@@ -15,6 +15,52 @@ use std::io::{self, Stdout};
 use std::time::Duration;
 use strum::IntoEnumIterator;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColorProfile {
+    FullColor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ColorPalette {
+    TokioNight,
+}
+
+#[derive(Clone, Copy)]
+struct Theme {
+    background: Color,
+    foreground: Color,
+    accent: Color,
+    accent_text: Color,
+    border: Color,
+    muted: Color,
+}
+
+impl Theme {
+    const fn active() -> Self {
+        let profile = ColorProfile::FullColor;
+        let palette = ColorPalette::TokioNight;
+        match (profile, palette) {
+            (ColorProfile::FullColor, ColorPalette::TokioNight) => Self {
+                background: Color::Rgb(26, 27, 38),
+                foreground: Color::Rgb(192, 202, 245),
+                accent: Color::Rgb(122, 162, 247),
+                accent_text: Color::Rgb(26, 27, 38),
+                border: Color::Rgb(86, 95, 137),
+                muted: Color::Rgb(169, 177, 214),
+            },
+        }
+    }
+
+    const fn profile_name() -> &'static str { "FullColor" }
+    const fn palette_name() -> &'static str { "tokio-night" }
+
+    fn block(self, title: &'static str) -> Block<'static> {
+        Block::default().title(title).borders(Borders::ALL)
+            .border_style(Style::default().fg(self.border).bg(self.background))
+            .title_style(Style::default().fg(self.accent).bg(self.background).add_modifier(Modifier::BOLD))
+    }
+}
+
 #[derive(Default)]
 struct UiState {
     selected: FeatureAction,
@@ -165,6 +211,8 @@ fn parse_action(action: FeatureAction, input: &str) -> Result<Command> {
 }
 
 fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
+    let theme = Theme::active();
+    frame.render_widget(Block::default().style(Style::default().fg(theme.foreground).bg(theme.background)), frame.area());
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(3), Constraint::Length(3)])
@@ -175,11 +223,13 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
     let action_area = areas.next().expect("action area");
     let footer_area = areas.next().expect("footer area");
     let title = Paragraph::new(Line::from(vec![
-        Span::styled(" AmneziaVPN TUI ", Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(if state.connection.is_some() { " CONNECTED" } else { " DISCONNECTED" }),
-        Span::raw(if ui.dry_run { "  PREVIEW" } else { "" }),
+        Span::styled(" AmneziaVPN TUI ", Style::default().fg(theme.accent_text).bg(theme.accent).add_modifier(Modifier::BOLD)),
+        Span::styled(if state.connection.is_some() { " CONNECTED" } else { " DISCONNECTED" }, Style::default().fg(theme.foreground).bg(theme.background)),
+        Span::styled(if ui.dry_run { "  PREVIEW" } else { "" }, Style::default().fg(theme.muted).bg(theme.background)),
+        Span::styled(format!("  {} / {}", Theme::profile_name(), Theme::palette_name()), Style::default().fg(theme.muted).bg(theme.background)),
     ]))
-    .block(Block::default().borders(Borders::ALL));
+    .style(Style::default().fg(theme.foreground).bg(theme.background))
+    .block(theme.block(""));
     frame.render_widget(title, title_area);
 
     let column_layout = Layout::default()
@@ -196,8 +246,9 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
     let selected = FeatureAction::iter().position(|action| action == ui.selected);
     let mut list_state = ListState::default().with_selected(selected);
     let list = List::new(actions)
-        .block(Block::default().title("All features").borders(Borders::ALL))
-        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
+        .style(Style::default().fg(theme.foreground).bg(theme.background))
+        .block(theme.block("All features"))
+        .highlight_style(Style::default().bg(theme.accent).fg(theme.accent_text).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     frame.render_stateful_widget(list, features_area, &mut list_state);
 
@@ -212,7 +263,8 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
         sanitize_terminal(&ui.output)
     );
     frame.render_widget(
-        Paragraph::new(summary).scroll((ui.output_scroll, 0)).wrap(Wrap { trim: false }).block(Block::default().title("Result").borders(Borders::ALL)),
+        Paragraph::new(summary).style(Style::default().fg(theme.foreground).bg(theme.background))
+            .scroll((ui.output_scroll, 0)).wrap(Wrap { trim: false }).block(theme.block("Result")),
         result_area,
     );
 
@@ -221,10 +273,10 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
         Some(value) => format!("{} {}: {value}_", info.command, info.prompt),
         None => format!("Enter: {} / {}  {}", info.category, info.label, info.prompt),
     };
-    frame.render_widget(Paragraph::new(input).block(Block::default().title("Action").borders(Borders::ALL)), action_area);
+    frame.render_widget(Paragraph::new(input).style(Style::default().fg(theme.foreground).bg(theme.background)).block(theme.block("Action")), action_area);
 
     let message = format!("↑/↓ select  PgUp/PgDn result  p preview  Enter run  c connect  d disconnect  r reload  q quit    {}", sanitize_terminal(&ui.message));
-    frame.render_widget(Paragraph::new(message).block(Block::default().borders(Borders::ALL)), footer_area);
+    frame.render_widget(Paragraph::new(message).style(Style::default().fg(theme.muted).bg(theme.background)).block(theme.block("")), footer_area);
 }
 
 pub fn render_snapshot(state: &State, width: u16, height: u16) -> Result<String> {
@@ -258,6 +310,21 @@ mod tests {
         assert!(snapshot.contains("Servers / List"));
         assert!(snapshot.contains("Settings / Show"));
         assert!(snapshot.contains("Split tunnel / List"));
+        assert!(snapshot.contains("FullColor / tokio-night"));
+    }
+
+    #[test]
+    fn dashboard_uses_full_color_tokio_night_palette() {
+        use ratatui::backend::TestBackend;
+        let theme = Theme::active();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| render(frame, &State::default(), &UiState::default())).unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(buffer.content().iter().any(|cell| cell.fg == theme.accent));
+        assert!(buffer.content().iter().any(|cell| cell.bg == theme.background));
+        assert_eq!(Theme::profile_name(), "FullColor");
+        assert_eq!(Theme::palette_name(), "tokio-night");
     }
 
     #[test]

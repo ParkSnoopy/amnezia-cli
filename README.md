@@ -53,6 +53,7 @@ Use `↑` and `↓` to select connection, profile, server, settings, split-tunne
 - `q` or `Esc`: quit
 
 The TUI exposes the same operations as the command-line interface.
+It uses the `FullColor` color profile with the `tokio-night` palette.
 
 ## Servers
 
