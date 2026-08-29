@@ -24,7 +24,7 @@ pub fn execute(store: &Store, state: &mut State, command: Command, dry_run: bool
         Command::SplitTunnel(command) => split_command(store, state, command, &mut output)?,
         Command::Backup(command) => backup_command(store, state, command)?,
         Command::Logs(command) => logs_command(store, command, &mut output)?,
-        Command::Doctor => doctor(state, &mut output)?,
+        Command::Doctor => doctor(store, state, &mut output)?,
     }
     Ok(output)
 }
@@ -257,31 +257,31 @@ fn log_paths(store: &Store) -> Result<Vec<std::path::PathBuf>> {
     Ok(paths)
 }
 
-fn doctor(state: &State, output: &mut String) -> Result<()> {
-    let mut programs = Vec::new();
-    if !state.servers.is_empty() {
-        programs.push("ssh");
-    }
-    for profile in state.profiles.values() {
-        let required: &[&str] = match profile.protocol {
-            model::Protocol::WireGuard => &["wg", "wg-quick"],
-            model::Protocol::AmneziaWg => &["awg", "awg-quick"],
-            model::Protocol::OpenVpn
-            | model::Protocol::Xray
-            | model::Protocol::Shadowsocks
-            | model::Protocol::Ikev2
-            | model::Protocol::Amnezia => continue,
-        };
-        for program in required {
-            if !programs.contains(program) { programs.push(program); }
+fn doctor(store: &Store, state: &State, output: &mut String) -> Result<()> {
+    let mut failures = Vec::new();
+    for saved_server in state.servers.values() {
+        match server::check_dependencies(saved_server) {
+            Ok(_) => writeln!(output, "server {}: ok", saved_server.id)?,
+            Err(error) => failures.push(format!("server {}: {error:#}", saved_server.id)),
         }
     }
-    let mut missing = false;
-    for program in programs {
-        let present = runner::resolve_program(program).is_ok();
-        writeln!(output, "{program}: {}", if present { "ok" } else { missing = true; "missing" })?;
+    for profile in state.profiles.values() {
+        match profile.protocol {
+            model::Protocol::WireGuard | model::Protocol::AmneziaWg | model::Protocol::Xray => {
+                match runner::check_profile_dependencies(store, profile, &state.settings) {
+                    Ok(()) => writeln!(output, "profile {}: ok", profile.id)?,
+                    Err(error) => failures.push(format!("profile {}: {error:#}", profile.id)),
+                }
+            }
+            model::Protocol::OpenVpn
+            | model::Protocol::Shadowsocks
+            | model::Protocol::Ikev2
+            | model::Protocol::Amnezia => {}
+        }
     }
-    if missing { bail!("required programs are missing"); }
+    if !failures.is_empty() {
+        bail!("required command-line or system dependencies are missing:\n{}", sanitize_terminal(&failures.join("\n")));
+    }
     Ok(())
 }
 

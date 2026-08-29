@@ -1,4 +1,5 @@
 use crate::core::model::Server;
+use crate::core::runner;
 use anyhow::{Context, Result, bail};
 use std::process::{Command, Output};
 
@@ -7,8 +8,19 @@ pub fn run_ssh(server: &Server, remote_args: &[&str], dry_run: bool) -> Result<S
     if dry_run {
         return Ok(format_command(&program, &args));
     }
-    let output = Command::new(&program).args(&args).output().with_context(|| format!("start {program}"))?;
+    let executable = check_dependencies(server)?;
+    let output = Command::new(&executable).args(&args).output().with_context(|| format!("start {program}"))?;
     output_text(output)
+}
+
+pub fn check_dependencies(server: &Server) -> Result<std::path::PathBuf> {
+    if let Some(identity) = &server.identity_file {
+        let metadata = std::fs::metadata(identity).with_context(|| format!("read SSH identity {identity}"))?;
+        if !metadata.is_file() {
+            bail!("SSH identity is not a regular file: {identity}");
+        }
+    }
+    runner::resolve_program("ssh")
 }
 
 pub fn ssh_command(server: &Server, remote_args: &[&str]) -> (String, Vec<String>) {
@@ -52,6 +64,15 @@ fn format_command(program: &str, args: &[String]) -> String {
 }
 
 pub fn scan(server: &Server, dry_run: bool) -> Result<String> {
+    if dry_run {
+        return Ok(format!("{}\n{}", run_ssh(server, &["command", "-v", "docker"], true)?, run_ssh(
+            server,
+            &["docker", "ps", "--all", "--format", "{{.Names}}\\t{{.Status}}\\t{{.Image}}"],
+            true,
+        )?));
+    }
+    run_ssh(server, &["command", "-v", "docker"], false)
+        .context("remote Docker dependency is unavailable")?;
     run_ssh(
         server,
         &["docker", "ps", "--all", "--format", "{{.Names}}\\t{{.Status}}\\t{{.Image}}"],
@@ -63,7 +84,11 @@ pub fn reboot(server: &Server, confirmed: bool, dry_run: bool) -> Result<String>
     if !confirmed {
         bail!("reboot requires --yes");
     }
-    run_ssh(server, &["sudo", "reboot"], dry_run)
+    if dry_run {
+        return Ok(format!("{}\n{}", run_ssh(server, &["sudo", "-n", "true"], true)?, run_ssh(server, &["sudo", "reboot"], true)?));
+    }
+    run_ssh(server, &["sudo", "-n", "true"], false).context("remote passwordless sudo dependency is unavailable")?;
+    run_ssh(server, &["sudo", "reboot"], false)
 }
 
 #[cfg(test)]

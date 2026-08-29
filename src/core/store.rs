@@ -254,16 +254,21 @@ impl Store {
         Ok(())
     }
 
-    fn validate_profile_sources(&self, state: &State) -> Result<()> {
+    pub(crate) fn validated_profile_text(&self, profile: &Profile) -> Result<String> {
         let profiles_root = fs::canonicalize(self.root.join("profiles"))?;
+        let source = fs::canonicalize(&profile.source)
+            .with_context(|| format!("profile file is missing: {}", profile.source))?;
+        if source.parent() != Some(profiles_root.as_path()) {
+            bail!("profile source is outside managed profile directory: {}", profile.source);
+        }
+        let text = fs::read_to_string(&source)?;
+        reject_executable_directives(&text, &profile.protocol)?;
+        Ok(text)
+    }
+
+    fn validate_profile_sources(&self, state: &State) -> Result<()> {
         for profile in state.profiles.values() {
-            let source = fs::canonicalize(&profile.source)
-                .with_context(|| format!("profile file is missing: {}", profile.source))?;
-            if source.parent() != Some(profiles_root.as_path()) {
-                bail!("profile source is outside managed profile directory: {}", profile.source);
-            }
-            let text = fs::read_to_string(&source)?;
-            reject_executable_directives(&text, &profile.protocol)?;
+            self.validated_profile_text(profile)?;
         }
         Ok(())
     }
@@ -365,9 +370,19 @@ fn reject_executable_directives(text: &str, protocol: &Protocol) -> Result<()> {
     if matches!(protocol, Protocol::WireGuard | Protocol::AmneziaWg) {
         const HOOKS: &[&str] = &["preup", "postup", "predown", "postdown"];
         for line in text.lines() {
-            let key = line.split_once('=').map(|(key, _)| key.trim().to_ascii_lowercase());
-            if let Some(key) = key && HOOKS.contains(&key.as_str()) {
+            let assignment = line.split_once('=').map(|(key, value)| {
+                (key.trim().to_ascii_lowercase(), value.split('#').next().unwrap_or_default().trim())
+            });
+            if let Some((key, _)) = assignment.as_ref()
+                && HOOKS.contains(&key.as_str())
+            {
                 bail!("WireGuard profile contains executable hook '{key}'");
+            }
+            if let Some((key, value)) = assignment.as_ref()
+                && key == "saveconfig"
+                && value.eq_ignore_ascii_case("true")
+            {
+                bail!("WireGuard profile contains unsupported mutable directive 'saveconfig'");
             }
         }
         return Ok(());
@@ -394,15 +409,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_wireguard_and_amneziawg() {
+    fn detects_wireguard_amneziawg_and_raw_xray() {
         assert_eq!(detect_protocol("[Interface]\nPrivateKey=x\n[Peer]\nPublicKey=y", Path::new("x.conf")).unwrap(), Protocol::WireGuard);
         assert_eq!(detect_protocol("[Interface]\nJc = 4\n[Peer]\nPublicKey=y", Path::new("x.conf")).unwrap(), Protocol::AmneziaWg);
+        assert_eq!(detect_protocol("{\"outbounds\":[]}", Path::new("x.json")).unwrap(), Protocol::Xray);
     }
 
     #[test]
     fn rejects_wireguard_hooks() {
         let result = reject_executable_directives("[Interface]\nPostUp = curl attacker", &Protocol::WireGuard);
         assert!(result.unwrap_err().to_string().contains("executable hook 'postup'"));
+        let save = reject_executable_directives("[Interface]\nSaveConfig = true # mutate source", &Protocol::WireGuard);
+        assert!(save.unwrap_err().to_string().contains("unsupported mutable directive 'saveconfig'"));
     }
 
     #[test]

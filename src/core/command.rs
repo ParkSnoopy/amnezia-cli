@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
-use strum::{EnumIter, IntoEnumIterator};
+use strum::EnumIter;
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -229,6 +229,7 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use std::collections::BTreeSet;
+    use strum::IntoEnumIterator;
 
     #[test]
     fn tui_actions_cover_every_cli_leaf_command() {

@@ -109,6 +109,7 @@ const AMNEZIA_REMOTE: &str = "https://artifactory.amnezia.org/artifactory/api/co
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/core/amnezia_xray_runner.c");
     println!("cargo:rerun-if-changed=amnezia-client/conanfile.py");
     println!("cargo:rerun-if-changed=amnezia-client/recipes");
 
@@ -123,13 +124,13 @@ fn main() {
     if required_env("CARGO_CFG_TARGET_OS") != "linux" || required_env("CARGO_CFG_TARGET_ARCH") != "x86_64" {
         panic!("recipe bundle currently supports only native Linux x86_64 builds");
     }
-    if required_env("HOST") != required_env("TARGET") {
-        panic!("cross-compiling bundled AmneziaVPN recipes is not supported");
-    }
-
     let conan = require_program("conan", "Conan 2");
     let _compiler = require_program("cc", "C compiler");
-    let _make = require_program("make", "Make");
+    let _cmake = require_program("cmake", "CMake");
+    let _ninja = require_program("ninja", "Ninja");
+    if required_env("TARGET") == "x86_64-unknown-linux-musl" {
+        let _musl_compiler = require_program("musl-gcc", "musl C compiler");
+    }
     run(&conan, ["--version"], &manifest);
     run(&conan, ["profile", "path", "default"], &manifest);
     let remotes = run_capture(&conan, ["remote", "list"], &manifest);
@@ -170,6 +171,31 @@ fn main() {
         panic!("create bundle {}: {error}", bundle.display());
     });
     let deployed_packages = deploy.join("full_deploy").join("host");
+    let xray_package = deployed_packages.join("amnezia-xray-bindings/1.3.0/x86_64");
+    let xray_library = xray_package.join("lib/libamnezia_xray.a");
+    let xray_header = xray_package.join("include/amnezia_xray.h");
+    validate_artifact(&xray_library, false);
+    require_file(&xray_header);
+    let xray_runner_source = manifest.join("src/core/amnezia_xray_runner.c");
+    require_file(&xray_runner_source);
+    let xray_runner = bundle.join("amnezia-xray-runner");
+    let compiler = require_program("cc", "C compiler");
+    run_os(&compiler, &[
+        xray_runner_source.into_os_string(),
+        xray_library.into_os_string(),
+        format!("-I{}", xray_package.join("include").display()).into(),
+        "-Wall".into(),
+        "-Wextra".into(),
+        "-Werror".into(),
+        "-pthread".into(),
+        "-ldl".into(),
+        "-lm".into(),
+        "-lresolv".into(),
+        "-o".into(),
+        xray_runner.as_os_str().to_owned(),
+    ], &manifest);
+    validate_artifact(&xray_runner, true);
+
     for artifact_kind in std::iter::successors(Some(RecipeArtifact::OpenVpn), |artifact| artifact.next()) {
         let artifact = deployed_packages.join(artifact_kind.package_path());
         validate_artifact(&artifact, artifact_kind.executable());
