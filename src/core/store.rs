@@ -1,4 +1,4 @@
-use crate::model::{Profile, Protocol, State};
+use crate::core::model::{Profile, Protocol, State};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::io::Write;
@@ -69,7 +69,7 @@ impl Store {
         let id = Uuid::new_v4().simple().to_string();
         let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("conf");
         let file_stem = if matches!(protocol, Protocol::WireGuard | Protocol::AmneziaWg) {
-            format!("amn{}", &id[..11])
+            format!("amn{}", id.chars().take(11).collect::<String>())
         } else {
             id.clone()
         };
@@ -85,11 +85,16 @@ impl Store {
             enabled: true,
             server_id: None,
         };
-        state.profiles.insert(id.clone(), profile);
-        if state.default_profile.is_none() {
-            state.default_profile = Some(id.clone());
+        let mut updated = state.clone();
+        updated.profiles.insert(id.clone(), profile);
+        if updated.default_profile.is_none() {
+            updated.default_profile = Some(id.clone());
         }
-        self.save(state)?;
+        if let Err(error) = self.save(&updated) {
+            let _ = fs::remove_file(&destination);
+            return Err(error).context("profile import rolled back");
+        }
+        *state = updated;
         Ok(id)
     }
 
@@ -108,9 +113,17 @@ impl Store {
         if updated.default_profile.as_deref() == Some(id) {
             updated.default_profile = updated.profiles.keys().next().cloned();
         }
-        self.save(&updated)?;
-        fs::remove_file(source)?;
+        let staged = profiles_root.join(format!(".remove-{}", Uuid::new_v4().simple()));
+        fs::rename(&source, &staged)?;
+        if let Err(error) = self.save(&updated) {
+            let rollback = fs::rename(&staged, &source);
+            return match rollback {
+                Ok(()) => Err(error).context("profile removal rolled back"),
+                Err(rollback_error) => Err(error).context(format!("profile removal failed and file rollback failed: {rollback_error}")),
+            };
+        }
         *state = updated;
+        fs::remove_file(staged).context("remove staged profile file")?;
         Ok(())
     }
 
@@ -258,7 +271,7 @@ impl Store {
 
 fn restored_profile_path(profiles_dir: &Path, id: &str, protocol: &Protocol) -> PathBuf {
     let file_stem = if matches!(protocol, Protocol::WireGuard | Protocol::AmneziaWg) {
-        format!("amn{}", &id[..11])
+        format!("amn{}", id.chars().take(11).collect::<String>())
     } else {
         id.to_owned()
     };

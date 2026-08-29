@@ -1,6 +1,16 @@
-# Amnezia TUI
+# AmneziaVPN TUI
 
-Amnezia TUI is a terminal client for managing and connecting Amnezia-compatible VPN profiles without Qt or a graphical desktop.
+AmneziaVPN TUI manages and connects AmneziaVPN profiles from an interactive TUI or CLI.
+
+## Build
+
+Install Rust, Conan 2, a C compiler, and Make, then build the release bundle:
+
+```text
+cargo build --release
+```
+
+Cargo builds the required recipes from `amnezia-client/recipes/`. Missing tools, recipes, recipe outputs, or the Conan default profile stop the build. The resulting `amn` and its `libexec/amn` files form the release bundle.
 
 ## Usage
 
@@ -33,7 +43,7 @@ Direct connection is enabled for WireGuard and AmneziaWG. OpenVPN, XRay, Shadows
 
 Amnezia full-access bundles and XRay share links can be imported and stored. Export them to a native protocol configuration before connecting.
 
-The matching protocol helper must be bundled under `libexec/amn`, supplied through `AMN_LIBEXEC`, or available in `PATH`: `openvpn`, `wg-quick`, `awg-quick`, `xray`, `tun2socks`, `sslocal`, or `swanctl`. The `amn` frontend itself has no Qt dependency.
+The Cargo build builds AmneziaVPN recipe outputs and places `openvpn`, `tun2socks`, `amneziawg-go`, `geoip.dat`, and `geosite.dat` under `libexec/amn` beside `amn`. WireGuard and AmneziaWG connections also require their platform tools (`wg`, `wg-quick`, `awg`, and `awg-quick`).
 
 Use `--dry-run` to inspect the exact external command without connecting:
 
@@ -41,8 +51,11 @@ Use `--dry-run` to inspect the exact external command without connecting:
 amn --dry-run connect
 ```
 
-## Terminal dashboard
+## AmneziaVPN TUI
 
+Use `↑` and `↓` to select any connection, profile, server, settings, split-tunnel, backup, log, or diagnostic action. Press `Enter`, provide requested values inside the TUI, then press `Enter` again to run it.
+
+- `PgUp` or `PgDn`: scroll action results
 - `c`: connect the default profile
 - `d`: disconnect
 - `r`: reload saved state

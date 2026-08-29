@@ -1,4 +1,4 @@
-use crate::model::Server;
+use crate::core::model::Server;
 use anyhow::{Context, Result, bail};
 use std::process::{Command, Output};
 

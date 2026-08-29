@@ -1,5 +1,5 @@
-use crate::model::{Connection, Profile, Protocol, Settings, State};
-use crate::store::Store;
+use crate::core::model::{Connection, Profile, Protocol, Settings, State};
+use crate::core::store::Store;
 use anyhow::{Context, Result, bail};
 use std::fs::{self, OpenOptions};
 use std::path::Path;
