@@ -3,6 +3,8 @@ use crate::core::store::Store;
 use anyhow::{Context, Result, anyhow, bail};
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::os::unix::ffi::OsStringExt;
+
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +15,22 @@ pub struct CommandPlan {
     pub rollback_program: String,
     pub rollback_args: Vec<String>,
     pub interface: Option<String>,
+}
+
+pub(crate) struct QuickSpec {
+    pub quick_program: &'static str,
+    pub probe_program: &'static str,
+    pub kernel_module: &'static str,
+    pub backend_variable: &'static str,
+    pub userspace_backend: &'static str,
+}
+
+fn quick_spec(protocol: &Protocol) -> Result<QuickSpec> {
+    match protocol {
+        Protocol::WireGuard => Ok(crate::core::wireguard::spec()),
+        Protocol::AmneziaWg => Ok(crate::core::amneziawg::spec()),
+        _ => bail!("protocol does not use a quick-script backend"),
+    }
 }
 
 impl CommandPlan {
@@ -37,28 +55,20 @@ fn quote_argument(value: &str) -> String {
     }
 }
 
-pub fn connection_plan(profile: &Profile, _settings: &Settings) -> Result<CommandPlan> {
+fn quick_connection_plan(profile: &Profile) -> Result<CommandPlan> {
     let source = profile.source.clone();
     let plan = match profile.protocol {
-        Protocol::OpenVpn => bail!("OpenVPN connection requires isolated bundled backend integration"),
-        Protocol::WireGuard => CommandPlan {
-            program: "wg-quick".into(),
-            args: vec!["up".into(), source],
-            rollback_program: "wg-quick".into(),
-            rollback_args: vec!["down".into(), profile.source.clone()],
-            interface: Some(interface_name(&profile.source)),
+        Protocol::WireGuard | Protocol::AmneziaWg => {
+            let spec = quick_spec(&profile.protocol)?;
+            CommandPlan {
+                program: spec.quick_program.into(),
+                args: vec!["up".into(), source],
+                rollback_program: spec.quick_program.into(),
+                rollback_args: vec!["down".into(), profile.source.clone()],
+                interface: Some(interface_name(&profile.source)),
+            }
         },
-        Protocol::AmneziaWg => CommandPlan {
-            program: "awg-quick".into(),
-            args: vec!["up".into(), source],
-            rollback_program: "awg-quick".into(),
-            rollback_args: vec!["down".into(), profile.source.clone()],
-            interface: Some(interface_name(&profile.source)),
-        },
-        Protocol::Xray => bail!("XRay connection requires bundled XRay and tun2socks backend integration"),
-        Protocol::Shadowsocks => bail!("Shadowsocks connection requires bundled tun2socks backend integration"),
-        Protocol::Ikev2 => bail!("IKEv2 connection requires privileged platform backend integration"),
-        Protocol::Amnezia => bail!("Amnezia full-access bundle must be exported to a native protocol before connection"),
+        _ => bail!("protocol does not use a quick-script backend"),
     };
 
     Ok(plan)
@@ -100,17 +110,9 @@ fn prepare_network_plan(store: &Store, profile: &Profile, plan: &CommandPlan, st
             resolve_network_program(dependency)?;
         }
     }
-    let (kernel_backend, interface_probe) = match profile.protocol {
-        Protocol::WireGuard => {
-            let probe = resolve_network_program("wg")?;
-            (Some(("wireguard", "WG_QUICK_USERSPACE_IMPLEMENTATION", "wireguard-go")), probe)
-        }
-        Protocol::AmneziaWg => {
-            let probe = resolve_network_program("awg")?;
-            (Some(("amneziawg", "WG_QUICK_USERSPACE_IMPLEMENTATION", "amneziawg-go")), probe)
-        }
-        _ => bail!("protocol does not use a supported network interface backend"),
-    };
+    let spec = quick_spec(&profile.protocol)?;
+    let interface_probe = resolve_network_program(spec.probe_program)?;
+    let kernel_backend = Some((spec.kernel_module, spec.backend_variable, spec.userspace_backend));
     if configuration_has_key(&configuration, "DNS") {
         resolve_network_program("resolvconf")?;
     }
@@ -184,11 +186,19 @@ fn prepare_network_plan(store: &Store, profile: &Profile, plan: &CommandPlan, st
 }
 
 pub fn check_profile_dependencies(store: &Store, profile: &Profile, settings: &Settings) -> Result<()> {
-    if profile.protocol == Protocol::Xray {
+    if profile.protocol == Protocol::Ikev2 {
+        prepare_ikev2(store, profile)?;
+        return Ok(());
+    }
+    if profile.protocol == Protocol::OpenVpn {
+        prepare_openvpn(store, profile, settings)?;
+        return Ok(());
+    }
+    if matches!(profile.protocol, Protocol::Xray | Protocol::Shadowsocks) {
         prepare_xray(store, profile, settings)?;
         return Ok(());
     }
-    let plan = connection_plan(profile, settings)?;
+    let plan = quick_connection_plan(profile)?;
     prepare_network_plan(store, profile, &plan, false)?;
     Ok(())
 }
@@ -398,6 +408,191 @@ fn fail_with_rollback<T>(plan: &CommandPlan, prepared: &PreparedPlan, failure: a
     }
 }
 
+struct PreparedOpenVpn {
+    configuration: String,
+    executable: PathBuf,
+    setsid: PathBuf,
+    kill: PathBuf,
+    ip: PathBuf,
+    path: std::ffi::OsString,
+    interface: String,
+}
+
+fn prepare_openvpn(store: &Store, profile: &Profile, settings: &Settings) -> Result<PreparedOpenVpn> {
+    let configuration = crate::core::openvpn::prepare(&store.validated_profile_text(profile)?, settings)?;
+    let executable = resolve_network_program("openvpn")?;
+    let version = Command::new(&executable).arg("--version").output().context("check bundled OpenVPN")?;
+    if !version.status.success() {
+        bail!("bundled OpenVPN failed its dependency check");
+    }
+    Ok(PreparedOpenVpn {
+        configuration: configuration.text,
+        executable,
+        setsid: resolve_network_program("setsid")?,
+        kill: resolve_network_program("kill")?,
+        ip: resolve_network_program("ip")?,
+        path: std::env::join_paths(network_program_directories()).context("construct OpenVPN dependency PATH")?,
+        interface: configuration.interface,
+    })
+}
+
+fn start_openvpn(store: &Store, prepared: &PreparedOpenVpn, logging: bool) -> Result<(u32, PathBuf)> {
+    if effective_user_id() != Some(0) {
+        bail!("OpenVPN interface changes require running amn as root");
+    }
+    if Command::new(&prepared.ip).args(["link", "show", "dev", &prepared.interface]).env("PATH", &prepared.path)
+        .stdout(Stdio::null()).stderr(Stdio::null()).status()?.success()
+    {
+        bail!("refusing to connect because interface already exists: {}", prepared.interface);
+    }
+    let directory = create_root_runtime_directory()?;
+    let configuration = directory.join("openvpn.conf");
+    crate::core::store::write_private(&configuration, prepared.configuration.as_bytes())?;
+    let mut command = Command::new(&prepared.setsid);
+    command.args([prepared.executable.as_os_str(), std::ffi::OsStr::new("--config"), configuration.as_os_str()])
+        .env("PATH", &prepared.path).stdin(Stdio::null());
+    if logging {
+        let log_path = store.root().join("logs").join(format!("connection-{}.log", uuid::Uuid::new_v4().simple()));
+        let stdout = create_private_log(&log_path)?;
+        command.stdout(stdout.try_clone()?).stderr(stdout);
+    } else {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    let mut child = command.spawn().context("start isolated OpenVPN process")?;
+    for _ in 0..300 {
+        if let Some(status) = child.try_wait()? {
+            let _ = fs::remove_dir_all(&directory);
+            bail!("OpenVPN exited during startup with {status}");
+        }
+        if Command::new(&prepared.ip).args(["link", "show", "dev", &prepared.interface]).env("PATH", &prepared.path)
+            .stdout(Stdio::null()).stderr(Stdio::null()).status()?.success()
+        {
+            return Ok((child.id(), directory));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = stop_process_group(&prepared.kill, &prepared.path, child.id(), "OpenVPN");
+    let _ = fs::remove_dir_all(&directory);
+    bail!("OpenVPN did not create its tunnel interface")
+}
+
+fn stop_process_group(kill: &Path, path: &std::ffi::OsStr, pid: u32, name: &str) -> Result<()> {
+    let status = Command::new(kill).args(["-TERM", "--", &format!("-{pid}")]).env("PATH", path).status()
+        .with_context(|| format!("stop {name} process group"))?;
+    if !status.success() { bail!("stop {name} process exited with {status}"); }
+    for _ in 0..100 {
+        if !process_is_running(pid) { return Ok(()); }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    bail!("{name} process did not stop")
+}
+
+fn openvpn_process_configuration(pid: u32) -> Result<PathBuf> {
+    if !process_is_running(pid) { bail!("recorded OpenVPN process is no longer running"); }
+    let executable = fs::canonicalize(format!("/proc/{pid}/exe")).context("resolve OpenVPN executable")?;
+    if executable.file_name() != Some(std::ffi::OsStr::new("openvpn")) || !is_trusted_network_executable(&executable) {
+        bail!("recorded process is not a trusted OpenVPN process");
+    }
+    let command_line = fs::read(format!("/proc/{pid}/cmdline"))?;
+    let arguments = command_line.split(|byte| *byte == 0).filter(|argument| !argument.is_empty()).collect::<Vec<_>>();
+    let index = arguments.iter().position(|argument| *argument == b"--config").context("OpenVPN process has no configuration argument")?;
+    let value = arguments.get(index + 1).context("OpenVPN configuration argument is incomplete")?;
+    PathBuf::from(std::ffi::OsString::from_vec(value.to_vec())).canonicalize().context("resolve staged OpenVPN configuration")
+}
+
+struct PreparedIkev2 {
+    host: String,
+    endpoint: String,
+    identity: String,
+    remote_identity: Option<String>,
+    certificate: Vec<u8>,
+    password: String,
+    executable: PathBuf,
+    setsid: PathBuf,
+    kill: PathBuf,
+    ip: PathBuf,
+    path: std::ffi::OsString,
+}
+
+fn prepare_ikev2(store: &Store, profile: &Profile) -> Result<PreparedIkev2> {
+    let configuration = crate::core::ikev2::parse(&store.validated_profile_text(profile)?)?;
+    let executable = resolve_network_program("charon-cmd")?;
+    let version = Command::new(&executable).arg("--version").output().context("check charon-cmd")?;
+    if !version.status.success() { bail!("charon-cmd failed its dependency check"); }
+    Ok(PreparedIkev2 {
+        host: configuration.host,
+        endpoint: configuration.endpoint,
+        identity: configuration.identity,
+        remote_identity: configuration.remote_identity,
+        certificate: configuration.certificate,
+        password: configuration.password,
+        executable,
+        setsid: resolve_network_program("setsid")?,
+        kill: resolve_network_program("kill")?,
+        ip: resolve_network_program("ip")?,
+        path: std::env::join_paths(network_program_directories()).context("construct IKEv2 dependency PATH")?,
+    })
+}
+
+fn start_ikev2(store: &Store, prepared: &PreparedIkev2, logging: bool) -> Result<(u32, PathBuf)> {
+    use std::io::Write as _;
+    if effective_user_id() != Some(0) { bail!("IKEv2 connection requires running amn as root"); }
+    let directory = create_root_runtime_directory()?;
+    let certificate = directory.join("client.p12");
+    crate::core::store::write_private(&certificate, &prepared.certificate)?;
+    let mut arguments = vec![
+        prepared.executable.as_os_str().to_owned(), "--host".into(), prepared.host.clone().into(),
+        "--identity".into(), prepared.identity.clone().into(), "--p12".into(), certificate.as_os_str().to_owned(),
+        "--profile".into(), "ikev2-pub".into(), "--remote-ts".into(), "0.0.0.0/0".into(),
+    ];
+    if let Some(identity) = &prepared.remote_identity {
+        arguments.extend(["--remote-identity".into(), identity.into()]);
+    }
+    let mut command = Command::new(&prepared.setsid);
+    command.args(arguments).env("PATH", &prepared.path).stdin(Stdio::piped());
+    if logging {
+        let log_path = store.root().join("logs").join(format!("connection-{}.log", uuid::Uuid::new_v4().simple()));
+        let stdout = create_private_log(&log_path)?;
+        command.stdout(stdout.try_clone()?).stderr(stdout);
+    } else {
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+    }
+    let mut child = command.spawn().context("start isolated IKEv2 process")?;
+    if let Some(mut input) = child.stdin.take() {
+        input.write_all(prepared.password.as_bytes())?;
+        input.write_all(b"\n")?;
+    }
+    for _ in 0..300 {
+        if let Some(status) = child.try_wait()? {
+            let _ = fs::remove_dir_all(&directory);
+            bail!("IKEv2 process exited during startup with {status}");
+        }
+        let state = Command::new(&prepared.ip).args(["xfrm", "state"]).env("PATH", &prepared.path).output()?;
+        if state.status.success()
+            && String::from_utf8_lossy(&state.stdout).split_whitespace().any(|field| field == prepared.endpoint)
+        {
+            return Ok((child.id(), directory));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = stop_process_group(&prepared.kill, &prepared.path, child.id(), "IKEv2");
+    let _ = fs::remove_dir_all(&directory);
+    bail!("IKEv2 did not establish an IPsec security association")
+}
+
+fn ikev2_process_certificate(pid: u32) -> Result<PathBuf> {
+    if !process_is_running(pid) { bail!("recorded IKEv2 process is no longer running"); }
+    let executable = fs::canonicalize(format!("/proc/{pid}/exe")).context("resolve IKEv2 executable")?;
+    if executable.file_name() != Some(std::ffi::OsStr::new("charon-cmd")) || !is_trusted_network_executable(&executable) {
+        bail!("recorded process is not a trusted IKEv2 process");
+    }
+    let command_line = fs::read(format!("/proc/{pid}/cmdline"))?;
+    let arguments = command_line.split(|byte| *byte == 0).filter(|argument| !argument.is_empty()).collect::<Vec<_>>();
+    let index = arguments.iter().position(|argument| *argument == b"--p12").context("IKEv2 process has no certificate argument")?;
+    let value = arguments.get(index + 1).context("IKEv2 certificate argument is incomplete")?;
+    PathBuf::from(std::ffi::OsString::from_vec(value.to_vec())).canonicalize().context("resolve staged IKEv2 certificate")
+}
+
 struct PreparedXray {
     configuration: String,
     endpoint: String,
@@ -409,13 +604,17 @@ struct PreparedXray {
     kill: PathBuf,
     ip: PathBuf,
     path: std::ffi::OsString,
+    route_mode: crate::core::model::RouteMode,
+    split_routes: Vec<crate::core::routing::Network>,
 }
 
 fn prepare_xray(store: &Store, profile: &Profile, settings: &Settings) -> Result<PreparedXray> {
-    if settings.route_mode != crate::core::model::RouteMode::All {
-        bail!("raw XRay currently requires all-traffic routing mode");
-    }
-    let raw = crate::core::xray::RawConfiguration::parse(&store.validated_profile_text(profile)?)?;
+    let text = store.validated_profile_text(profile)?;
+    let raw = match profile.protocol {
+        Protocol::Xray => crate::core::xray::RawConfiguration::parse(&text)?,
+        Protocol::Shadowsocks => crate::core::shadowsocks::parse(&text)?,
+        _ => bail!("protocol does not use the XRay transport backend"),
+    };
     let endpoint = raw.endpoint_ipv4()?;
     let configuration = raw.render_for_endpoint(endpoint)?;
     let executable = resolve_network_program("amnezia-xray-runner")?;
@@ -437,6 +636,14 @@ fn prepare_xray(store: &Store, profile: &Profile, settings: &Settings) -> Result
     let fields = route.split_whitespace().collect::<Vec<_>>();
     let uplink = route_field(&fields, "dev").context("XRay endpoint route has no uplink interface")?.to_owned();
     let gateway = route_field(&fields, "via").unwrap_or("-").to_owned();
+    let split_routes = settings.split_routes.iter()
+        .map(|route| crate::core::routing::Network::parse(route))
+        .collect::<Result<Vec<_>>>()?;
+    if settings.route_mode != crate::core::model::RouteMode::All
+        && split_routes.iter().any(crate::core::routing::Network::is_ipv6)
+    {
+        bail!("XRay split-tunnel routes currently require IPv4 networks");
+    }
     Ok(PreparedXray {
         configuration,
         endpoint: endpoint.to_string(),
@@ -448,6 +655,8 @@ fn prepare_xray(store: &Store, profile: &Profile, settings: &Settings) -> Result
         kill,
         ip,
         path,
+        route_mode: settings.route_mode.clone(),
+        split_routes,
     })
 }
 
@@ -545,6 +754,50 @@ fn stop_xray_worker(prepared: &PreparedXray, pid: u32) -> Result<()> {
     bail!("XRay worker did not stop")
 }
 
+fn traffic_route_pairs(prepared: &PreparedXray, interface: &str) -> Vec<(Vec<String>, Vec<String>)> {
+    let mut pairs = Vec::new();
+    let tunnel_route = |action: &str, prefix: &str| {
+        vec!["route".into(), action.into(), prefix.into(), "dev".into(), interface.into(), "proto".into(), "66".into(), "metric".into(), "5".into()]
+    };
+    let bypass_route = |action: &str, prefix: &str| {
+        let mut arguments = vec!["route".into(), action.into(), prefix.into()];
+        if prepared.gateway != "-" {
+            arguments.extend(["via".into(), prepared.gateway.clone()]);
+        }
+        arguments.extend(["dev".into(), prepared.uplink.clone(), "proto".into(), "66".into(), "metric".into(), "5".into()]);
+        arguments
+    };
+    match prepared.route_mode {
+        crate::core::model::RouteMode::All => {
+            for prefix in ["0.0.0.0/1", "128.0.0.0/1"] {
+                pairs.push((tunnel_route("add", prefix), tunnel_route("delete", prefix)));
+            }
+        }
+        crate::core::model::RouteMode::OnlyListed => {
+            for route in &prepared.split_routes {
+                let prefix = route.cidr();
+                pairs.push((tunnel_route("add", &prefix), tunnel_route("delete", &prefix)));
+            }
+        }
+        crate::core::model::RouteMode::ExceptListed => {
+            for prefix in ["0.0.0.0/1", "128.0.0.0/1"] {
+                pairs.push((tunnel_route("add", prefix), tunnel_route("delete", prefix)));
+            }
+            for route in &prepared.split_routes {
+                let prefix = route.cidr();
+                pairs.push((bypass_route("add", &prefix), bypass_route("delete", &prefix)));
+            }
+        }
+    }
+    if prepared.route_mode != crate::core::model::RouteMode::OnlyListed {
+        pairs.push((
+            vec!["-6".into(), "route".into(), "add".into(), "unreachable".into(), "::/0".into(), "proto".into(), "66".into(), "metric".into(), "42760".into()],
+            vec!["-6".into(), "route".into(), "delete".into(), "unreachable".into(), "::/0".into(), "proto".into(), "66".into(), "metric".into(), "42760".into()],
+        ));
+    }
+    pairs
+}
+
 fn configure_xray_interface(prepared: &PreparedXray, interface: &str, rollback: &mut Vec<Vec<String>>) -> Result<()> {
     apply_xray_mutation(prepared,
         vec!["address".into(), "add".into(), "10.33.0.2/24".into(), "dev".into(), interface.into()],
@@ -553,14 +806,9 @@ fn configure_xray_interface(prepared: &PreparedXray, interface: &str, rollback: 
         vec!["link".into(), "set".into(), "dev".into(), interface.into(), "up".into()],
         vec!["link".into(), "set".into(), "dev".into(), interface.into(), "down".into()], rollback)?;
     apply_xray_mutation(prepared, endpoint_route_arguments(prepared, "add"), endpoint_route_arguments(prepared, "delete"), rollback)?;
-    for prefix in ["0.0.0.0/1", "128.0.0.0/1"] {
-        apply_xray_mutation(prepared,
-            vec!["route".into(), "add".into(), prefix.into(), "dev".into(), interface.into(), "proto".into(), "66".into()],
-            vec!["route".into(), "delete".into(), prefix.into(), "dev".into(), interface.into(), "proto".into(), "66".into()], rollback)?;
+    for (forward, reverse) in traffic_route_pairs(prepared, interface) {
+        apply_xray_mutation(prepared, forward, reverse, rollback)?;
     }
-    apply_xray_mutation(prepared,
-        vec!["-6".into(), "route".into(), "add".into(), "unreachable".into(), "::/0".into(), "proto".into(), "66".into(), "metric".into(), "42760".into()],
-        vec!["-6".into(), "route".into(), "delete".into(), "unreachable".into(), "::/0".into(), "proto".into(), "66".into(), "metric".into(), "42760".into()], rollback)?;
     Ok(())
 }
 
@@ -589,12 +837,6 @@ fn connect_xray(store: &Store, state: &mut State, profile: &Profile, id: String,
         .stdout(Stdio::null()).stderr(Stdio::null()).status()?.success();
     if existing {
         bail!("refusing to connect because interface already exists: {interface}");
-    }
-    for prefix in ["0.0.0.0/1", "128.0.0.0/1"] {
-        let output = Command::new(&prepared.ip).args(["route", "show", prefix]).env("PATH", &prepared.path).output()?;
-        if !output.status.success() || !output.stdout.is_empty() {
-            bail!("refusing to replace existing route: {prefix}");
-        }
     }
     let pid = start_xray_worker(store, &prepared, interface, state.settings.logging)?;
     let mut rollback = Vec::new();
@@ -710,14 +952,9 @@ fn disconnect_xray(store: &Store, state: &mut State, profile: &Profile, connecti
 
     let mut route_rollback = Vec::new();
     let operation = (|| -> Result<()> {
-        for prefix in ["0.0.0.0/1", "128.0.0.0/1"] {
-            apply_xray_mutation(&prepared,
-                vec!["route".into(), "delete".into(), prefix.into(), "dev".into(), info.interface.clone(), "proto".into(), "66".into()],
-                vec!["route".into(), "add".into(), prefix.into(), "dev".into(), info.interface.clone(), "proto".into(), "66".into()], &mut route_rollback)?;
+        for (forward, reverse) in traffic_route_pairs(&prepared, &info.interface).into_iter().rev() {
+            apply_xray_mutation(&prepared, reverse, forward, &mut route_rollback)?;
         }
-        apply_xray_mutation(&prepared,
-            vec!["-6".into(), "route".into(), "delete".into(), "unreachable".into(), "::/0".into(), "proto".into(), "66".into(), "metric".into(), "42760".into()],
-            vec!["-6".into(), "route".into(), "add".into(), "unreachable".into(), "::/0".into(), "proto".into(), "66".into(), "metric".into(), "42760".into()], &mut route_rollback)?;
         apply_xray_mutation(&prepared, endpoint_route_arguments(&prepared, "delete"), endpoint_route_arguments(&prepared, "add"), &mut route_rollback)?;
         stop_xray_worker(&prepared, pid)?;
         let exists = Command::new(&prepared.ip).args(["link", "show", "dev", &info.interface]).env("PATH", &prepared.path)
@@ -738,6 +975,103 @@ fn disconnect_xray(store: &Store, state: &mut State, profile: &Profile, connecti
     Ok("disconnected".into())
 }
 
+fn connect_openvpn(store: &Store, state: &mut State, profile: &Profile, id: String, dry_run: bool) -> Result<String> {
+    if dry_run {
+        return Ok("openvpn --config <validated-config>\nrollback: terminate the owned OpenVPN process group and remove its tunnel interface".into());
+    }
+    let prepared = prepare_openvpn(store, profile, &state.settings)?;
+    let (pid, runtime_directory) = start_openvpn(store, &prepared, state.settings.logging)?;
+    let mut updated = state.clone();
+    updated.connection = Some(Connection {
+        profile_id: id,
+        pid: Some(pid),
+        interface: Some(prepared.interface.clone()),
+        started_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    });
+    if let Err(error) = store.save(&updated) {
+        let rollback = stop_process_group(&prepared.kill, &prepared.path, pid, "OpenVPN");
+        let _ = fs::remove_dir_all(&runtime_directory);
+        return match rollback {
+            Ok(()) => Err(error).context("OpenVPN connection rolled back after state save failed"),
+            Err(rollback_error) => Err(error).context(format!("OpenVPN state save and rollback failed: {rollback_error:#}")),
+        };
+    }
+    *state = updated;
+    Ok("connected".into())
+}
+
+fn disconnect_openvpn(store: &Store, state: &mut State, profile: &Profile, connection: &Connection, dry_run: bool) -> Result<String> {
+    let pid = connection.pid.context("OpenVPN connection has no process PID")?;
+    let configuration = openvpn_process_configuration(pid)?;
+    if dry_run {
+        return Ok(format!("terminate owned OpenVPN process group {pid}\nrollback: restart the validated OpenVPN profile"));
+    }
+    let prepared = prepare_openvpn(store, profile, &state.settings)?;
+    let mut disconnected = state.clone();
+    disconnected.connection = None;
+    store.save(&disconnected).context("persist pending OpenVPN disconnect")?;
+    if let Err(error) = stop_process_group(&prepared.kill, &prepared.path, pid, "OpenVPN") {
+        store.save(state).context("restore OpenVPN connection state after failed disconnect")?;
+        return Err(error).context("OpenVPN disconnect failed; connection state restored");
+    }
+    let runtime_directory = configuration.parent().map(Path::to_path_buf);
+    for _ in 0..100 {
+        let exists = Command::new(&prepared.ip).args(["link", "show", "dev", &prepared.interface]).env("PATH", &prepared.path)
+            .stdout(Stdio::null()).stderr(Stdio::null()).status()?.success();
+        if !exists { break; }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if let Some(directory) = runtime_directory {
+        fs::remove_dir_all(directory).context("remove staged OpenVPN configuration")?;
+    }
+    *state = disconnected;
+    Ok("disconnected".into())
+}
+
+fn connect_ikev2(store: &Store, state: &mut State, profile: &Profile, id: String, dry_run: bool) -> Result<String> {
+    if dry_run {
+        return Ok("charon-cmd --host <server> --identity <identity> --p12 <validated-certificate> --profile ikev2-pub\nrollback: terminate the owned IKEv2 process group".into());
+    }
+    let prepared = prepare_ikev2(store, profile)?;
+    let (pid, runtime_directory) = start_ikev2(store, &prepared, state.settings.logging)?;
+    let mut updated = state.clone();
+    updated.connection = Some(Connection {
+        profile_id: id, pid: Some(pid), interface: None,
+        started_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+    });
+    if let Err(error) = store.save(&updated) {
+        let rollback = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2");
+        let _ = fs::remove_dir_all(&runtime_directory);
+        return match rollback {
+            Ok(()) => Err(error).context("IKEv2 connection rolled back after state save failed"),
+            Err(rollback_error) => Err(error).context(format!("IKEv2 state save and rollback failed: {rollback_error:#}")),
+        };
+    }
+    *state = updated;
+    Ok("connected".into())
+}
+
+fn disconnect_ikev2(store: &Store, state: &mut State, profile: &Profile, connection: &Connection, dry_run: bool) -> Result<String> {
+    let pid = connection.pid.context("IKEv2 connection has no process PID")?;
+    let certificate = ikev2_process_certificate(pid)?;
+    if dry_run {
+        return Ok(format!("terminate owned IKEv2 process group {pid}\nrollback: restart the validated IKEv2 profile"));
+    }
+    let prepared = prepare_ikev2(store, profile)?;
+    let mut disconnected = state.clone();
+    disconnected.connection = None;
+    store.save(&disconnected).context("persist pending IKEv2 disconnect")?;
+    if let Err(error) = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2") {
+        store.save(state).context("restore IKEv2 connection state after failed disconnect")?;
+        return Err(error).context("IKEv2 disconnect failed; connection state restored");
+    }
+    if let Some(directory) = certificate.parent() {
+        fs::remove_dir_all(directory).context("remove staged IKEv2 certificate")?;
+    }
+    *state = disconnected;
+    Ok("disconnected".into())
+}
+
 pub fn connect(store: &Store, state: &mut State, profile_id: Option<&str>, dry_run: bool) -> Result<String> {
     refresh_connection(state);
     if state.connection.is_some() {
@@ -751,13 +1085,17 @@ pub fn connect(store: &Store, state: &mut State, profile_id: Option<&str>, dry_r
     if !profile.enabled {
         bail!("profile is disabled");
     }
-    if state.settings.kill_switch || state.settings.strict_kill_switch {
-        bail!("kill switch is enabled but native firewall backend is unavailable; refusing unprotected connection");
-    }
-    if profile.protocol == Protocol::Xray {
+
+    if matches!(profile.protocol, Protocol::Xray | Protocol::Shadowsocks) {
         return connect_xray(store, state, &profile, id, dry_run);
     }
-    let plan = connection_plan(&profile, &state.settings)?;
+    if profile.protocol == Protocol::OpenVpn {
+        return connect_openvpn(store, state, &profile, id, dry_run);
+    }
+    if profile.protocol == Protocol::Ikev2 {
+        return connect_ikev2(store, state, &profile, id, dry_run);
+    }
+    let plan = quick_connection_plan(&profile)?;
     if dry_run {
         return Ok(plan.display());
     }
@@ -805,8 +1143,14 @@ pub fn connect(store: &Store, state: &mut State, profile_id: Option<&str>, dry_r
 pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<String> {
     let connection = state.connection.clone().context("VPN is not connected")?;
     let profile = state.profiles.get(&connection.profile_id).context("connected profile is missing")?.clone();
-    if profile.protocol == Protocol::Xray {
+    if matches!(profile.protocol, Protocol::Xray | Protocol::Shadowsocks) {
         return disconnect_xray(store, state, &profile, &connection, dry_run);
+    }
+    if profile.protocol == Protocol::OpenVpn {
+        return disconnect_openvpn(store, state, &profile, &connection, dry_run);
+    }
+    if profile.protocol == Protocol::Ikev2 {
+        return disconnect_ikev2(store, state, &profile, &connection, dry_run);
     }
     let process_is_valid = connection.pid.is_none_or(|pid| process_belongs_to_profile(pid, &profile));
     if !process_is_valid {
@@ -847,30 +1191,27 @@ pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<Str
 }
 
 fn disconnect_plan(profile: &Profile, connection: &Connection) -> Result<CommandPlan> {
-    match profile.protocol {
-        Protocol::WireGuard => Ok(CommandPlan {
-            program: "wg-quick".into(),
-            args: vec!["down".into(), profile.source.clone()],
-            rollback_program: "wg-quick".into(),
-            rollback_args: vec!["up".into(), profile.source.clone()],
-            interface: connection.interface.clone(),
-        }),
-        Protocol::AmneziaWg => Ok(CommandPlan {
-            program: "awg-quick".into(),
-            args: vec!["down".into(), profile.source.clone()],
-            rollback_program: "awg-quick".into(),
-            rollback_args: vec!["up".into(), profile.source.clone()],
-            interface: connection.interface.clone(),
-        }),
-        _ => bail!("connected protocol has no supported rollback-safe disconnect backend"),
-    }
+    let spec = quick_spec(&profile.protocol)?;
+    Ok(CommandPlan {
+        program: spec.quick_program.into(),
+        args: vec!["down".into(), profile.source.clone()],
+        rollback_program: spec.quick_program.into(),
+        rollback_args: vec!["up".into(), profile.source.clone()],
+        interface: connection.interface.clone(),
+    })
 }
 
 pub fn refresh_connection(state: &mut State) {
     let stale = state.connection.as_ref().is_some_and(|connection| {
         let Some(profile) = state.profiles.get(&connection.profile_id) else { return true };
         if let Some(pid) = connection.pid {
-            if profile.protocol == Protocol::Xray {
+            if profile.protocol == Protocol::Ikev2 {
+                return ikev2_process_certificate(pid).is_err();
+            }
+            if profile.protocol == Protocol::OpenVpn {
+                return openvpn_process_configuration(pid).is_err();
+            }
+            if matches!(profile.protocol, Protocol::Xray | Protocol::Shadowsocks) {
                 return match xray_process_info(pid) {
                     Ok(worker) => connection.interface.as_deref() != Some(&worker.interface),
                     Err(_) => true,
@@ -879,8 +1220,8 @@ pub fn refresh_connection(state: &mut State) {
             return !process_belongs_to_profile(pid, profile);
         }
         let Some(interface) = connection.interface.as_deref() else { return true };
-        let program = if profile.protocol == Protocol::AmneziaWg { "awg" } else { "wg" };
-        match resolve_program(program)
+        let Ok(spec) = quick_spec(&profile.protocol) else { return true };
+        match resolve_program(spec.probe_program)
             .and_then(|executable| Command::new(executable).args(["show", interface]).status().map_err(Into::into))
         {
             Ok(status) => !status.success(),
@@ -1023,18 +1364,8 @@ mod tests {
     }
 
     #[test]
-    fn openvpn_never_runs_untrusted_profile_language() {
-        assert!(connection_plan(&profile(Protocol::OpenVpn), &Settings::default()).is_err());
-    }
-
-    #[test]
-    fn full_bundle_never_claims_native_connection() {
-        assert!(connection_plan(&profile(Protocol::Amnezia), &Settings::default()).is_err());
-    }
-
-    #[test]
     fn network_plans_always_include_opposite_rollback() {
-        let connect = connection_plan(&profile(Protocol::WireGuard), &Settings::default()).unwrap();
+        let connect = quick_connection_plan(&profile(Protocol::WireGuard)).unwrap();
         assert_eq!(connect.args.first().map(String::as_str), Some("up"));
         assert_eq!(connect.rollback_args.first().map(String::as_str), Some("down"));
 

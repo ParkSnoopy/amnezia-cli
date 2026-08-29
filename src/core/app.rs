@@ -149,20 +149,7 @@ fn settings_command(store: &Store, state: &mut State, command: SettingsCommand, 
 fn set_setting(state: &mut State, key: &str, value: &str) -> Result<()> {
     let boolean = || value.parse::<bool>().with_context(|| format!("{key} expects true or false"));
     match key {
-        "primary-dns" => { value.parse::<std::net::IpAddr>().context("primary-dns expects an IP address")?; state.settings.primary_dns = value.into(); }
-        "secondary-dns" => { value.parse::<std::net::IpAddr>().context("secondary-dns expects an IP address")?; state.settings.secondary_dns = value.into(); }
-        "amnezia-dns" => state.settings.amnezia_dns = boolean()?,
-        "kill-switch" => state.settings.kill_switch = boolean()?,
-        "strict-kill-switch" => state.settings.strict_kill_switch = boolean()?,
-        "auto-connect" => state.settings.auto_connect = boolean()?,
-        "auto-start" => state.settings.auto_start = boolean()?,
-        "start-minimized" => state.settings.start_minimized = boolean()?,
         "logging" => state.settings.logging = boolean()?,
-        "notifications" => state.settings.notifications = boolean()?,
-        "screenshots" => state.settings.screenshots = boolean()?,
-        "language" => state.settings.language = value.into(),
-        "gateway-endpoint" => state.settings.gateway_endpoint = nonempty(value),
-        "subscription-key" => state.settings.subscription_key = nonempty(value),
         _ => bail!("unknown setting: {key}"),
     }
     Ok(())
@@ -172,15 +159,22 @@ fn split_command(store: &Store, state: &mut State, command: SplitTunnelCommand, 
     if matches!(&command, SplitTunnelCommand::List) {
         writeln!(output, "mode: {:?}", state.settings.route_mode)?;
         for value in &state.settings.split_routes { writeln!(output, "route\t{}", sanitize_terminal(value))?; }
-        for value in &state.settings.split_apps { writeln!(output, "app\t{}", sanitize_terminal(value))?; }
-        for value in &state.settings.kill_switch_exceptions { writeln!(output, "kill-switch-exception\t{}", sanitize_terminal(value))?; }
         return Ok(());
+    }
+    if state.connection.is_some() {
+        bail!("disconnect VPN before changing split-tunnel routing");
     }
     update_state(store, state, |updated| {
         match command {
             SplitTunnelCommand::List => unreachable!("list returned before mutation"),
-            SplitTunnelCommand::Add { kind, value } => add_unique(split_values_mut(updated, kind), value),
-            SplitTunnelCommand::Remove { kind, value } => split_values_mut(updated, kind).retain(|entry| entry != &value),
+            SplitTunnelCommand::Add { kind, value } => {
+                let value = crate::core::routing::Network::parse(&value)?.cidr();
+                add_unique(split_values_mut(updated, kind), value);
+            }
+            SplitTunnelCommand::Remove { kind, value } => {
+                let value = crate::core::routing::Network::parse(&value)?.cidr();
+                split_values_mut(updated, kind).retain(|entry| entry != &value);
+            }
             SplitTunnelCommand::Clear { kind } => split_values_mut(updated, kind).clear(),
             SplitTunnelCommand::Mode { mode } => updated.settings.route_mode = match mode {
                 SplitMode::All => RouteMode::All,
@@ -195,8 +189,6 @@ fn split_command(store: &Store, state: &mut State, command: SplitTunnelCommand, 
 fn split_values_mut(state: &mut State, kind: SplitKind) -> &mut Vec<String> {
     match kind {
         SplitKind::Route => &mut state.settings.split_routes,
-        SplitKind::App => &mut state.settings.split_apps,
-        SplitKind::KillSwitchException => &mut state.settings.kill_switch_exceptions,
     }
 }
 
@@ -267,16 +259,17 @@ fn doctor(store: &Store, state: &State, output: &mut String) -> Result<()> {
     }
     for profile in state.profiles.values() {
         match profile.protocol {
-            model::Protocol::WireGuard | model::Protocol::AmneziaWg | model::Protocol::Xray => {
+            model::Protocol::OpenVpn
+            | model::Protocol::WireGuard
+            | model::Protocol::AmneziaWg
+            | model::Protocol::Xray
+            | model::Protocol::Shadowsocks
+            | model::Protocol::Ikev2 => {
                 match runner::check_profile_dependencies(store, profile, &state.settings) {
                     Ok(()) => writeln!(output, "profile {}: ok", profile.id)?,
                     Err(error) => failures.push(format!("profile {}: {error:#}", profile.id)),
                 }
             }
-            model::Protocol::OpenVpn
-            | model::Protocol::Shadowsocks
-            | model::Protocol::Ikev2
-            | model::Protocol::Amnezia => {}
         }
     }
     if !failures.is_empty() {
@@ -305,6 +298,4 @@ fn server_ref<'a>(state: &'a State, id: &str) -> Result<&'a Server> {
     state.servers.get(id).with_context(|| format!("unknown server: {id}"))
 }
 
-fn nonempty(value: &str) -> Option<String> {
-    if value.is_empty() { None } else { Some(value.into()) }
-}
+

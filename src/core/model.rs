@@ -10,7 +10,6 @@ pub enum Protocol {
     Xray,
     Shadowsocks,
     Ikev2,
-    Amnezia,
 }
 
 impl std::fmt::Display for Protocol {
@@ -22,7 +21,6 @@ impl std::fmt::Display for Protocol {
             Self::Xray => "XRay",
             Self::Shadowsocks => "Shadowsocks",
             Self::Ikev2 => "IKEv2",
-            Self::Amnezia => "Amnezia",
         };
         f.write_str(value)
     }
@@ -60,47 +58,17 @@ pub enum RouteMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
-    pub primary_dns: String,
-    pub secondary_dns: String,
-    pub amnezia_dns: bool,
-    pub kill_switch: bool,
-    pub strict_kill_switch: bool,
-    pub auto_connect: bool,
-    pub auto_start: bool,
-    pub start_minimized: bool,
     pub logging: bool,
-    pub notifications: bool,
-    pub screenshots: bool,
     pub route_mode: RouteMode,
     pub split_routes: Vec<String>,
-    pub split_apps: Vec<String>,
-    pub kill_switch_exceptions: Vec<String>,
-    pub language: String,
-    pub gateway_endpoint: Option<String>,
-    pub subscription_key: Option<String>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            primary_dns: "1.1.1.1".into(),
-            secondary_dns: "1.0.0.1".into(),
-            amnezia_dns: false,
-            kill_switch: false,
-            strict_kill_switch: false,
-            auto_connect: false,
-            auto_start: false,
-            start_minimized: false,
             logging: true,
-            notifications: true,
-            screenshots: false,
             route_mode: RouteMode::All,
             split_routes: Vec::new(),
-            split_apps: Vec::new(),
-            kill_switch_exceptions: Vec::new(),
-            language: "en".into(),
-            gateway_endpoint: None,
-            subscription_key: None,
         }
     }
 }

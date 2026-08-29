@@ -8,7 +8,7 @@ A release is ready only when every applicable gate below passes against the curr
 - The default invocation remains the CLI and `--tui` remains the only TUI launcher.
 - CLI and TUI action coverage remains shared through `src/core`.
 - No `scripts/` build path or `CHANGELOG.md` is introduced; Cargo `build.rs` owns bundle construction.
-- Any new dependency or dependency version change has explicit approval.
+- New dependencies are documented; existing dependency version changes require explicit approval.
 
 ## Build prerequisites
 
@@ -60,13 +60,17 @@ target/x86_64-unknown-linux-musl/release/libexec/amn/geosite.dat
 - Before mutation, preflight resolves protocol tools, `ip`, quick-script utilities, conditional DNS/firewall utilities, and the required kernel module or userspace backend.
 - Raw XRay accepts only JSON VLESS Reality profiles using the `raw` transport, replaces imported inbounds with a loopback-only SOCKS inbound, resolves and pins the endpoint before route mutation, blocks IPv6 leakage with a reversible unreachable route, and preflights the bundled runner, `tun2socks`, `ip`, `setsid`, and `kill`.
 - Every raw XRay address, link, endpoint-route, split-default-route, and worker-process mutation has a recorded reverse action; disconnect persists its pending state before mutation and restores the worker and routes if a later action fails.
+- Shadowsocks accepts SIP002 links and Shadowsocks XRay JSON, normalizes both to a loopback-only SOCKS inbound, and uses the same endpoint-pinned XRay lifecycle and rollback gates.
+- OpenVPN rejects executable, background, external-credential-file, and interactive-challenge directives; it uses a private staged configuration, fixed owned interface, isolated process group, startup interface verification, and process-group rollback.
+- IKEv2 accepts validated Amnezia JSON with a PKCS#12 certificate, stages only the decoded certificate privately, passes its password through stdin rather than argv, verifies an endpoint security association, and owns an isolated `charon-cmd` process group.
+- Amnezia connection keys are decoded with size-checked Qt-compatible compression and normalized to their preferred supported protocol during import; no generic non-connectable protocol entry is stored.
 - Every supported connect and disconnect plan has the opposite rollback action.
 - Connect rollback removes an interface only when its exact live peer set matches the selected profile.
 - Disconnect refuses an absent interface or an interface whose exact peer set differs from the selected profile; failed persistence restores the selected profile only after a verified owned interface transition.
 
 ## Runtime acceptance
 
-Complete these gates on an isolated Linux host or disposable VM with root access. Raw XRay VLESS Reality and AmneziaWG are the primary protocol gates; WireGuard is secondary:
+Complete these gates on an isolated Linux host or disposable VM with root access for OpenVPN, WireGuard, AmneziaWG, raw XRay VLESS Reality, Shadowsocks, and IKEv2:
 
 1. Run `amn doctor` and confirm every required runtime dependency passes.
 2. Connect each supported protocol and verify the intended interface, addresses, routes, DNS behavior, and traffic path.
@@ -74,7 +78,9 @@ Complete these gates on an isolated Linux host or disposable VM with root access
 4. Inject a command failure after interface creation and verify connect rollback removes only the created profile-owned interface.
 5. Inject a persistence failure after successful connect and after successful disconnect; verify the opposite action restores the pre-operation state.
 6. Create a same-named interface with a different or additional peer and verify mutation and rollback are refused.
-7. For raw XRay, verify the endpoint remains on the original uplink while IPv4 split-default routes use `amnxray0`, DNS traffic follows the tunnel, the worker process group stops cleanly, and injected route/process failures restore every earlier mutation.
-8. Verify OpenVPN, Shadowsocks, and IKEv2 are explicitly refused rather than reported as connected.
+7. For raw XRay and Shadowsocks, verify the endpoint remains on the original uplink, selected route mode uses `amnxray0`, all-traffic modes prevent IPv6 leakage, the worker process group stops cleanly, and injected route/process failures restore every earlier mutation.
+8. For OpenVPN, verify inline-certificate and inline-credential profiles connect, route modes work, pushed DNS is applied, `amnovpn0` disappears on disconnect, and process/persistence failures restore the previous state.
+9. For IKEv2, verify PKCS#12 authentication, installed IPsec policies/routes, DNS behavior, process cleanup, and failure rollback.
+10. Import a real `vpn://` key for each available Amnezia container and verify the preferred native protocol is selected and connectable.
 
 Record real-host runtime acceptance separately from automated build/test results. If these runtime gates have not been performed, the release remains unverified for privileged VPN behavior.

@@ -10,6 +10,10 @@ pub struct RawConfiguration {
 }
 
 impl RawConfiguration {
+    pub(crate) fn from_parts(document: Value, endpoint_host: String, endpoint_port: u16, outbound_index: usize) -> Self {
+        Self { document, endpoint_host, endpoint_port, outbound_index }
+    }
+
     pub fn parse(text: &str) -> Result<Self> {
         let mut document: Value = serde_json::from_str(text).context("raw XRay profile is not valid JSON")?;
         let root = document.as_object_mut().context("raw XRay profile must be a JSON object")?;
@@ -62,13 +66,17 @@ impl RawConfiguration {
 
     pub fn render_for_endpoint(mut self, endpoint: std::net::Ipv4Addr) -> Result<String> {
         let outbounds = self.document.get_mut("outbounds").and_then(Value::as_array_mut).context("validated XRay outbounds disappeared")?;
-        let server = outbounds.get_mut(self.outbound_index).and_then(|outbound| outbound.pointer_mut("/settings/vnext/0"))
-            .and_then(Value::as_object_mut).context("validated XRay server disappeared")?;
+        let outbound = outbounds.get_mut(self.outbound_index).context("validated XRay outbound disappeared")?;
+        let server = if outbound.pointer("/settings/vnext/0").is_some() {
+            outbound.pointer_mut("/settings/vnext/0")
+        } else {
+            outbound.pointer_mut("/settings/servers/0")
+        }
+        .and_then(Value::as_object_mut).context("validated XRay server disappeared")?;
         server.insert("address".into(), Value::String(endpoint.to_string()));
         serde_json::to_string(&self.document).context("serialize normalized XRay configuration")
     }
 }
-
 
 #[cfg(test)]
 mod tests {

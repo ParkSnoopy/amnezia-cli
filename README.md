@@ -1,26 +1,16 @@
 # AmneziaVPN TUI
 
-AmneziaVPN TUI manages and connects AmneziaVPN profiles from an interactive TUI or CLI.
-
-## Build
-
-Install Rust with the `x86_64-unknown-linux-musl` target, Conan 2, a C compiler, musl tools, CMake, and Ninja, then build the release bundle:
-
-```text
-cargo build --release
-```
-
-Cargo builds `amn` as a statically linked musl executable and builds the required recipes from `amnezia-client/recipes/`. Missing tools, recipes, recipe outputs, or the Conan default profile stop the build. The resulting `amn` and its `libexec/amn` files form the release bundle.
+AmneziaVPN TUI manages and connects VPN profiles from an interactive terminal dashboard or command-line interface.
 
 ## Usage
 
-Open interactive terminal dashboard with `--tui`:
+Open the interactive dashboard:
 
 ```text
 amn --tui
 ```
 
-Import a native VPN profile, inspect it, and connect:
+Import a profile and connect:
 
 ```text
 amn profile import ~/vpn/home.conf --name Home
@@ -30,38 +20,39 @@ amn status
 amn disconnect
 ```
 
-Imported native profile formats:
-
-- OpenVPN
-- WireGuard
-- AmneziaWG
-- XRay
-- Shadowsocks
-- IKEv2
-
-Direct connection is enabled for raw-transport XRay VLESS Reality, AmneziaWG, and WireGuard. Raw XRay JSON profiles are normalized to a loopback-only SOCKS inbound and routed through the bundled XRay runner and `tun2socks`. OpenVPN, Shadowsocks, and IKEv2 remain unavailable until their bundled isolated or privileged routing backends are integrated; `amn` refuses them instead of reporting a false VPN connection.
-
-Amnezia full-access bundles and XRay share links can be imported and stored. Export them to a native protocol configuration before connecting.
-
-The Cargo build builds AmneziaVPN recipe outputs and places `openvpn`, `tun2socks`, `amneziawg-go`, `amnezia-xray-runner`, `geoip.dat`, and `geosite.dat` under `libexec/amn` beside `amn`. AmneziaWG and WireGuard connections also require their platform tools (`awg`, `awg-quick`, `wg`, and `wg-quick`) in a root-owned bundle or system program directory. Raw XRay uses the bundled runner and `tun2socks` plus trusted `ip`, `setsid`, and `kill` tools.
-
-Before changing an interface, `amn` requires root execution and validates the managed profile, command-line tools, DNS and firewall helpers, and the required kernel module or userspace backend. It executes a validated profile copy from a root-owned private runtime directory. Every connect and disconnect plan includes the opposite rollback action; failures restore the interface only when its current ownership still matches the selected profile.
-
-Use `--dry-run` to inspect the exact external command without connecting:
+Use `--dry-run` to preview a connection and its rollback without changing the network:
 
 ```text
 amn --dry-run connect
 ```
 
+## Supported profiles
+
+- **AmneziaWG** through `awg-quick`
+- **WireGuard** through `wg-quick`
+- **OpenVPN** through the bundled OpenVPN client
+- **XRay VLESS Reality** JSON using the `raw` transport
+- **Shadowsocks** SIP002 `ss://` links and Shadowsocks XRay JSON
+- **IKEv2** Amnezia JSON profiles containing a PKCS#12 client certificate
+- **Amnezia connection keys and full-access bundles**, normalized to their selected supported protocol during import
+
+OpenVPN profiles must be self-contained. Inline certificates and credentials are accepted; executable hooks, external credential files, background process directives, and interactive challenges are rejected.
+
+XRay profiles are normalized to a loopback-only SOCKS inbound. IKEv2 requires `charon-cmd` from strongSwan. AmneziaWG and WireGuard require their matching quick-script and control tools. All connections require trusted `ip`, `setsid`, and process-control tools where applicable.
+
+Before changing the network, `amn` validates the managed profile, root privileges, protocol programs, conditional DNS and firewall helpers, and kernel or userspace backends. Private profiles, state, backups, runtime configurations, and logs use owner-only permissions where supported.
+
 ## AmneziaVPN TUI
 
-Use `↑` and `↓` to select any connection, profile, server, settings, split-tunnel, backup, log, or diagnostic action. Press `Enter`, provide requested values inside the TUI, then press `Enter` again to run it.
+Use `↑` and `↓` to select connection, profile, server, settings, split-tunnel, backup, log, or diagnostic actions. Press `Enter`, provide the requested values inside the TUI, then press `Enter` again to run the action.
 
 - `PgUp` or `PgDn`: scroll action results
 - `c`: connect the default profile
 - `d`: disconnect
 - `r`: reload saved state
 - `q` or `Esc`: quit
+
+The TUI exposes the same operations as the command-line interface.
 
 ## Servers
 
@@ -76,20 +67,21 @@ amn server scan SERVER_ID
 
 Password credentials are never accepted or saved. Server scanning reports Docker containers through SSH.
 
-## DNS, routing, and safety
+## Routing
 
 ```text
-amn settings set primary-dns 9.9.9.9
 amn split-tunnel mode only-listed
 amn split-tunnel add route 10.0.0.0/8
 amn split-tunnel list
 ```
 
-Routing settings are preserved for the bundled privileged backend. WireGuard and AmneziaWG retain routing rules from their native profiles.
+OpenVPN and XRay support all-traffic, only-listed, and except-listed route modes. XRay split routes are IPv4 networks; OpenVPN accepts IPv4 and IPv6 networks. WireGuard and AmneziaWG use the routes in their native profiles.
 
-Kill-switch settings are preserved, but connection is refused while either kill switch is enabled because this version has no native firewall backend. This prevents an unprotected connection from being reported as protected.
+Connection logging can be enabled or disabled:
 
-Imported profiles, saved state, and backups are written with owner-only permissions on Unix systems. OpenVPN profiles containing executable hook directives are rejected.
+```text
+amn settings set logging true
+```
 
 ## Backup and logs
 
@@ -101,4 +93,4 @@ amn logs export ~/amnezia-connection.log
 amn logs clear
 ```
 
-Run `amn doctor` to check tools required by imported profiles.
+Run `amn doctor` to check the runtime tools required by every imported profile.

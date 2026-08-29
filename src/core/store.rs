@@ -1,10 +1,14 @@
 use crate::core::model::{Profile, Protocol, State};
 use anyhow::{Context, Result, bail};
+
+use flate2::read::ZlibDecoder;
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
+
+const MAX_PROFILE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct BackupFile {
@@ -62,10 +66,14 @@ impl Store {
     }
 
     pub fn import_profile(&self, state: &mut State, path: &Path, name: Option<String>) -> Result<String> {
+        if fs::metadata(path).with_context(|| format!("inspect {}", path.display()))?.len() > MAX_PROFILE_BYTES as u64 {
+            bail!("profile exceeds the 16 MiB size limit");
+        }
         let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
         let text = String::from_utf8(data).context("profile is not UTF-8 text")?;
-        let protocol = detect_protocol(&text, path)?;
+        let (text, protocol) = normalize_imported_profile(&text, path)?;
         reject_executable_directives(&text, &protocol)?;
+        validate_protocol_configuration(&text, &protocol)?;
         let id = Uuid::new_v4().simple().to_string();
         let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("conf");
         let file_stem = if matches!(protocol, Protocol::WireGuard | Protocol::AmneziaWg) {
@@ -165,6 +173,7 @@ impl Store {
             }
             let text = backup.profiles.get(id).with_context(|| format!("missing profile data: {id}"))?;
             reject_executable_directives(text, &profile.protocol)?;
+            validate_protocol_configuration(text, &profile.protocol)?;
             let destination = restored_profile_path(&profiles_root, id, &profile.protocol);
             if !destinations.insert(destination) {
                 bail!("backup profile IDs resolve to duplicate filenames");
@@ -263,6 +272,7 @@ impl Store {
         }
         let text = fs::read_to_string(&source)?;
         reject_executable_directives(&text, &profile.protocol)?;
+        validate_protocol_configuration(&text, &profile.protocol)?;
         Ok(text)
     }
 
@@ -283,6 +293,81 @@ fn restored_profile_path(profiles_dir: &Path, id: &str, protocol: &Protocol) -> 
     profiles_dir.join(format!("{file_stem}.conf"))
 }
 
+fn normalize_imported_profile(text: &str, path: &Path) -> Result<(String, Protocol)> {
+    let decoded = if let Some(value) = text.trim().strip_prefix("vpn://") {
+        let bytes = crate::core::encoding::decode_base64(value, "Amnezia connection key is not valid base64")?;
+        decode_qcompress(&bytes).unwrap_or(bytes)
+    } else {
+        text.as_bytes().to_vec()
+    };
+    let decoded = String::from_utf8(decoded).context("decoded Amnezia profile is not UTF-8")?;
+    if let Ok(document) = serde_json::from_str::<serde_json::Value>(&decoded)
+        && document.get("containers").is_some()
+    {
+        return extract_amnezia_protocol(&document);
+    }
+    Ok((decoded.clone(), detect_protocol(&decoded, path)?))
+}
+
+fn decode_qcompress(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 5 { return None; }
+    let expected = u32::from_be_bytes(data[..4].try_into().ok()?) as usize;
+    if expected > MAX_PROFILE_BYTES { return None; }
+    let mut output = Vec::with_capacity(expected);
+    ZlibDecoder::new(&data[4..]).take(expected as u64 + 1).read_to_end(&mut output).ok()?;
+    (output.len() == expected).then_some(output)
+}
+
+fn extract_amnezia_protocol(document: &serde_json::Value) -> Result<(String, Protocol)> {
+    let containers = document.get("containers").and_then(serde_json::Value::as_array)
+        .context("Amnezia bundle has no containers array")?;
+    let preferred = document.get("defaultContainer").or_else(|| document.get("default_container"))
+        .and_then(serde_json::Value::as_str);
+    let ordered = containers.iter().filter(|container| {
+        preferred.is_some_and(|name| container.get("container").and_then(serde_json::Value::as_str) == Some(name))
+    }).chain(containers.iter().filter(|container| {
+        !preferred.is_some_and(|name| container.get("container").and_then(serde_json::Value::as_str) == Some(name))
+    }));
+    for container in ordered {
+        let name = container.get("container").and_then(serde_json::Value::as_str).unwrap_or_default().to_ascii_lowercase();
+        let candidates = if name.contains("openvpn") {
+            Some((Protocol::OpenVpn, ["openvpn", "openvpn_config_data"].as_slice()))
+        } else if name.contains("ssxray") || name.contains("shadowsocks") {
+            Some((Protocol::Shadowsocks, ["ssxray", "shadowsocks", "ssxray_config_data"].as_slice()))
+        } else if name.contains("xray") {
+            Some((Protocol::Xray, ["xray", "xray_config_data"].as_slice()))
+        } else if name.contains("amnezia-awg") || name.ends_with("awg") {
+            Some((Protocol::AmneziaWg, ["awg", "amneziawg", "awg_config_data"].as_slice()))
+        } else if name.contains("wireguard") {
+            Some((Protocol::WireGuard, ["wireguard", "wireguard_config_data"].as_slice()))
+        } else if name.contains("ipsec") || name.contains("ikev2") {
+            Some((Protocol::Ikev2, ["ikev2", "ikev2_config_data"].as_slice()))
+        } else {
+            None
+        };
+        let Some((protocol, keys)) = candidates else { continue };
+        let value = keys.iter().find_map(|key| container.get(*key));
+        let Some(value) = value else { continue };
+        let last = value.get("last_config").and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("config").and_then(serde_json::Value::as_str));
+        let Some(last) = last else {
+            if protocol == Protocol::Ikev2 {
+                return Ok((serde_json::to_string(value)?, protocol));
+            }
+            continue;
+        };
+        if matches!(protocol, Protocol::OpenVpn | Protocol::WireGuard | Protocol::AmneziaWg) {
+            if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(last)
+                && let Some(configuration) = wrapper.get("config").and_then(serde_json::Value::as_str)
+            {
+                return Ok((configuration.to_owned(), protocol));
+            }
+        }
+        return Ok((last.to_owned(), protocol));
+    }
+    bail!("Amnezia bundle contains no supported VPN protocol configuration")
+}
+
 pub fn detect_protocol(text: &str, path: &Path) -> Result<Protocol> {
     let lower = text.to_ascii_lowercase();
     let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -298,21 +383,27 @@ pub fn detect_protocol(text: &str, path: &Path) -> Result<Protocol> {
     if extension == "ovpn" || lower.lines().any(|line| line.trim_start().starts_with("remote ")) {
         return Ok(Protocol::OpenVpn);
     }
-    if lower.trim_start().starts_with('{') && (lower.contains("\"outbounds\"") || lower.contains("\"inbounds\"")) {
-        return Ok(Protocol::Xray);
+    if lower.trim_start().starts_with('{')
+        && lower.contains("\"cert\"")
+        && (lower.contains("\"hostname\"") || lower.contains("\"host_name\"") || lower.contains("\"ikev2_config_data\""))
+    {
+        return Ok(Protocol::Ikev2);
     }
-    if ["vless://", "vmess://", "trojan://"].iter().any(|prefix| lower.trim_start().starts_with(prefix)) {
+    if lower.trim_start().starts_with('{') && (lower.contains("\"outbounds\"") || lower.contains("\"inbounds\"")) {
+        if serde_json::from_str::<serde_json::Value>(text).ok()
+            .and_then(|document| document.get("outbounds").and_then(serde_json::Value::as_array).cloned())
+            .is_some_and(|outbounds| outbounds.iter().any(|outbound| {
+                outbound.get("protocol").and_then(serde_json::Value::as_str) == Some("shadowsocks")
+            }))
+        {
+            return Ok(Protocol::Shadowsocks);
+        }
         return Ok(Protocol::Xray);
     }
     if lower.trim_start().starts_with("ss://") {
         return Ok(Protocol::Shadowsocks);
     }
-    if lower.contains("conn ") && lower.contains("left") && lower.contains("right") {
-        return Ok(Protocol::Ikev2);
-    }
-    if lower.trim_start().starts_with("vpn://") || lower.contains("\"containers\"") {
-        return Ok(Protocol::Amnezia);
-    }
+
     bail!("unsupported profile format")
 }
 
@@ -392,13 +483,62 @@ fn reject_executable_directives(text: &str, protocol: &Protocol) -> Result<()> {
     }
     const UNSAFE: &[&str] = &[
         "up", "down", "route-up", "route-pre-down", "ipchange", "client-connect",
-        "learn-address", "auth-user-pass-verify", "tls-verify", "plugin", "config",
-        "script-security",
+        "client-disconnect", "learn-address", "auth-user-pass-verify", "tls-verify", "plugin",
+        "config", "script-security", "daemon", "management", "management-client", "writepid",
+        "log", "log-append", "status", "cd", "chroot",
+    ];
+    const EXTERNAL_SECRET_FILES: &[&str] = &[
+        "ca", "cert", "key", "pkcs12", "auth-user-pass", "http-proxy-user-pass", "tls-auth",
+        "tls-crypt", "tls-crypt-v2", "secret", "crl-verify", "askpass", "auth-gen-token-secret",
     ];
     for line in text.lines() {
-        let directive = line.trim_start().trim_start_matches('-').split_whitespace().next().unwrap_or("");
-        if UNSAFE.contains(&directive) {
+        let fields = line.trim_start().trim_start_matches('-').split_whitespace().collect::<Vec<_>>();
+        let directive = fields.first().copied().unwrap_or("").to_ascii_lowercase();
+        if UNSAFE.contains(&directive.as_str()) {
             bail!("OpenVPN profile contains executable directive '{directive}'");
+        }
+        if EXTERNAL_SECRET_FILES.contains(&directive.as_str())
+            && fields.get(1).is_some_and(|value| *value != "[inline]")
+        {
+            bail!("OpenVPN profile references an external credential file with directive '{directive}'");
+        }
+        if directive == "auth-user-pass" && fields.get(1).is_none() && !text.contains("<auth-user-pass>") {
+            bail!("OpenVPN profile requires interactive credentials; embed auth-user-pass credentials in the profile");
+        }
+        if directive == "static-challenge" {
+            bail!("OpenVPN profile requires an interactive static challenge");
+        }
+    }
+    Ok(())
+}
+
+fn validate_protocol_configuration(text: &str, protocol: &Protocol) -> Result<()> {
+    match protocol {
+        Protocol::OpenVpn => {
+            crate::core::openvpn::prepare(text, &crate::core::model::Settings::default())?;
+        }
+        Protocol::Xray => {
+            crate::core::xray::RawConfiguration::parse(text)?;
+        }
+        Protocol::Shadowsocks => {
+            crate::core::shadowsocks::parse(text)?;
+        }
+        Protocol::Ikev2 => {
+            crate::core::ikev2::validate(text)?;
+        }
+        Protocol::WireGuard | Protocol::AmneziaWg => {
+            let has_private_key = text.lines().filter_map(|line| line.split_once('=')).any(|(key, value)| {
+                key.trim().eq_ignore_ascii_case("PrivateKey") && !value.split('#').next().unwrap_or_default().trim().is_empty()
+            });
+            if !has_private_key {
+                bail!("WireGuard profile has no private key");
+            }
+            let has_public_key = text.lines().filter_map(|line| line.split_once('=')).any(|(key, value)| {
+                key.trim().eq_ignore_ascii_case("PublicKey") && !value.split('#').next().unwrap_or_default().trim().is_empty()
+            });
+            if !has_public_key {
+                bail!("WireGuard profile has no peer public key");
+            }
         }
     }
     Ok(())
@@ -413,6 +553,24 @@ mod tests {
         assert_eq!(detect_protocol("[Interface]\nPrivateKey=x\n[Peer]\nPublicKey=y", Path::new("x.conf")).unwrap(), Protocol::WireGuard);
         assert_eq!(detect_protocol("[Interface]\nJc = 4\n[Peer]\nPublicKey=y", Path::new("x.conf")).unwrap(), Protocol::AmneziaWg);
         assert_eq!(detect_protocol("{\"outbounds\":[]}", Path::new("x.json")).unwrap(), Protocol::Xray);
+        assert_eq!(detect_protocol("{\"hostName\":\"vpn.example\",\"cert\":\"AA==\"}", Path::new("x.json")).unwrap(), Protocol::Ikev2);
+        let shadowsocks = r#"{"outbounds":[{"protocol":"shadowsocks"}]}"#;
+        assert_eq!(detect_protocol(shadowsocks, Path::new("x.json")).unwrap(), Protocol::Shadowsocks);
+        assert!(detect_protocol("vless://unsupported-share-link", Path::new("x.txt")).is_err());
+    }
+
+    #[test]
+    fn extracts_default_protocol_from_amnezia_bundle() {
+        let bundle = r#"{
+            "defaultContainer":"amnezia-openvpn",
+            "containers":[{
+                "container":"amnezia-openvpn",
+                "openvpn":{"last_config":"{\"config\":\"client\\nremote vpn.example 1194\"}"}
+            }]
+        }"#;
+        let (configuration, protocol) = normalize_imported_profile(bundle, Path::new("bundle.json")).unwrap();
+        assert_eq!(protocol, Protocol::OpenVpn);
+        assert_eq!(configuration, "client\nremote vpn.example 1194");
     }
 
     #[test]

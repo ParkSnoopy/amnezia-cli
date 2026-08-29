@@ -76,8 +76,6 @@ pub enum SettingsCommand {
 #[derive(Debug, Clone, ValueEnum)]
 pub enum SplitKind {
     Route,
-    App,
-    KillSwitchException,
 }
 
 #[derive(Debug, Subcommand)]
@@ -190,9 +188,9 @@ impl TuiAction for FeatureAction {
             Self::SettingsSet => ActionInfo::new("Settings", "Set", "settings set", "<KEY> <VALUE>"),
             Self::SettingsReset => ActionInfo::new("Settings", "Reset", "settings reset", ""),
             Self::SplitList => ActionInfo::new("Split tunnel", "List", "split-tunnel list", ""),
-            Self::SplitAdd => ActionInfo::new("Split tunnel", "Add", "split-tunnel add", "<route|app|kill-switch-exception> <VALUE>"),
-            Self::SplitRemove => ActionInfo::new("Split tunnel", "Remove", "split-tunnel remove", "<route|app|kill-switch-exception> <VALUE>"),
-            Self::SplitClear => ActionInfo::new("Split tunnel", "Clear", "split-tunnel clear", "<route|app|kill-switch-exception>"),
+            Self::SplitAdd => ActionInfo::new("Split tunnel", "Add", "split-tunnel add", "route <CIDR>"),
+            Self::SplitRemove => ActionInfo::new("Split tunnel", "Remove", "split-tunnel remove", "route <CIDR>"),
+            Self::SplitClear => ActionInfo::new("Split tunnel", "Clear", "split-tunnel clear", "route"),
             Self::SplitMode => ActionInfo::new("Split tunnel", "Mode", "split-tunnel mode", "<all|only-listed|except-listed>"),
             Self::BackupCreate => ActionInfo::new("Backup", "Create", "backup create", "<DESTINATION>"),
             Self::BackupRestore => ActionInfo::new("Backup", "Restore", "backup restore", "<SOURCE>"),
