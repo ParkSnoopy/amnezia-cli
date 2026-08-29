@@ -1,6 +1,15 @@
-use crate::core::model::{RouteMode, Settings};
-use crate::core::routing::Network;
-use anyhow::{Result, bail};
+use anyhow::{
+    Result,
+    bail,
+};
+
+use crate::core::{
+    model::{
+        RouteMode,
+        Settings,
+    },
+    routing::Network,
+};
 
 pub struct Configuration {
     pub text: String,
@@ -8,8 +17,10 @@ pub struct Configuration {
 }
 
 pub fn prepare(source: &str, settings: &Settings) -> Result<Configuration> {
-
-    if !source.lines().any(|line| line.trim_start().starts_with("remote ")) {
+    if !source
+        .lines()
+        .any(|line| line.trim_start().starts_with("remote "))
+    {
         bail!("OpenVPN profile has no remote server");
     }
     let mut text = source.to_owned();
@@ -25,7 +36,10 @@ pub fn prepare(source: &str, settings: &Settings) -> Result<Configuration> {
             append_routes(&mut text, &settings.split_routes, true)?;
         }
     }
-    Ok(Configuration { text, interface: "amnovpn0".into() })
+    Ok(Configuration {
+        text,
+        interface: "amnovpn0".into(),
+    })
 }
 
 fn append_routes(configuration: &mut String, routes: &[String], net_gateway: bool) -> Result<()> {
@@ -42,7 +56,10 @@ mod tests {
 
     #[test]
     fn applies_route_mode_without_executable_hooks() {
-        let mut settings = Settings { route_mode: RouteMode::OnlyListed, ..Settings::default() };
+        let mut settings = Settings {
+            route_mode: RouteMode::OnlyListed,
+            ..Settings::default()
+        };
         settings.split_routes.push("10.0.0.0/8".into());
         let prepared = prepare("client\nremote vpn.example 1194", &settings).unwrap();
         assert!(prepared.text.contains("route-nopull"));

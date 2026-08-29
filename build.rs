@@ -1,9 +1,14 @@
-use std::env;
-use std::ffi::OsStr;
-use std::fs;
-use std::io::Read;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::{
+    env,
+    ffi::OsStr,
+    fs,
+    io::Read,
+    path::{
+        Path,
+        PathBuf,
+    },
+    process::Command,
+};
 
 #[derive(Clone, Copy)]
 enum RecipeArtifact {
@@ -19,7 +24,9 @@ trait BundledArtifact {
     fn package_path(self) -> &'static str;
     fn destination_name(self) -> &'static str;
     fn executable(self) -> bool;
-    fn next(self) -> Option<Self> where Self: Sized;
+    fn next(self) -> Option<Self>
+    where
+        Self: Sized;
 }
 
 impl BundledArtifact for RecipeArtifact {
@@ -105,7 +112,8 @@ impl RecipeInput {
     }
 }
 
-const AMNEZIA_REMOTE: &str = "https://artifactory.amnezia.org/artifactory/api/conan/client-prebuilts";
+const AMNEZIA_REMOTE: &str =
+    "https://artifactory.amnezia.org/artifactory/api/conan/client-prebuilts";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -121,7 +129,9 @@ fn main() {
     for recipe in std::iter::successors(Some(RecipeInput::OpenVpn), |recipe| recipe.next()) {
         require_file(&recipes.join(recipe.directory()).join("conanfile.py"));
     }
-    if required_env("CARGO_CFG_TARGET_OS") != "linux" || required_env("CARGO_CFG_TARGET_ARCH") != "x86_64" {
+    if required_env("CARGO_CFG_TARGET_OS") != "linux"
+        || required_env("CARGO_CFG_TARGET_ARCH") != "x86_64"
+    {
         panic!("recipe bundle currently supports only native Linux x86_64 builds");
     }
     let conan = require_program("conan", "Conan 2");
@@ -135,7 +145,10 @@ fn main() {
     run(&conan, ["profile", "path", "default"], &manifest);
     let remotes = run_capture(&conan, ["remote", "list"], &manifest);
     let expected_remote = format!("amnezia: {AMNEZIA_REMOTE}");
-    if !remotes.lines().any(|line| line.starts_with(&expected_remote)) {
+    if !remotes
+        .lines()
+        .any(|line| line.starts_with(&expected_remote))
+    {
         panic!("required Conan remote is missing or has the wrong URL: {expected_remote}");
     }
     export_recipes(&conan, &recipes);
@@ -144,7 +157,10 @@ fn main() {
     let deploy = conan_output.join("deploy");
     if conan_output.exists() {
         fs::remove_dir_all(&conan_output).unwrap_or_else(|error| {
-            panic!("remove stale Conan output {}: {error}", conan_output.display());
+            panic!(
+                "remove stale Conan output {}: {error}",
+                conan_output.display()
+            );
         });
     }
     fs::create_dir_all(&conan_output).unwrap_or_else(|error| {
@@ -180,28 +196,38 @@ fn main() {
     require_file(&xray_runner_source);
     let xray_runner = bundle.join("amnezia-xray-runner");
     let compiler = require_program("cc", "C compiler");
-    run_os(&compiler, &[
-        xray_runner_source.into_os_string(),
-        xray_library.into_os_string(),
-        format!("-I{}", xray_package.join("include").display()).into(),
-        "-Wall".into(),
-        "-Wextra".into(),
-        "-Werror".into(),
-        "-pthread".into(),
-        "-ldl".into(),
-        "-lm".into(),
-        "-lresolv".into(),
-        "-o".into(),
-        xray_runner.as_os_str().to_owned(),
-    ], &manifest);
+    run_os(
+        &compiler,
+        &[
+            xray_runner_source.into_os_string(),
+            xray_library.into_os_string(),
+            format!("-I{}", xray_package.join("include").display()).into(),
+            "-Wall".into(),
+            "-Wextra".into(),
+            "-Werror".into(),
+            "-pthread".into(),
+            "-ldl".into(),
+            "-lm".into(),
+            "-lresolv".into(),
+            "-o".into(),
+            xray_runner.as_os_str().to_owned(),
+        ],
+        &manifest,
+    );
     validate_artifact(&xray_runner, true);
 
-    for artifact_kind in std::iter::successors(Some(RecipeArtifact::OpenVpn), |artifact| artifact.next()) {
+    for artifact_kind in
+        std::iter::successors(Some(RecipeArtifact::OpenVpn), |artifact| artifact.next())
+    {
         let artifact = deployed_packages.join(artifact_kind.package_path());
         validate_artifact(&artifact, artifact_kind.executable());
         let destination = bundle.join(artifact_kind.destination_name());
         fs::copy(&artifact, &destination).unwrap_or_else(|error| {
-            panic!("copy {} to {}: {error}", artifact.display(), destination.display());
+            panic!(
+                "copy {} to {}: {error}",
+                artifact.display(),
+                destination.display()
+            );
         });
         if artifact_kind.executable() {
             make_executable(&destination);
@@ -212,7 +238,11 @@ fn main() {
 fn export_recipes(conan: &Path, recipes: &Path) {
     let mut recipe_directories = fs::read_dir(recipes)
         .unwrap_or_else(|error| panic!("read recipes directory {}: {error}", recipes.display()))
-        .map(|entry| entry.unwrap_or_else(|error| panic!("read recipe entry: {error}")).path())
+        .map(|entry| {
+            entry
+                .unwrap_or_else(|error| panic!("read recipe entry: {error}"))
+                .path()
+        })
         .filter(|path| path.join("conanfile.py").is_file())
         .collect::<Vec<_>>();
     recipe_directories.sort();
@@ -221,10 +251,32 @@ fn export_recipes(conan: &Path, recipes: &Path) {
     }
     for recipe in recipe_directories {
         if recipe.file_name() == Some(OsStr::new("go")) {
-            run_os(conan, &["export".into(), recipe.as_os_str().to_owned(), "--version".into(), "1.26.0".into()], recipes);
-            run_os(conan, &["export".into(), recipe.as_os_str().to_owned(), "--version".into(), "1.23.12".into()], recipes);
+            run_os(
+                conan,
+                &[
+                    "export".into(),
+                    recipe.as_os_str().to_owned(),
+                    "--version".into(),
+                    "1.26.0".into(),
+                ],
+                recipes,
+            );
+            run_os(
+                conan,
+                &[
+                    "export".into(),
+                    recipe.as_os_str().to_owned(),
+                    "--version".into(),
+                    "1.23.12".into(),
+                ],
+                recipes,
+            );
         } else {
-            run_os(conan, &["export".into(), recipe.as_os_str().to_owned()], recipes);
+            run_os(
+                conan,
+                &["export".into(), recipe.as_os_str().to_owned()],
+                recipes,
+            );
         }
     }
 }
@@ -260,7 +312,8 @@ fn run_os(program: &Path, arguments: &[std::ffi::OsString], directory: &Path) {
 }
 
 fn required_env(name: &str) -> String {
-    env::var(name).unwrap_or_else(|_| panic!("required build environment variable is missing: {name}"))
+    env::var(name)
+        .unwrap_or_else(|_| panic!("required build environment variable is missing: {name}"))
 }
 
 fn require_file(path: &Path) {
@@ -292,10 +345,16 @@ fn find_program(name: &str) -> Option<PathBuf> {
 
 fn validate_artifact(path: &Path, executable: bool) {
     let metadata = fs::metadata(path).unwrap_or_else(|error| {
-        panic!("required recipe output does not exist: {}: {error}", path.display());
+        panic!(
+            "required recipe output does not exist: {}: {error}",
+            path.display()
+        );
     });
     if !metadata.is_file() || metadata.len() == 0 {
-        panic!("required recipe output is not a nonempty regular file: {}", path.display());
+        panic!(
+            "required recipe output is not a nonempty regular file: {}",
+            path.display()
+        );
     }
     if executable {
         let mut file = fs::File::open(path).unwrap_or_else(|error| {
@@ -306,7 +365,10 @@ fn validate_artifact(path: &Path, executable: bool) {
             panic!("read recipe executable {}: {error}", path.display());
         });
         if magic != *b"\x7fELF" {
-            panic!("recipe executable is not a Linux ELF file: {}", path.display());
+            panic!(
+                "recipe executable is not a Linux ELF file: {}",
+                path.display()
+            );
         }
     }
 }
@@ -327,8 +389,9 @@ fn profile_directory() -> PathBuf {
 fn make_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-        .unwrap_or_else(|error| panic!("set executable permissions on {}: {error}", path.display()));
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap_or_else(|error| {
+        panic!("set executable permissions on {}: {error}", path.display())
+    });
 }
 
 #[cfg(not(unix))]

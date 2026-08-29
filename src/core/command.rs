@@ -1,12 +1,23 @@
-use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+use anyhow::{
+    Context,
+    Result,
+};
+use clap::{
+    Args,
+    Parser,
+    Subcommand,
+    ValueEnum,
+};
 use strum::EnumIter;
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Status,
-    Connect { profile: Option<String> },
+    Connect {
+        profile: Option<String>,
+    },
     Disconnect,
     #[command(subcommand)]
     Profile(ProfileCommand),
@@ -26,18 +37,34 @@ pub enum Command {
 #[derive(Debug, Subcommand)]
 pub enum ProfileCommand {
     List,
-    Show { id: String },
+    Show {
+        id: String,
+    },
     Import {
         path: PathBuf,
         #[arg(long)]
         name: Option<String>,
     },
-    Export { id: String, destination: PathBuf },
-    Remove { id: String },
-    Rename { id: String, name: String },
-    Enable { id: String },
-    Disable { id: String },
-    Default { id: String },
+    Export {
+        id: String,
+        destination: PathBuf,
+    },
+    Remove {
+        id: String,
+    },
+    Rename {
+        id: String,
+        name: String,
+    },
+    Enable {
+        id: String,
+    },
+    Disable {
+        id: String,
+    },
+    Default {
+        id: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -57,13 +84,30 @@ pub struct ServerAdd {
 pub enum ServerCommand {
     List,
     Add(ServerAdd),
-    Show { id: String },
-    Remove { id: String },
-    Rename { id: String, name: String },
-    Default { id: String },
-    Test { id: String },
-    Scan { id: String },
-    Reboot { id: String, #[arg(long)] yes: bool },
+    Show {
+        id: String,
+    },
+    Remove {
+        id: String,
+    },
+    Rename {
+        id: String,
+        name: String,
+    },
+    Default {
+        id: String,
+    },
+    Test {
+        id: String,
+    },
+    Scan {
+        id: String,
+    },
+    Reboot {
+        id: String,
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -168,32 +212,84 @@ impl TuiAction for FeatureAction {
             Self::Disconnect => ActionInfo::new("Connection", "Disconnect", "disconnect", ""),
             Self::ProfileList => ActionInfo::new("Profiles", "List", "profile list", ""),
             Self::ProfileShow => ActionInfo::new("Profiles", "Show", "profile show", "<ID>"),
-            Self::ProfileImport => ActionInfo::new("Profiles", "Import", "profile import", "<PATH> [--name NAME]"),
-            Self::ProfileExport => ActionInfo::new("Profiles", "Export", "profile export", "<ID> <DESTINATION>"),
+            Self::ProfileImport => {
+                ActionInfo::new(
+                    "Profiles",
+                    "Import",
+                    "profile import",
+                    "<PATH> [--name NAME]",
+                )
+            }
+            Self::ProfileExport => {
+                ActionInfo::new("Profiles", "Export", "profile export", "<ID> <DESTINATION>")
+            }
             Self::ProfileRemove => ActionInfo::new("Profiles", "Remove", "profile remove", "<ID>"),
-            Self::ProfileRename => ActionInfo::new("Profiles", "Rename", "profile rename", "<ID> <NAME>"),
+            Self::ProfileRename => {
+                ActionInfo::new("Profiles", "Rename", "profile rename", "<ID> <NAME>")
+            }
             Self::ProfileEnable => ActionInfo::new("Profiles", "Enable", "profile enable", "<ID>"),
-            Self::ProfileDisable => ActionInfo::new("Profiles", "Disable", "profile disable", "<ID>"),
-            Self::ProfileDefault => ActionInfo::new("Profiles", "Set default", "profile default", "<ID>"),
+            Self::ProfileDisable => {
+                ActionInfo::new("Profiles", "Disable", "profile disable", "<ID>")
+            }
+            Self::ProfileDefault => {
+                ActionInfo::new("Profiles", "Set default", "profile default", "<ID>")
+            }
             Self::ServerList => ActionInfo::new("Servers", "List", "server list", ""),
-            Self::ServerAdd => ActionInfo::new("Servers", "Add", "server add", "<HOST> [--name NAME] [--user USER] [--port PORT] [--identity PATH]"),
+            Self::ServerAdd => {
+                ActionInfo::new(
+                    "Servers",
+                    "Add",
+                    "server add",
+                    "<HOST> [--name NAME] [--user USER] [--port PORT] [--identity PATH]",
+                )
+            }
             Self::ServerShow => ActionInfo::new("Servers", "Show", "server show", "<ID>"),
             Self::ServerRemove => ActionInfo::new("Servers", "Remove", "server remove", "<ID>"),
-            Self::ServerRename => ActionInfo::new("Servers", "Rename", "server rename", "<ID> <NAME>"),
-            Self::ServerDefault => ActionInfo::new("Servers", "Set default", "server default", "<ID>"),
+            Self::ServerRename => {
+                ActionInfo::new("Servers", "Rename", "server rename", "<ID> <NAME>")
+            }
+            Self::ServerDefault => {
+                ActionInfo::new("Servers", "Set default", "server default", "<ID>")
+            }
             Self::ServerTest => ActionInfo::new("Servers", "Test", "server test", "<ID>"),
             Self::ServerScan => ActionInfo::new("Servers", "Scan", "server scan", "<ID>"),
-            Self::ServerReboot => ActionInfo::new("Servers", "Reboot", "server reboot", "<ID> --yes"),
+            Self::ServerReboot => {
+                ActionInfo::new("Servers", "Reboot", "server reboot", "<ID> --yes")
+            }
             Self::SettingsShow => ActionInfo::new("Settings", "Show", "settings show", ""),
-            Self::SettingsSet => ActionInfo::new("Settings", "Set", "settings set", "<KEY> <VALUE>"),
+            Self::SettingsSet => {
+                ActionInfo::new("Settings", "Set", "settings set", "<KEY> <VALUE>")
+            }
             Self::SettingsReset => ActionInfo::new("Settings", "Reset", "settings reset", ""),
             Self::SplitList => ActionInfo::new("Split tunnel", "List", "split-tunnel list", ""),
-            Self::SplitAdd => ActionInfo::new("Split tunnel", "Add", "split-tunnel add", "route <CIDR>"),
-            Self::SplitRemove => ActionInfo::new("Split tunnel", "Remove", "split-tunnel remove", "route <CIDR>"),
-            Self::SplitClear => ActionInfo::new("Split tunnel", "Clear", "split-tunnel clear", "route"),
-            Self::SplitMode => ActionInfo::new("Split tunnel", "Mode", "split-tunnel mode", "<all|only-listed|except-listed>"),
-            Self::BackupCreate => ActionInfo::new("Backup", "Create", "backup create", "<DESTINATION>"),
-            Self::BackupRestore => ActionInfo::new("Backup", "Restore", "backup restore", "<SOURCE>"),
+            Self::SplitAdd => {
+                ActionInfo::new("Split tunnel", "Add", "split-tunnel add", "route <CIDR>")
+            }
+            Self::SplitRemove => {
+                ActionInfo::new(
+                    "Split tunnel",
+                    "Remove",
+                    "split-tunnel remove",
+                    "route <CIDR>",
+                )
+            }
+            Self::SplitClear => {
+                ActionInfo::new("Split tunnel", "Clear", "split-tunnel clear", "route")
+            }
+            Self::SplitMode => {
+                ActionInfo::new(
+                    "Split tunnel",
+                    "Mode",
+                    "split-tunnel mode",
+                    "<all|only-listed|except-listed>",
+                )
+            }
+            Self::BackupCreate => {
+                ActionInfo::new("Backup", "Create", "backup create", "<DESTINATION>")
+            }
+            Self::BackupRestore => {
+                ActionInfo::new("Backup", "Restore", "backup restore", "<SOURCE>")
+            }
             Self::LogsShow => ActionInfo::new("Logs", "Show", "logs show", ""),
             Self::LogsExport => ActionInfo::new("Logs", "Export", "logs export", "<DESTINATION>"),
             Self::LogsClear => ActionInfo::new("Logs", "Clear", "logs clear", ""),
@@ -205,13 +301,25 @@ impl TuiAction for FeatureAction {
         let mut arguments = vec!["amn-action".to_owned()];
         arguments.extend(self.info().command.split_whitespace().map(str::to_owned));
         arguments.extend(shlex::split(input).context("input contains an unterminated quote")?);
-        ActionParser::try_parse_from(arguments)?.command.context("selected action did not produce a command")
+        ActionParser::try_parse_from(arguments)?
+            .command
+            .context("selected action did not produce a command")
     }
 }
 
 impl ActionInfo {
-    const fn new(category: &'static str, label: &'static str, command: &'static str, prompt: &'static str) -> Self {
-        Self { category, label, command, prompt }
+    const fn new(
+        category: &'static str,
+        label: &'static str,
+        command: &'static str,
+        prompt: &'static str,
+    ) -> Self {
+        Self {
+            category,
+            label,
+            command,
+            prompt,
+        }
     }
 }
 
@@ -224,16 +332,20 @@ struct ActionParser {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use clap::CommandFactory;
     use std::collections::BTreeSet;
+
+    use clap::CommandFactory;
     use strum::IntoEnumIterator;
+
+    use super::*;
 
     #[test]
     fn tui_actions_cover_every_cli_leaf_command() {
         let mut commands = BTreeSet::new();
         collect_leaf_commands(&ActionParser::command(), "", &mut commands);
-        let actions = FeatureAction::iter().map(|action| action.info().command.to_owned()).collect::<BTreeSet<_>>();
+        let actions = FeatureAction::iter()
+            .map(|action| action.info().command.to_owned())
+            .collect::<BTreeSet<_>>();
         assert_eq!(actions, commands);
     }
 

@@ -1,7 +1,18 @@
-use crate::core::model::Server;
-use crate::core::runner;
-use anyhow::{Context, Result, bail};
-use std::process::{Command, Output};
+use std::process::{
+    Command,
+    Output,
+};
+
+use anyhow::{
+    Context,
+    Result,
+    bail,
+};
+
+use crate::core::{
+    model::Server,
+    runner,
+};
 
 pub fn run_ssh(server: &Server, remote_args: &[&str], dry_run: bool) -> Result<String> {
     let (program, args) = ssh_command(server, remote_args);
@@ -9,13 +20,17 @@ pub fn run_ssh(server: &Server, remote_args: &[&str], dry_run: bool) -> Result<S
         return Ok(format_command(&program, &args));
     }
     let executable = check_dependencies(server)?;
-    let output = Command::new(&executable).args(&args).output().with_context(|| format!("start {program}"))?;
+    let output = Command::new(&executable)
+        .args(&args)
+        .output()
+        .with_context(|| format!("start {program}"))?;
     output_text(output)
 }
 
 pub fn check_dependencies(server: &Server) -> Result<std::path::PathBuf> {
     if let Some(identity) = &server.identity_file {
-        let metadata = std::fs::metadata(identity).with_context(|| format!("read SSH identity {identity}"))?;
+        let metadata =
+            std::fs::metadata(identity).with_context(|| format!("read SSH identity {identity}"))?;
         if !metadata.is_file() {
             bail!("SSH identity is not a regular file: {identity}");
         }
@@ -53,7 +68,10 @@ fn format_command(program: &str, args: &[String]) -> String {
     std::iter::once(program)
         .chain(args.iter().map(String::as_str))
         .map(|value| {
-            if value.chars().all(|character| character.is_ascii_alphanumeric() || "-._/:=@".contains(character)) {
+            if value
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "-._/:=@".contains(character))
+            {
                 value.to_owned()
             } else {
                 format!("'{value}'", value = value.replace('\'', "'\\''"))
@@ -65,17 +83,33 @@ fn format_command(program: &str, args: &[String]) -> String {
 
 pub fn scan(server: &Server, dry_run: bool) -> Result<String> {
     if dry_run {
-        return Ok(format!("{}\n{}", run_ssh(server, &["command", "-v", "docker"], true)?, run_ssh(
-            server,
-            &["docker", "ps", "--all", "--format", "{{.Names}}\\t{{.Status}}\\t{{.Image}}"],
-            true,
-        )?));
+        return Ok(format!(
+            "{}\n{}",
+            run_ssh(server, &["command", "-v", "docker"], true)?,
+            run_ssh(
+                server,
+                &[
+                    "docker",
+                    "ps",
+                    "--all",
+                    "--format",
+                    "{{.Names}}\\t{{.Status}}\\t{{.Image}}"
+                ],
+                true,
+            )?
+        ));
     }
     run_ssh(server, &["command", "-v", "docker"], false)
         .context("remote Docker dependency is unavailable")?;
     run_ssh(
         server,
-        &["docker", "ps", "--all", "--format", "{{.Names}}\\t{{.Status}}\\t{{.Image}}"],
+        &[
+            "docker",
+            "ps",
+            "--all",
+            "--format",
+            "{{.Names}}\\t{{.Status}}\\t{{.Image}}",
+        ],
         dry_run,
     )
 }
@@ -85,9 +119,14 @@ pub fn reboot(server: &Server, confirmed: bool, dry_run: bool) -> Result<String>
         bail!("reboot requires --yes");
     }
     if dry_run {
-        return Ok(format!("{}\n{}", run_ssh(server, &["sudo", "-n", "true"], true)?, run_ssh(server, &["sudo", "reboot"], true)?));
+        return Ok(format!(
+            "{}\n{}",
+            run_ssh(server, &["sudo", "-n", "true"], true)?,
+            run_ssh(server, &["sudo", "reboot"], true)?
+        ));
     }
-    run_ssh(server, &["sudo", "-n", "true"], false).context("remote passwordless sudo dependency is unavailable")?;
+    run_ssh(server, &["sudo", "-n", "true"], false)
+        .context("remote passwordless sudo dependency is unavailable")?;
     run_ssh(server, &["sudo", "reboot"], false)
 }
 
@@ -98,8 +137,12 @@ mod tests {
     #[test]
     fn ssh_arguments_do_not_use_shell() {
         let server = Server {
-            id: "id".into(), name: "name".into(), host: "vpn.example".into(), port: 2222,
-            user: "admin".into(), identity_file: Some("/home/me/key".into()),
+            id: "id".into(),
+            name: "name".into(),
+            host: "vpn.example".into(),
+            port: 2222,
+            user: "admin".into(),
+            identity_file: Some("/home/me/key".into()),
         };
         let (program, args) = ssh_command(&server, &["docker", "ps"]);
         assert_eq!(program, "ssh");

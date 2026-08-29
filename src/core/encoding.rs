@@ -1,4 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::{
+    Context,
+    Result,
+};
 use base64::Engine as _;
 
 pub fn decode_base64(value: &str, description: &str) -> Result<Vec<u8>> {

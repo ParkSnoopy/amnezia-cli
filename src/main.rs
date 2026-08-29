@@ -1,6 +1,12 @@
-use amn::cli::Cli;
-use amn::core::Store;
-use anyhow::{Context, Result, bail};
+use amn::{
+    cli::Cli,
+    core::Store,
+};
+use anyhow::{
+    Context,
+    Result,
+    bail,
+};
 use clap::Parser;
 
 fn main() {
@@ -27,6 +33,8 @@ fn run() -> Result<()> {
         return amn::tui::run(&store, &mut state);
     }
 
-    let command = arguments.command.context("no command specified; use --help")?;
+    let command = arguments
+        .command
+        .context("no command specified; use --help")?;
     amn::cli::run(&store, &mut state, command, arguments.dry_run)
 }
