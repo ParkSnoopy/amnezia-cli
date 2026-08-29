@@ -99,8 +99,7 @@ mod tests {
     fn ssh_arguments_do_not_use_shell() {
         let server = Server {
             id: "id".into(), name: "name".into(), host: "vpn.example".into(), port: 2222,
-            user: "admin".into(), identity_file: Some("/home/me/key".into()), default_profile: None,
-            installed_services: Vec::new(),
+            user: "admin".into(), identity_file: Some("/home/me/key".into()),
         };
         let (program, args) = ssh_command(&server, &["docker", "ps"]);
         assert_eq!(program, "ssh");

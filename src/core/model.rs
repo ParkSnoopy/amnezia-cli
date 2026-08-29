@@ -33,7 +33,6 @@ pub struct Profile {
     pub protocol: Protocol,
     pub source: String,
     pub enabled: bool,
-    pub server_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,8 +43,6 @@ pub struct Server {
     pub port: u16,
     pub user: String,
     pub identity_file: Option<String>,
-    pub default_profile: Option<String>,
-    pub installed_services: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -77,8 +74,9 @@ impl Default for Settings {
 pub struct Connection {
     pub profile_id: String,
     pub pid: Option<u32>,
+    #[serde(default)]
+    pub process_start_ticks: Option<u64>,
     pub interface: Option<String>,
-    pub started_unix_seconds: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

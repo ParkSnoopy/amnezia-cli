@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 const MAX_PROFILE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_BACKUP_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct BackupFile {
@@ -65,45 +66,57 @@ impl Store {
         fs::rename(&temporary, &path).with_context(|| format!("replace {}", path.display()))
     }
 
-    pub fn import_profile(&self, state: &mut State, path: &Path, name: Option<String>) -> Result<String> {
+    pub fn import_profile(&self, state: &mut State, path: &Path, name: Option<String>) -> Result<Vec<String>> {
         if fs::metadata(path).with_context(|| format!("inspect {}", path.display()))?.len() > MAX_PROFILE_BYTES as u64 {
             bail!("profile exceeds the 16 MiB size limit");
         }
         let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
         let text = String::from_utf8(data).context("profile is not UTF-8 text")?;
-        let (text, protocol) = normalize_imported_profile(&text, path)?;
-        reject_executable_directives(&text, &protocol)?;
-        validate_protocol_configuration(&text, &protocol)?;
-        let id = Uuid::new_v4().simple().to_string();
-        let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("conf");
-        let file_stem = if matches!(protocol, Protocol::WireGuard | Protocol::AmneziaWg) {
-            format!("amn{}", id.chars().take(11).collect::<String>())
-        } else {
-            id.clone()
-        };
-        let destination = self.root.join("profiles").join(format!("{file_stem}.{extension}"));
-        write_private(&destination, text.as_bytes())?;
-        let profile = Profile {
-            id: id.clone(),
-            name: name.unwrap_or_else(|| {
-                path.file_stem().and_then(|value| value.to_str()).unwrap_or("VPN").to_owned()
-            }),
-            protocol,
-            source: destination.to_string_lossy().into_owned(),
-            enabled: true,
-            server_id: None,
-        };
+        let configurations = normalize_imported_profiles(&text, path)?;
+        for (text, protocol) in &configurations {
+            reject_executable_directives(text, protocol)
+                .and_then(|_| validate_protocol_configuration(text, protocol))
+                .with_context(|| format!("{protocol} configuration is unusable"))?;
+        }
+        let base_name = name.unwrap_or_else(|| {
+            path.file_stem().and_then(|value| value.to_str()).unwrap_or("VPN").to_owned()
+        });
+        let multiple = configurations.len() > 1;
         let mut updated = state.clone();
-        updated.profiles.insert(id.clone(), profile);
+        let mut imported = Vec::new();
+        let mut destinations = Vec::new();
+        for (text, protocol) in configurations {
+            let id = Uuid::new_v4().simple().to_string();
+            let file_stem = if matches!(protocol, Protocol::WireGuard | Protocol::AmneziaWg) {
+                format!("amn{}", id.chars().take(11).collect::<String>())
+            } else {
+                id.clone()
+            };
+            let destination = self.root.join("profiles").join(format!("{file_stem}.{}", profile_extension(&protocol)));
+            if let Err(error) = write_private(&destination, text.as_bytes()) {
+                for written in &destinations { let _ = fs::remove_file(written); }
+                return Err(error).context("profile import rolled back");
+            }
+            destinations.push(destination.clone());
+            let profile = Profile {
+                id: id.clone(),
+                name: if multiple { format!("{base_name} ({protocol})") } else { base_name.clone() },
+                protocol,
+                source: destination.to_string_lossy().into_owned(),
+                enabled: true,
+            };
+            updated.profiles.insert(id.clone(), profile);
+            imported.push(id);
+        }
         if updated.default_profile.is_none() {
-            updated.default_profile = Some(id.clone());
+            updated.default_profile = imported.first().cloned();
         }
         if let Err(error) = self.save(&updated) {
-            let _ = fs::remove_file(&destination);
+            for destination in destinations { let _ = fs::remove_file(destination); }
             return Err(error).context("profile import rolled back");
         }
         *state = updated;
-        Ok(id)
+        Ok(imported)
     }
 
     pub fn remove_profile(&self, state: &mut State, id: &str) -> Result<()> {
@@ -149,11 +162,18 @@ impl Store {
             .map(|(id, profile)| Ok((id.clone(), fs::read_to_string(&profile.source)?)))
             .collect::<Result<BTreeMap<_, _>>>()?;
         let backup = BackupFile { format_version: 1, state: backup_state, profiles };
-        write_private(destination, &serde_json::to_vec_pretty(&backup)?)
+        let data = serde_json::to_vec_pretty(&backup)?;
+        if data.len() > MAX_BACKUP_BYTES {
+            bail!("backup exceeds the 64 MiB size limit");
+        }
+        write_private(destination, &data)
             .with_context(|| format!("write backup {}", destination.display()))
     }
 
     pub fn restore(&self, source: &Path) -> Result<State> {
+        if fs::metadata(source).with_context(|| format!("inspect backup {}", source.display()))?.len() > MAX_BACKUP_BYTES as u64 {
+            bail!("backup exceeds the 64 MiB size limit");
+        }
         let data = fs::read(source).with_context(|| format!("read backup {}", source.display()))?;
         let backup: BackupFile = serde_json::from_slice(&data).context("invalid backup")?;
         if backup.format_version != 1 {
@@ -172,6 +192,9 @@ impl Store {
                 bail!("profile ID does not match canonical backup key: {id}");
             }
             let text = backup.profiles.get(id).with_context(|| format!("missing profile data: {id}"))?;
+            if text.len() > MAX_PROFILE_BYTES {
+                bail!("backup profile exceeds the 16 MiB size limit: {id}");
+            }
             reject_executable_directives(text, &profile.protocol)?;
             validate_protocol_configuration(text, &profile.protocol)?;
             let destination = restored_profile_path(&profiles_root, id, &profile.protocol);
@@ -239,20 +262,10 @@ impl Store {
             if profile.id != *id {
                 bail!("profile ID does not match state key: {id}");
             }
-            if let Some(server_id) = &profile.server_id
-                && !state.servers.contains_key(server_id)
-            {
-                bail!("profile {id} references unknown server: {server_id}");
-            }
         }
         for (id, server) in &state.servers {
             if server.id != *id {
                 bail!("server ID does not match state key: {id}");
-            }
-            if let Some(profile_id) = &server.default_profile
-                && !state.profiles.contains_key(profile_id)
-            {
-                bail!("server {id} references unknown profile: {profile_id}");
             }
         }
         if let Some(connection) = &state.connection
@@ -284,16 +297,24 @@ impl Store {
     }
 }
 
+fn profile_extension(protocol: &Protocol) -> &'static str {
+    match protocol {
+        Protocol::OpenVpn => "ovpn",
+        Protocol::Xray | Protocol::Shadowsocks | Protocol::Ikev2 => "json",
+        Protocol::WireGuard | Protocol::AmneziaWg => "conf",
+    }
+}
+
 fn restored_profile_path(profiles_dir: &Path, id: &str, protocol: &Protocol) -> PathBuf {
     let file_stem = if matches!(protocol, Protocol::WireGuard | Protocol::AmneziaWg) {
         format!("amn{}", id.chars().take(11).collect::<String>())
     } else {
         id.to_owned()
     };
-    profiles_dir.join(format!("{file_stem}.conf"))
+    profiles_dir.join(format!("{file_stem}.{}", profile_extension(protocol)))
 }
 
-fn normalize_imported_profile(text: &str, path: &Path) -> Result<(String, Protocol)> {
+fn normalize_imported_profiles(text: &str, path: &Path) -> Result<Vec<(String, Protocol)>> {
     let decoded = if let Some(value) = text.trim().strip_prefix("vpn://") {
         let bytes = crate::core::encoding::decode_base64(value, "Amnezia connection key is not valid base64")?;
         decode_qcompress(&bytes).unwrap_or(bytes)
@@ -304,9 +325,10 @@ fn normalize_imported_profile(text: &str, path: &Path) -> Result<(String, Protoc
     if let Ok(document) = serde_json::from_str::<serde_json::Value>(&decoded)
         && document.get("containers").is_some()
     {
-        return extract_amnezia_protocol(&document);
+        return extract_amnezia_protocols(&document);
     }
-    Ok((decoded.clone(), detect_protocol(&decoded, path)?))
+    let protocol = detect_protocol(&decoded, path)?;
+    Ok(vec![(decoded, protocol)])
 }
 
 fn decode_qcompress(data: &[u8]) -> Option<Vec<u8>> {
@@ -318,7 +340,7 @@ fn decode_qcompress(data: &[u8]) -> Option<Vec<u8>> {
     (output.len() == expected).then_some(output)
 }
 
-fn extract_amnezia_protocol(document: &serde_json::Value) -> Result<(String, Protocol)> {
+fn extract_amnezia_protocols(document: &serde_json::Value) -> Result<Vec<(String, Protocol)>> {
     let containers = document.get("containers").and_then(serde_json::Value::as_array)
         .context("Amnezia bundle has no containers array")?;
     let preferred = document.get("defaultContainer").or_else(|| document.get("default_container"))
@@ -328,6 +350,7 @@ fn extract_amnezia_protocol(document: &serde_json::Value) -> Result<(String, Pro
     }).chain(containers.iter().filter(|container| {
         !preferred.is_some_and(|name| container.get("container").and_then(serde_json::Value::as_str) == Some(name))
     }));
+    let mut profiles = Vec::new();
     for container in ordered {
         let name = container.get("container").and_then(serde_json::Value::as_str).unwrap_or_default().to_ascii_lowercase();
         let candidates = if name.contains("openvpn") {
@@ -346,26 +369,23 @@ fn extract_amnezia_protocol(document: &serde_json::Value) -> Result<(String, Pro
             None
         };
         let Some((protocol, keys)) = candidates else { continue };
-        let value = keys.iter().find_map(|key| container.get(*key));
-        let Some(value) = value else { continue };
-        let last = value.get("last_config").and_then(serde_json::Value::as_str)
-            .or_else(|| value.get("config").and_then(serde_json::Value::as_str));
-        let Some(last) = last else {
-            if protocol == Protocol::Ikev2 {
-                return Ok((serde_json::to_string(value)?, protocol));
-            }
-            continue;
+        let Some(value) = keys.iter().find_map(|key| container.get(*key)) else { continue };
+        let Some(last) = value.get("last_config").and_then(serde_json::Value::as_str)
+            .or_else(|| value.get("config").and_then(serde_json::Value::as_str))
+        else { continue };
+        let configuration = if matches!(protocol, Protocol::OpenVpn | Protocol::WireGuard | Protocol::AmneziaWg) {
+            serde_json::from_str::<serde_json::Value>(last).ok()
+                .and_then(|wrapper| wrapper.get("config").and_then(serde_json::Value::as_str).map(str::to_owned))
+                .unwrap_or_else(|| last.to_owned())
+        } else {
+            last.to_owned()
         };
-        if matches!(protocol, Protocol::OpenVpn | Protocol::WireGuard | Protocol::AmneziaWg) {
-            if let Ok(wrapper) = serde_json::from_str::<serde_json::Value>(last)
-                && let Some(configuration) = wrapper.get("config").and_then(serde_json::Value::as_str)
-            {
-                return Ok((configuration.to_owned(), protocol));
-            }
-        }
-        return Ok((last.to_owned(), protocol));
+        profiles.push((configuration, protocol));
     }
-    bail!("Amnezia bundle contains no supported VPN protocol configuration")
+    if profiles.is_empty() {
+        bail!("Amnezia bundle contains no supported VPN protocol configuration");
+    }
+    Ok(profiles)
 }
 
 pub fn detect_protocol(text: &str, path: &Path) -> Result<Protocol> {
@@ -384,8 +404,19 @@ pub fn detect_protocol(text: &str, path: &Path) -> Result<Protocol> {
         return Ok(Protocol::OpenVpn);
     }
     if lower.trim_start().starts_with('{')
-        && lower.contains("\"cert\"")
-        && (lower.contains("\"hostname\"") || lower.contains("\"host_name\"") || lower.contains("\"ikev2_config_data\""))
+        && serde_json::from_str::<serde_json::Value>(text).ok().is_some_and(|document| {
+            let configuration = document.get("ikev2_config_data").unwrap_or(&document);
+            let classic = ["cert", "certificate"].iter().any(|key| configuration.get(*key).is_some())
+                && ["hostName", "host_name", "host"].iter().any(|key| configuration.get(*key).is_some());
+            let android = configuration.get("type").and_then(serde_json::Value::as_str) == Some("ikev2-cert")
+                && configuration.pointer("/remote/addr").is_some()
+                && configuration.pointer("/local/p12").is_some();
+            let nested = configuration.get("config").and_then(serde_json::Value::as_str)
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                .is_some_and(|value| value.get("cert").is_some() && value.get("hostName").is_some());
+            let encoded = document.get("ikev2_config_data").is_some_and(serde_json::Value::is_string);
+            classic || android || nested || encoded
+        })
     {
         return Ok(Protocol::Ikev2);
     }
@@ -485,11 +516,14 @@ fn reject_executable_directives(text: &str, protocol: &Protocol) -> Result<()> {
         "up", "down", "route-up", "route-pre-down", "ipchange", "client-connect",
         "client-disconnect", "learn-address", "auth-user-pass-verify", "tls-verify", "plugin",
         "config", "script-security", "daemon", "management", "management-client", "writepid",
-        "log", "log-append", "status", "cd", "chroot",
+        "log", "log-append", "status", "cd", "chroot", "iproute", "tmp-dir",
+        "client-config-dir", "ifconfig-pool-persist", "tls-export-cert", "engine", "providers",
+        "pkcs11-providers",
     ];
     const EXTERNAL_SECRET_FILES: &[&str] = &[
         "ca", "cert", "key", "pkcs12", "auth-user-pass", "http-proxy-user-pass", "tls-auth",
         "tls-crypt", "tls-crypt-v2", "secret", "crl-verify", "askpass", "auth-gen-token-secret",
+        "capath", "extra-certs", "dh",
     ];
     for line in text.lines() {
         let fields = line.trim_start().trim_start_matches('-').split_whitespace().collect::<Vec<_>>();
@@ -568,9 +602,26 @@ mod tests {
                 "openvpn":{"last_config":"{\"config\":\"client\\nremote vpn.example 1194\"}"}
             }]
         }"#;
-        let (configuration, protocol) = normalize_imported_profile(bundle, Path::new("bundle.json")).unwrap();
-        assert_eq!(protocol, Protocol::OpenVpn);
+        let configurations = normalize_imported_profiles(bundle, Path::new("bundle.json")).unwrap();
+        assert_eq!(configurations.len(), 1);
+        let (configuration, protocol) = &configurations[0];
+        assert_eq!(*protocol, Protocol::OpenVpn);
         assert_eq!(configuration, "client\nremote vpn.example 1194");
+    }
+
+    #[test]
+    fn extracts_every_supported_protocol_from_amnezia_bundle() {
+        let bundle = r#"{
+            "defaultContainer":"amnezia-awg",
+            "containers":[
+                {"container":"amnezia-openvpn","openvpn":{"last_config":"{\"config\":\"client\\nremote vpn.example 1194\"}"}},
+                {"container":"amnezia-awg","awg":{"last_config":"{\"config\":\"[Interface]\\nPrivateKey=x\\n[Peer]\\nPublicKey=y\"}"}}
+            ]
+        }"#;
+        let configurations = normalize_imported_profiles(bundle, Path::new("bundle.json")).unwrap();
+        assert_eq!(configurations.len(), 2);
+        assert_eq!(configurations[0].1, Protocol::AmneziaWg);
+        assert_eq!(configurations[1].1, Protocol::OpenVpn);
     }
 
     #[test]

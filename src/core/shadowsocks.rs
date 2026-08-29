@@ -86,7 +86,7 @@ mod tests {
 
     #[test]
     fn accepts_xray_shadowsocks_configuration() {
-        let profile = r#"{"inbounds":[{"listen":"0.0.0.0"}],"outbounds":[{"protocol":"shadowsocks","settings":{"servers":[{"address":"vpn.example","port":8388,"method":"aes-256-gcm","password":"secret"}]}}]}"#;
+        let profile = r#"{"inbounds":[{"listen":"0.0.0.0"}],"outbounds":[{"protocol":"shadowsocks","settings":{"servers":[{"address":"vpn.example","port":8388,"method":"aes-256-gcm","password":"[REDACTED]"}]}}]}"#;
         let rendered = parse(profile).unwrap().render_for_endpoint("192.0.2.3".parse().unwrap()).unwrap();
         let value: Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(value.pointer("/inbounds/0/listen").and_then(Value::as_str), Some("127.0.0.1"));
@@ -95,7 +95,10 @@ mod tests {
 
     #[test]
     fn converts_sip002_uri_to_xray() {
-        let rendered = parse("ss://YWVzLTI1Ni1nY206c2VjcmV0@vpn.example:8388#VPN")
+        use base64::Engine as _;
+        let credentials = base64::engine::general_purpose::STANDARD.encode("aes-256-gcm:[REDACTED]");
+        let profile = format!("ss://{credentials}@vpn.example:8388#VPN");
+        let rendered = parse(&profile)
             .unwrap().render_for_endpoint("192.0.2.2".parse().unwrap()).unwrap();
         let value: Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(value.pointer("/outbounds/0/protocol").and_then(Value::as_str), Some("shadowsocks"));

@@ -2,11 +2,13 @@ use crate::core::model::{Connection, Profile, Protocol, Settings, State};
 use crate::core::store::Store;
 use anyhow::{Context, Result, anyhow, bail};
 use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write as _};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::os::unix::ffi::OsStringExt;
 
 use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandPlan {
@@ -187,7 +189,7 @@ fn prepare_network_plan(store: &Store, profile: &Profile, plan: &CommandPlan, st
 
 pub fn check_profile_dependencies(store: &Store, profile: &Profile, settings: &Settings) -> Result<()> {
     if profile.protocol == Protocol::Ikev2 {
-        prepare_ikev2(store, profile)?;
+        prepare_ikev2(store, profile, settings)?;
         return Ok(());
     }
     if profile.protocol == Protocol::OpenVpn {
@@ -445,59 +447,170 @@ fn start_openvpn(store: &Store, prepared: &PreparedOpenVpn, logging: bool) -> Re
     {
         bail!("refusing to connect because interface already exists: {}", prepared.interface);
     }
+    let reservation = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).context("reserve OpenVPN management port")?;
+    let management_port = reservation.local_addr()?.port();
+    drop(reservation);
     let directory = create_root_runtime_directory()?;
     let configuration = directory.join("openvpn.conf");
-    crate::core::store::write_private(&configuration, prepared.configuration.as_bytes())?;
+    if let Err(error) = crate::core::store::write_private(&configuration, prepared.configuration.as_bytes()) {
+        let _ = fs::remove_dir_all(&directory);
+        return Err(error).context("stage OpenVPN configuration");
+    }
+    let management_password = uuid::Uuid::new_v4().simple().to_string();
+    let management_password_path = directory.join("management.password");
+    if let Err(error) = crate::core::store::write_private(&management_password_path, format!("{management_password}\n").as_bytes()) {
+        let _ = fs::remove_dir_all(&directory);
+        return Err(error).context("stage OpenVPN management password");
+    }
+    let management_port_text = management_port.to_string();
     let mut command = Command::new(&prepared.setsid);
-    command.args([prepared.executable.as_os_str(), std::ffi::OsStr::new("--config"), configuration.as_os_str()])
-        .env("PATH", &prepared.path).stdin(Stdio::null());
+    command.args([
+        prepared.executable.as_os_str(),
+        std::ffi::OsStr::new("--config"), configuration.as_os_str(),
+        std::ffi::OsStr::new("--management"), std::ffi::OsStr::new("127.0.0.1"), std::ffi::OsStr::new(&management_port_text), management_password_path.as_os_str(),
+    ]).env("PATH", &prepared.path).stdin(Stdio::null());
     if logging {
         let log_path = store.root().join("logs").join(format!("connection-{}.log", uuid::Uuid::new_v4().simple()));
-        let stdout = create_private_log(&log_path)?;
-        command.stdout(stdout.try_clone()?).stderr(stdout);
+        let stdout = match create_private_log(&log_path) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&directory);
+                return Err(error);
+            }
+        };
+        let stderr = match stdout.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&directory);
+                return Err(error.into());
+            }
+        };
+        command.stdout(stdout).stderr(stderr);
     } else {
         command.stdout(Stdio::null()).stderr(Stdio::null());
     }
-    let mut child = command.spawn().context("start isolated OpenVPN process")?;
-    for _ in 0..300 {
-        if let Some(status) = child.try_wait()? {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
             let _ = fs::remove_dir_all(&directory);
-            bail!("OpenVPN exited during startup with {status}");
+            return Err(error).context("start isolated OpenVPN process");
         }
-        if Command::new(&prepared.ip).args(["link", "show", "dev", &prepared.interface]).env("PATH", &prepared.path)
-            .stdout(Stdio::null()).stderr(Stdio::null()).status()?.success()
-        {
-            return Ok((child.id(), directory));
+    };
+    let startup = (|| -> Result<()> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut management = loop {
+            if let Some(status) = child.try_wait()? {
+                bail!("OpenVPN exited during startup with {status}");
+            }
+            match TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, management_port)) {
+                Ok(stream) => break stream,
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut) => {}
+                Err(error) => return Err(error).context("connect to OpenVPN management interface"),
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("OpenVPN did not open its management interface");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        management.set_read_timeout(Some(std::time::Duration::from_millis(250)))?;
+        management.write_all(format!("{management_password}\nstate on\nlog on\nbytecount 1\n").as_bytes())?;
+        management.flush()?;
+        let mut reader = BufReader::new(management);
+        let mut line = String::new();
+        loop {
+            if let Some(status) = child.try_wait()? {
+                bail!("OpenVPN exited during startup with {status}");
+            }
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => bail!("OpenVPN closed its management connection during startup"),
+                Ok(_) if line.contains(",CONNECTED,SUCCESS,") || line.contains(",CONNECTED,SUCCESS") => break,
+                Ok(_) => {}
+                Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(error) => return Err(error).context("read OpenVPN management state"),
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("OpenVPN did not report a successful connection");
+            }
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        let interface_exists = Command::new(&prepared.ip).args(["link", "show", "dev", &prepared.interface])
+            .env("PATH", &prepared.path).stdout(Stdio::null()).stderr(Stdio::null()).status()?.success();
+        if !interface_exists {
+            bail!("OpenVPN reported connected without creating its tunnel interface");
+        }
+        Ok(())
+    })();
+    if let Err(error) = startup {
+        let _ = stop_process_group(&prepared.kill, &prepared.path, child.id(), "OpenVPN");
+        let _ = fs::remove_dir_all(&directory);
+        return Err(error).context("OpenVPN startup rolled back");
     }
-    let _ = stop_process_group(&prepared.kill, &prepared.path, child.id(), "OpenVPN");
-    let _ = fs::remove_dir_all(&directory);
-    bail!("OpenVPN did not create its tunnel interface")
+    Ok((child.id(), directory))
 }
 
 fn stop_process_group(kill: &Path, path: &std::ffi::OsStr, pid: u32, name: &str) -> Result<()> {
-    let status = Command::new(kill).args(["-TERM", "--", &format!("-{pid}")]).env("PATH", path).status()
+    let group_alive = || {
+        Command::new(kill).args(["-0", "--", &format!("-{pid}")]).env("PATH", path)
+            .stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|status| status.success())
+    };
+    if !group_alive() {
+        return Ok(());
+    }
+    let status = Command::new(kill).args(["-TERM", "--", &format!("-{pid}")]).env("PATH", path)
+        .stdout(Stdio::null()).stderr(Stdio::null()).status()
         .with_context(|| format!("stop {name} process group"))?;
-    if !status.success() { bail!("stop {name} process exited with {status}"); }
+    if !status.success() && group_alive() { bail!("stop {name} process exited with {status}"); }
     for _ in 0..100 {
-        if !process_is_running(pid) { return Ok(()); }
+        if !group_alive() { return Ok(()); }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    bail!("{name} process did not stop")
+    bail!("{name} process group did not stop")
 }
 
-fn openvpn_process_configuration(pid: u32) -> Result<PathBuf> {
+fn force_stop_process_group(kill: &Path, path: &std::ffi::OsStr, pid: u32, name: &str) -> Result<()> {
+    let status = Command::new(kill).args(["-KILL", "--", &format!("-{pid}")]).env("PATH", path)
+        .stdout(Stdio::null()).stderr(Stdio::null()).status()
+        .with_context(|| format!("force-stop {name} process group"))?;
+    if !status.success() && process_is_running(pid) {
+        bail!("force-stop {name} process exited with {status}");
+    }
+    Ok(())
+}
+
+fn owned_runtime_file(path: PathBuf, expected_name: &str) -> Result<PathBuf> {
+    let path = path.canonicalize().context("resolve staged runtime file")?;
+    if path.file_name() != Some(std::ffi::OsStr::new(expected_name)) {
+        bail!("staged runtime file has an unexpected name");
+    }
+    let directory = path.parent().context("staged runtime file has no directory")?;
+    if directory.parent() != Some(Path::new("/run/amn")) {
+        bail!("staged runtime file is outside the owned runtime directory");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::metadata(directory)?;
+        if metadata.uid() != 0 || metadata.permissions().mode() & 0o777 != 0o700 {
+            bail!("staged runtime directory ownership or permissions changed");
+        }
+    }
+    Ok(path)
+}
+
+fn openvpn_process_configuration(pid: u32, expected_executable: Option<&Path>) -> Result<PathBuf> {
     if !process_is_running(pid) { bail!("recorded OpenVPN process is no longer running"); }
     let executable = fs::canonicalize(format!("/proc/{pid}/exe")).context("resolve OpenVPN executable")?;
-    if executable.file_name() != Some(std::ffi::OsStr::new("openvpn")) || !is_trusted_network_executable(&executable) {
+    if expected_executable.is_some_and(|expected| executable != expected)
+        || executable.file_name() != Some(std::ffi::OsStr::new("openvpn"))
+        || !is_trusted_network_executable(&executable)
+    {
         bail!("recorded process is not a trusted OpenVPN process");
     }
     let command_line = fs::read(format!("/proc/{pid}/cmdline"))?;
     let arguments = command_line.split(|byte| *byte == 0).filter(|argument| !argument.is_empty()).collect::<Vec<_>>();
     let index = arguments.iter().position(|argument| *argument == b"--config").context("OpenVPN process has no configuration argument")?;
     let value = arguments.get(index + 1).context("OpenVPN configuration argument is incomplete")?;
-    PathBuf::from(std::ffi::OsString::from_vec(value.to_vec())).canonicalize().context("resolve staged OpenVPN configuration")
+    owned_runtime_file(PathBuf::from(std::ffi::OsString::from_vec(value.to_vec())), "openvpn.conf")
 }
 
 struct PreparedIkev2 {
@@ -507,18 +620,33 @@ struct PreparedIkev2 {
     remote_identity: Option<String>,
     certificate: Vec<u8>,
     password: String,
+    ike_proposal: Option<String>,
+    esp_proposal: Option<String>,
     executable: PathBuf,
     setsid: PathBuf,
     kill: PathBuf,
     ip: PathBuf,
     path: std::ffi::OsString,
+    remote_ts: Vec<String>,
+    bypass_routes: Vec<String>,
 }
 
-fn prepare_ikev2(store: &Store, profile: &Profile) -> Result<PreparedIkev2> {
+fn prepare_ikev2(store: &Store, profile: &Profile, settings: &Settings) -> Result<PreparedIkev2> {
     let configuration = crate::core::ikev2::parse(&store.validated_profile_text(profile)?)?;
     let executable = resolve_network_program("charon-cmd")?;
     let version = Command::new(&executable).arg("--version").output().context("check charon-cmd")?;
     if !version.status.success() { bail!("charon-cmd failed its dependency check"); }
+    let routes = settings.split_routes.iter()
+        .map(|route| crate::core::routing::Network::parse(route).map(|route| route.cidr()))
+        .collect::<Result<Vec<_>>>()?;
+    let (remote_ts, bypass_routes) = match settings.route_mode {
+        crate::core::model::RouteMode::All => (vec!["0.0.0.0/0".into(), "::/0".into()], Vec::new()),
+        crate::core::model::RouteMode::OnlyListed if routes.is_empty() => {
+            bail!("IKEv2 only-listed routing requires at least one split route");
+        }
+        crate::core::model::RouteMode::OnlyListed => (routes, Vec::new()),
+        crate::core::model::RouteMode::ExceptListed => (vec!["0.0.0.0/0".into(), "::/0".into()], routes),
+    };
     Ok(PreparedIkev2 {
         host: configuration.host,
         endpoint: configuration.endpoint,
@@ -526,71 +654,167 @@ fn prepare_ikev2(store: &Store, profile: &Profile) -> Result<PreparedIkev2> {
         remote_identity: configuration.remote_identity,
         certificate: configuration.certificate,
         password: configuration.password,
+        ike_proposal: configuration.ike_proposal,
+        esp_proposal: configuration.esp_proposal,
         executable,
         setsid: resolve_network_program("setsid")?,
         kill: resolve_network_program("kill")?,
         ip: resolve_network_program("ip")?,
         path: std::env::join_paths(network_program_directories()).context("construct IKEv2 dependency PATH")?,
+        remote_ts,
+        bypass_routes,
     })
 }
 
+fn ikev2_policy_arguments(action: &str, route: &str) -> Vec<Vec<String>> {
+    let ipv6 = route.contains(':');
+    let any = if ipv6 { "::/0" } else { "0.0.0.0/0" };
+    vec![
+        vec!["xfrm".into(), "policy".into(), action.into(), "dir".into(), "out".into(), "priority".into(), "5".into(), "src".into(), any.into(), "dst".into(), route.into(), "action".into(), "allow".into()],
+        vec!["xfrm".into(), "policy".into(), action.into(), "dir".into(), "in".into(), "priority".into(), "5".into(), "src".into(), route.into(), "dst".into(), any.into(), "action".into(), "allow".into()],
+    ]
+}
+
+fn run_ikev2_ip(prepared: &PreparedIkev2, arguments: &[String]) -> Result<()> {
+    let status = Command::new(&prepared.ip).args(arguments).env("PATH", &prepared.path).status()?;
+    if !status.success() { bail!("ip {} exited with {status}", arguments.join(" ")); }
+    Ok(())
+}
+
+fn remove_ikev2_bypass_policies(prepared: &PreparedIkev2) -> Result<()> {
+    let mut failures = Vec::new();
+    for route in prepared.bypass_routes.iter().rev() {
+        for arguments in ikev2_policy_arguments("delete", route).into_iter().rev() {
+            if let Err(error) = run_ikev2_ip(prepared, &arguments) { failures.push(format!("{error:#}")); }
+        }
+    }
+    if failures.is_empty() { Ok(()) } else { bail!("{}", failures.join("; ")) }
+}
+
 fn start_ikev2(store: &Store, prepared: &PreparedIkev2, logging: bool) -> Result<(u32, PathBuf)> {
-    use std::io::Write as _;
     if effective_user_id() != Some(0) { bail!("IKEv2 connection requires running amn as root"); }
-    let directory = create_root_runtime_directory()?;
+    let baseline = Command::new(&prepared.ip).args(["xfrm", "state"]).env("PATH", &prepared.path).output()
+        .context("capture existing IPsec security associations")?;
+    if !baseline.status.success() { bail!("cannot inspect existing IPsec security associations"); }
+    let mut applied_policies: Vec<Vec<String>> = Vec::new();
+    for route in &prepared.bypass_routes {
+        for arguments in ikev2_policy_arguments("add", route) {
+            if let Err(error) = run_ikev2_ip(prepared, &arguments) {
+                for applied in applied_policies.iter().rev() {
+                    let mut reverse = applied.clone();
+                    reverse[2] = "delete".into();
+                    let _ = run_ikev2_ip(prepared, &reverse);
+                }
+                return Err(error).context("install IKEv2 bypass policy");
+            }
+            applied_policies.push(arguments);
+        }
+    }
+    let directory = match create_root_runtime_directory() {
+        Ok(directory) => directory,
+        Err(error) => {
+            let _ = remove_ikev2_bypass_policies(prepared);
+            return Err(error);
+        }
+    };
     let certificate = directory.join("client.p12");
-    crate::core::store::write_private(&certificate, &prepared.certificate)?;
+    if let Err(error) = crate::core::store::write_private(&certificate, &prepared.certificate) {
+        let _ = remove_ikev2_bypass_policies(prepared);
+        let _ = fs::remove_dir_all(&directory);
+        return Err(error).context("stage IKEv2 certificate");
+    }
     let mut arguments = vec![
         prepared.executable.as_os_str().to_owned(), "--host".into(), prepared.host.clone().into(),
         "--identity".into(), prepared.identity.clone().into(), "--p12".into(), certificate.as_os_str().to_owned(),
-        "--profile".into(), "ikev2-pub".into(), "--remote-ts".into(), "0.0.0.0/0".into(),
+        "--profile".into(), "ikev2-pub".into(),
     ];
+    for selector in &prepared.remote_ts {
+        arguments.extend(["--remote-ts".into(), selector.into()]);
+    }
     if let Some(identity) = &prepared.remote_identity {
         arguments.extend(["--remote-identity".into(), identity.into()]);
+    }
+    if let Some(proposal) = &prepared.ike_proposal {
+        arguments.extend(["--ike-proposal".into(), proposal.into()]);
+    }
+    if let Some(proposal) = &prepared.esp_proposal {
+        arguments.extend(["--esp-proposal".into(), proposal.into()]);
     }
     let mut command = Command::new(&prepared.setsid);
     command.args(arguments).env("PATH", &prepared.path).stdin(Stdio::piped());
     if logging {
         let log_path = store.root().join("logs").join(format!("connection-{}.log", uuid::Uuid::new_v4().simple()));
-        let stdout = create_private_log(&log_path)?;
-        command.stdout(stdout.try_clone()?).stderr(stdout);
+        let stdout = match create_private_log(&log_path) {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = remove_ikev2_bypass_policies(prepared);
+                let _ = fs::remove_dir_all(&directory);
+                return Err(error);
+            }
+        };
+        let stderr = match stdout.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = remove_ikev2_bypass_policies(prepared);
+                let _ = fs::remove_dir_all(&directory);
+                return Err(error.into());
+            }
+        };
+        command.stdout(stdout).stderr(stderr);
     } else {
         command.stdout(Stdio::null()).stderr(Stdio::null());
     }
-    let mut child = command.spawn().context("start isolated IKEv2 process")?;
-    if let Some(mut input) = child.stdin.take() {
-        input.write_all(prepared.password.as_bytes())?;
-        input.write_all(b"\n")?;
-    }
-    for _ in 0..300 {
-        if let Some(status) = child.try_wait()? {
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = remove_ikev2_bypass_policies(prepared);
             let _ = fs::remove_dir_all(&directory);
-            bail!("IKEv2 process exited during startup with {status}");
+            return Err(error).context("start isolated IKEv2 process");
         }
-        let state = Command::new(&prepared.ip).args(["xfrm", "state"]).env("PATH", &prepared.path).output()?;
-        if state.status.success()
-            && String::from_utf8_lossy(&state.stdout).split_whitespace().any(|field| field == prepared.endpoint)
-        {
-            return Ok((child.id(), directory));
+    };
+    let startup = (|| -> Result<()> {
+        if let Some(mut input) = child.stdin.take() {
+            input.write_all(prepared.password.as_bytes())?;
+            input.write_all(b"\n")?;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        for _ in 0..300 {
+            if let Some(status) = child.try_wait()? {
+                bail!("IKEv2 process exited during startup with {status}");
+            }
+            let state = Command::new(&prepared.ip).args(["xfrm", "state"]).env("PATH", &prepared.path).output()?;
+            if state.status.success() && state.stdout != baseline.stdout
+                && String::from_utf8_lossy(&state.stdout).split_whitespace().any(|field| field == prepared.endpoint)
+            {
+                let policies = Command::new(&prepared.ip).args(["xfrm", "policy"]).env("PATH", &prepared.path).output()?;
+                if policies.status.success() && !policies.stdout.is_empty() { return Ok(()); }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        bail!("IKEv2 did not establish a new IPsec security association and policy")
+    })();
+    if let Err(error) = startup {
+        let _ = stop_process_group(&prepared.kill, &prepared.path, child.id(), "IKEv2");
+        let _ = remove_ikev2_bypass_policies(prepared);
+        let _ = fs::remove_dir_all(&directory);
+        return Err(error).context("IKEv2 startup rolled back");
     }
-    let _ = stop_process_group(&prepared.kill, &prepared.path, child.id(), "IKEv2");
-    let _ = fs::remove_dir_all(&directory);
-    bail!("IKEv2 did not establish an IPsec security association")
+    Ok((child.id(), directory))
 }
 
-fn ikev2_process_certificate(pid: u32) -> Result<PathBuf> {
+fn ikev2_process_certificate(pid: u32, expected_executable: Option<&Path>) -> Result<PathBuf> {
     if !process_is_running(pid) { bail!("recorded IKEv2 process is no longer running"); }
     let executable = fs::canonicalize(format!("/proc/{pid}/exe")).context("resolve IKEv2 executable")?;
-    if executable.file_name() != Some(std::ffi::OsStr::new("charon-cmd")) || !is_trusted_network_executable(&executable) {
+    if expected_executable.is_some_and(|expected| executable != expected)
+        || executable.file_name() != Some(std::ffi::OsStr::new("charon-cmd"))
+        || !is_trusted_network_executable(&executable)
+    {
         bail!("recorded process is not a trusted IKEv2 process");
     }
     let command_line = fs::read(format!("/proc/{pid}/cmdline"))?;
     let arguments = command_line.split(|byte| *byte == 0).filter(|argument| !argument.is_empty()).collect::<Vec<_>>();
     let index = arguments.iter().position(|argument| *argument == b"--p12").context("IKEv2 process has no certificate argument")?;
     let value = arguments.get(index + 1).context("IKEv2 certificate argument is incomplete")?;
-    PathBuf::from(std::ffi::OsString::from_vec(value.to_vec())).canonicalize().context("resolve staged IKEv2 certificate")
+    owned_runtime_file(PathBuf::from(std::ffi::OsString::from_vec(value.to_vec())), "client.p12")
 }
 
 struct PreparedXray {
@@ -716,7 +940,14 @@ fn start_xray_worker(store: &Store, prepared: &PreparedXray, interface: &str, lo
     if logging {
         let log_path = store.root().join("logs").join(format!("connection-{}.log", uuid::Uuid::new_v4().simple()));
         let stdout = create_private_log(&log_path)?;
-        command.stdout(stdout.try_clone()?).stderr(stdout);
+        let stderr = match stdout.try_clone() {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&directory);
+                return Err(error.into());
+            }
+        };
+        command.stdout(stdout).stderr(stderr);
     } else {
         command.stdout(Stdio::null()).stderr(Stdio::null());
     }
@@ -740,18 +971,7 @@ fn start_xray_worker(store: &Store, prepared: &PreparedXray, interface: &str, lo
 }
 
 fn stop_xray_worker(prepared: &PreparedXray, pid: u32) -> Result<()> {
-    let status = Command::new(&prepared.kill).args(["-TERM", "--", &format!("-{pid}")]).env("PATH", &prepared.path).status()
-        .context("stop XRay worker process group")?;
-    if !status.success() {
-        bail!("stop XRay worker exited with {status}");
-    }
-    for _ in 0..30 {
-        if !Path::new(&format!("/proc/{pid}")).exists() {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    bail!("XRay worker did not stop")
+    stop_process_group(&prepared.kill, &prepared.path, pid, "XRay worker")
 }
 
 fn traffic_route_pairs(prepared: &PreparedXray, interface: &str) -> Vec<(Vec<String>, Vec<String>)> {
@@ -847,12 +1067,17 @@ fn connect_xray(store: &Store, state: &mut State, profile: &Profile, id: String,
             Err(rollback_error) => Err(error).context(format!("XRay connection and rollback failed: {rollback_error:#}")),
         };
     }
+    let Some(start_ticks) = process_start_ticks(pid) else {
+        rollback_xray_connect(&prepared, pid, interface, &mut rollback)
+            .context("XRay process identity could not be read and rollback failed")?;
+        bail!("XRay process identity could not be read; connection rolled back");
+    };
     let mut updated = state.clone();
     updated.connection = Some(Connection {
         profile_id: id,
         pid: Some(pid),
+        process_start_ticks: Some(start_ticks),
         interface: Some(interface.into()),
-        started_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     });
     if let Err(error) = store.save(&updated) {
         return match rollback_xray_connect(&prepared, pid, interface, &mut rollback) {
@@ -890,9 +1115,31 @@ fn xray_process_info(pid: u32) -> Result<XrayProcessInfo> {
     })
 }
 
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let fields = stat.rsplit_once(')')?.1.split_whitespace().collect::<Vec<_>>();
+    fields.get(19)?.parse().ok()
+}
+
+fn verify_connection_process(connection: &Connection) -> Result<u32> {
+    let pid = connection.pid.context("connection has no process ID")?;
+    let expected = connection.process_start_ticks.context("connection has no verifiable process start identity")?;
+    if process_start_ticks(pid) != Some(expected) {
+        bail!("recorded connection process identity no longer matches");
+    }
+    Ok(pid)
+}
+
 fn process_is_running(pid: u32) -> bool {
     let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else { return false };
     stat.rsplit_once(") ").and_then(|(_, suffix)| suffix.chars().next()).is_some_and(|state| state != 'Z')
+}
+
+fn reverse_ip_action(mut arguments: Vec<String>) -> Vec<String> {
+    if let Some(action) = arguments.iter_mut().find(|value| value.as_str() == "add" || value.as_str() == "delete") {
+        *action = if action == "add" { "delete".into() } else { "add".into() };
+    }
+    arguments
 }
 
 fn restore_xray_disconnect(
@@ -904,33 +1151,53 @@ fn restore_xray_disconnect(
     process_alive: bool,
     mut route_rollback: Vec<Vec<String>>,
 ) -> Result<()> {
+    let interface = original.interface.as_deref().context("XRay connection has no interface")?;
     let mut restored = original.clone();
+    let pid;
+    let mut disconnect_again = Vec::new();
     if process_alive {
+        pid = original.pid.context("XRay connection has no worker PID")?;
         while let Some(arguments) = route_rollback.pop() {
-            xray_ip_command(prepared, &arguments)?;
+            if let Err(error) = xray_ip_command(prepared, &arguments) {
+                let cleanup = rollback_xray_connect(prepared, pid, interface, &mut disconnect_again);
+                return match cleanup {
+                    Ok(()) => Err(error).context("restore XRay route failed; disconnected network state retained"),
+                    Err(cleanup_error) => Err(error).context(format!("restore XRay route and cleanup failed: {cleanup_error:#}")),
+                };
+            }
+            disconnect_again.push(reverse_ip_action(arguments));
         }
     } else {
-        let delete = vec!["link".into(), "delete".into(), "dev".into(), original.interface.clone().context("XRay connection has no interface")?];
+        let delete = vec!["link".into(), "delete".into(), "dev".into(), interface.into()];
         let _ = xray_ip_command(prepared, &delete);
-        let interface = original.interface.as_deref().context("XRay connection has no interface")?;
-        let pid = start_xray_worker(store, prepared, interface, state.settings.logging)?;
-        let mut rollback = Vec::new();
-        if let Err(error) = configure_xray_interface(prepared, interface, &mut rollback) {
-            let _ = rollback_xray_connect(prepared, pid, interface, &mut rollback);
+        pid = start_xray_worker(store, prepared, interface, state.settings.logging)?;
+        if let Err(error) = configure_xray_interface(prepared, interface, &mut disconnect_again) {
+            let _ = rollback_xray_connect(prepared, pid, interface, &mut disconnect_again);
             return Err(error).context("restore XRay network after failed disconnect");
         }
         restored.pid = Some(pid);
     }
+    let Some(start_ticks) = process_start_ticks(pid) else {
+        let _ = rollback_xray_connect(prepared, pid, interface, &mut disconnect_again);
+        bail!("restored XRay worker process identity could not be read");
+    };
+    restored.process_start_ticks = Some(start_ticks);
     let mut recovered = state.clone();
     recovered.connection = Some(restored);
-    store.save(&recovered).context("restore XRay connection state")?;
+    if let Err(error) = store.save(&recovered) {
+        let rollback = rollback_xray_connect(prepared, pid, interface, &mut disconnect_again);
+        return match rollback {
+            Ok(()) => Err(error).context("restore XRay connection state failed; disconnected network state retained"),
+            Err(rollback_error) => Err(error).context(format!("restore XRay connection state and cleanup failed: {rollback_error:#}")),
+        };
+    }
     *state = recovered;
     let _ = profile;
     Ok(())
 }
 
 fn disconnect_xray(store: &Store, state: &mut State, profile: &Profile, connection: &Connection, dry_run: bool) -> Result<String> {
-    let pid = connection.pid.context("XRay connection has no worker PID")?;
+    let pid = verify_connection_process(connection).context("verify XRay worker identity")?;
     let info = xray_process_info(pid)?;
     if connection.interface.as_deref() != Some(&info.interface) {
         bail!("XRay worker interface does not match saved connection");
@@ -981,12 +1248,18 @@ fn connect_openvpn(store: &Store, state: &mut State, profile: &Profile, id: Stri
     }
     let prepared = prepare_openvpn(store, profile, &state.settings)?;
     let (pid, runtime_directory) = start_openvpn(store, &prepared, state.settings.logging)?;
+    let Some(start_ticks) = process_start_ticks(pid) else {
+        let rollback = stop_process_group(&prepared.kill, &prepared.path, pid, "OpenVPN");
+        let _ = fs::remove_dir_all(&runtime_directory);
+        rollback.context("OpenVPN process identity could not be read and rollback failed")?;
+        bail!("OpenVPN process identity could not be read; connection rolled back");
+    };
     let mut updated = state.clone();
     updated.connection = Some(Connection {
         profile_id: id,
         pid: Some(pid),
+        process_start_ticks: Some(start_ticks),
         interface: Some(prepared.interface.clone()),
-        started_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     });
     if let Err(error) = store.save(&updated) {
         let rollback = stop_process_group(&prepared.kill, &prepared.path, pid, "OpenVPN");
@@ -1000,29 +1273,72 @@ fn connect_openvpn(store: &Store, state: &mut State, profile: &Profile, id: Stri
     Ok("connected".into())
 }
 
+fn restore_openvpn_connection(store: &Store, state: &mut State, original: &Connection, prepared: &PreparedOpenVpn) -> Result<()> {
+    let (pid, directory) = start_openvpn(store, prepared, state.settings.logging)?;
+    let Some(start_ticks) = process_start_ticks(pid) else {
+        let _ = stop_process_group(&prepared.kill, &prepared.path, pid, "OpenVPN");
+        let _ = fs::remove_dir_all(directory);
+        bail!("restored OpenVPN process identity could not be read");
+    };
+    let mut connection = original.clone();
+    connection.pid = Some(pid);
+    connection.process_start_ticks = Some(start_ticks);
+    connection.interface = Some(prepared.interface.clone());
+    let mut recovered = state.clone();
+    recovered.connection = Some(connection);
+    if let Err(error) = store.save(&recovered) {
+        let _ = stop_process_group(&prepared.kill, &prepared.path, pid, "OpenVPN");
+        let _ = fs::remove_dir_all(directory);
+        return Err(error).context("persist restored OpenVPN connection");
+    }
+    *state = recovered;
+    Ok(())
+}
+
 fn disconnect_openvpn(store: &Store, state: &mut State, profile: &Profile, connection: &Connection, dry_run: bool) -> Result<String> {
-    let pid = connection.pid.context("OpenVPN connection has no process PID")?;
-    let configuration = openvpn_process_configuration(pid)?;
+    let pid = verify_connection_process(connection).context("verify OpenVPN process identity")?;
+    let prepared = prepare_openvpn(store, profile, &state.settings)?;
+    let configuration = openvpn_process_configuration(pid, Some(&prepared.executable))?;
     if dry_run {
         return Ok(format!("terminate owned OpenVPN process group {pid}\nrollback: restart the validated OpenVPN profile"));
     }
-    let prepared = prepare_openvpn(store, profile, &state.settings)?;
     let mut disconnected = state.clone();
     disconnected.connection = None;
     store.save(&disconnected).context("persist pending OpenVPN disconnect")?;
     if let Err(error) = stop_process_group(&prepared.kill, &prepared.path, pid, "OpenVPN") {
-        store.save(state).context("restore OpenVPN connection state after failed disconnect")?;
+        if let Err(persist_error) = store.save(state) {
+            let cleanup = force_stop_process_group(&prepared.kill, &prepared.path, pid, "OpenVPN");
+            return match cleanup {
+                Ok(()) => Err(error).context(format!("OpenVPN disconnect failed and connection state could not be restored: {persist_error:#}; process force-stopped")),
+                Err(cleanup_error) => Err(error).context(format!("OpenVPN disconnect, state restoration, and force-stop failed: {persist_error:#}; {cleanup_error:#}")),
+            };
+        }
         return Err(error).context("OpenVPN disconnect failed; connection state restored");
     }
     let runtime_directory = configuration.parent().map(Path::to_path_buf);
-    for _ in 0..100 {
-        let exists = Command::new(&prepared.ip).args(["link", "show", "dev", &prepared.interface]).env("PATH", &prepared.path)
+    let cleanup = (|| -> Result<()> {
+        for _ in 0..100 {
+            let exists = Command::new(&prepared.ip).args(["link", "show", "dev", &prepared.interface]).env("PATH", &prepared.path)
+                .stdout(Stdio::null()).stderr(Stdio::null()).status()?.success();
+            if !exists { break; }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let remains = Command::new(&prepared.ip).args(["link", "show", "dev", &prepared.interface]).env("PATH", &prepared.path)
             .stdout(Stdio::null()).stderr(Stdio::null()).status()?.success();
-        if !exists { break; }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    if let Some(directory) = runtime_directory {
-        fs::remove_dir_all(directory).context("remove staged OpenVPN configuration")?;
+        if remains {
+            let status = Command::new(&prepared.ip).args(["link", "delete", "dev", &prepared.interface]).env("PATH", &prepared.path).status()?;
+            if !status.success() { bail!("OpenVPN tunnel interface remained after process termination"); }
+        }
+        if let Some(directory) = runtime_directory {
+            fs::remove_dir_all(directory).context("remove staged OpenVPN configuration")?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = cleanup {
+        return match restore_openvpn_connection(store, state, connection, &prepared) {
+            Ok(()) => Err(error).context("OpenVPN disconnect cleanup failed; connection restored"),
+            Err(rollback_error) => Err(error).context(format!("OpenVPN disconnect cleanup and rollback failed: {rollback_error:#}")),
+        };
     }
     *state = disconnected;
     Ok("disconnected".into())
@@ -1032,15 +1348,24 @@ fn connect_ikev2(store: &Store, state: &mut State, profile: &Profile, id: String
     if dry_run {
         return Ok("charon-cmd --host <server> --identity <identity> --p12 <validated-certificate> --profile ikev2-pub\nrollback: terminate the owned IKEv2 process group".into());
     }
-    let prepared = prepare_ikev2(store, profile)?;
+    let prepared = prepare_ikev2(store, profile, &state.settings)?;
     let (pid, runtime_directory) = start_ikev2(store, &prepared, state.settings.logging)?;
+    let Some(start_ticks) = process_start_ticks(pid) else {
+        let rollback = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2")
+            .and_then(|_| remove_ikev2_bypass_policies(&prepared));
+        let _ = fs::remove_dir_all(&runtime_directory);
+        rollback.context("IKEv2 process identity could not be read and rollback failed")?;
+        bail!("IKEv2 process identity could not be read; connection rolled back");
+    };
     let mut updated = state.clone();
     updated.connection = Some(Connection {
-        profile_id: id, pid: Some(pid), interface: None,
-        started_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        profile_id: id, pid: Some(pid),
+        process_start_ticks: Some(start_ticks),
+        interface: None,
     });
     if let Err(error) = store.save(&updated) {
-        let rollback = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2");
+        let rollback = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2")
+            .and_then(|_| remove_ikev2_bypass_policies(&prepared));
         let _ = fs::remove_dir_all(&runtime_directory);
         return match rollback {
             Ok(()) => Err(error).context("IKEv2 connection rolled back after state save failed"),
@@ -1051,22 +1376,62 @@ fn connect_ikev2(store: &Store, state: &mut State, profile: &Profile, id: String
     Ok("connected".into())
 }
 
+fn restore_ikev2_connection(store: &Store, state: &mut State, original: &Connection, prepared: &PreparedIkev2) -> Result<()> {
+    let (pid, directory) = start_ikev2(store, prepared, state.settings.logging)?;
+    let Some(start_ticks) = process_start_ticks(pid) else {
+        let _ = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2");
+        let _ = remove_ikev2_bypass_policies(prepared);
+        let _ = fs::remove_dir_all(directory);
+        bail!("restored IKEv2 process identity could not be read");
+    };
+    let mut connection = original.clone();
+    connection.pid = Some(pid);
+    connection.process_start_ticks = Some(start_ticks);
+    let mut recovered = state.clone();
+    recovered.connection = Some(connection);
+    if let Err(error) = store.save(&recovered) {
+        let _ = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2");
+        let _ = remove_ikev2_bypass_policies(prepared);
+        let _ = fs::remove_dir_all(directory);
+        return Err(error).context("persist restored IKEv2 connection");
+    }
+    *state = recovered;
+    Ok(())
+}
+
 fn disconnect_ikev2(store: &Store, state: &mut State, profile: &Profile, connection: &Connection, dry_run: bool) -> Result<String> {
-    let pid = connection.pid.context("IKEv2 connection has no process PID")?;
-    let certificate = ikev2_process_certificate(pid)?;
+    let pid = verify_connection_process(connection).context("verify IKEv2 process identity")?;
+    let prepared = prepare_ikev2(store, profile, &state.settings)?;
+    let certificate = ikev2_process_certificate(pid, Some(&prepared.executable))?;
     if dry_run {
         return Ok(format!("terminate owned IKEv2 process group {pid}\nrollback: restart the validated IKEv2 profile"));
     }
-    let prepared = prepare_ikev2(store, profile)?;
     let mut disconnected = state.clone();
     disconnected.connection = None;
     store.save(&disconnected).context("persist pending IKEv2 disconnect")?;
     if let Err(error) = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2") {
-        store.save(state).context("restore IKEv2 connection state after failed disconnect")?;
+        if let Err(persist_error) = store.save(state) {
+            let cleanup = force_stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2")
+                .and_then(|_| remove_ikev2_bypass_policies(&prepared));
+            return match cleanup {
+                Ok(()) => Err(error).context(format!("IKEv2 disconnect failed and connection state could not be restored: {persist_error:#}; process force-stopped")),
+                Err(cleanup_error) => Err(error).context(format!("IKEv2 disconnect, state restoration, and force-stop failed: {persist_error:#}; {cleanup_error:#}")),
+            };
+        }
         return Err(error).context("IKEv2 disconnect failed; connection state restored");
     }
-    if let Some(directory) = certificate.parent() {
-        fs::remove_dir_all(directory).context("remove staged IKEv2 certificate")?;
+    let cleanup = remove_ikev2_bypass_policies(&prepared).and_then(|_| {
+        if let Some(directory) = certificate.parent() {
+            fs::remove_dir_all(directory).context("remove staged IKEv2 certificate")?;
+        }
+        Ok(())
+    });
+    if let Err(error) = cleanup {
+        let _ = remove_ikev2_bypass_policies(&prepared);
+        return match restore_ikev2_connection(store, state, connection, &prepared) {
+            Ok(()) => Err(error).context("IKEv2 disconnect cleanup failed; connection restored"),
+            Err(rollback_error) => Err(error).context(format!("IKEv2 disconnect cleanup and rollback failed: {rollback_error:#}")),
+        };
     }
     *state = disconnected;
     Ok("disconnected".into())
@@ -1123,10 +1488,10 @@ pub fn connect(store: &Store, state: &mut State, profile_id: Option<&str>, dry_r
         return fail_with_rollback(&plan, &prepared, anyhow!("{} exited with {status}", plan.program));
     }
     let connection = Connection {
-        profile_id: id,
+        profile_id: profile.id.clone(),
         pid: None,
+        process_start_ticks: None,
         interface: plan.interface.clone(),
-        started_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
     };
     let mut updated = state.clone();
     updated.connection = Some(connection);
@@ -1202,14 +1567,23 @@ fn disconnect_plan(profile: &Profile, connection: &Connection) -> Result<Command
 }
 
 pub fn refresh_connection(state: &mut State) {
+    if let Some(connection) = state.connection.as_mut()
+        && connection.process_start_ticks.is_none()
+        && let Some(pid) = connection.pid
+    {
+        connection.process_start_ticks = process_start_ticks(pid);
+    }
     let stale = state.connection.as_ref().is_some_and(|connection| {
         let Some(profile) = state.profiles.get(&connection.profile_id) else { return true };
         if let Some(pid) = connection.pid {
+            if connection.process_start_ticks != process_start_ticks(pid) {
+                return true;
+            }
             if profile.protocol == Protocol::Ikev2 {
-                return ikev2_process_certificate(pid).is_err();
+                return ikev2_process_certificate(pid, None).is_err();
             }
             if profile.protocol == Protocol::OpenVpn {
-                return openvpn_process_configuration(pid).is_err();
+                return openvpn_process_configuration(pid, None).is_err();
             }
             if matches!(profile.protocol, Protocol::Xray | Protocol::Shadowsocks) {
                 return match xray_process_info(pid) {
@@ -1360,7 +1734,7 @@ mod tests {
     use super::*;
 
     fn profile(protocol: Protocol) -> Profile {
-        Profile { id: "p".into(), name: "test".into(), protocol, source: "/vpn/test.conf".into(), enabled: true, server_id: None }
+        Profile { id: "p".into(), name: "test".into(), protocol, source: "/vpn/test.conf".into(), enabled: true }
     }
 
     #[test]
@@ -1372,8 +1746,8 @@ mod tests {
         let connection = Connection {
             profile_id: "p".into(),
             pid: None,
+            process_start_ticks: None,
             interface: Some("test".into()),
-            started_unix_seconds: 0,
         };
         let disconnect = disconnect_plan(&profile(Protocol::WireGuard), &connection).unwrap();
         assert_eq!(disconnect.args.first().map(String::as_str), Some("down"));
@@ -1399,6 +1773,59 @@ mod tests {
         assert!(peer_sets_match(&expected, ["peer-b", "peer-a"].into_iter()));
         assert!(!peer_sets_match(&expected, ["peer-a"].into_iter()));
         assert!(!peer_sets_match(&expected, ["peer-a", "peer-b", "peer-c"].into_iter()));
+    }
+
+    #[test]
+    fn xray_route_modes_generate_distinct_reversible_routes() {
+        let prepared = |route_mode, split_routes| PreparedXray {
+            configuration: String::new(),
+            endpoint: "192.0.2.1".into(),
+            gateway: "192.0.2.254".into(),
+            uplink: "eth0".into(),
+            executable: "/bundle/xray".into(),
+            tun2socks: "/bundle/tun2socks".into(),
+            setsid: "/usr/bin/setsid".into(),
+            kill: "/usr/bin/kill".into(),
+            ip: "/usr/bin/ip".into(),
+            path: "/usr/bin".into(),
+            route_mode,
+            split_routes,
+        };
+        let only = prepared(
+            crate::core::model::RouteMode::OnlyListed,
+            vec![crate::core::routing::Network::parse("10.4.3.2/8").unwrap()],
+        );
+        let only_pairs = traffic_route_pairs(&only, "amnxray0");
+        assert_eq!(only_pairs.len(), 1);
+        assert!(only_pairs[0].0.contains(&"10.0.0.0/8".into()));
+        assert!(!only_pairs[0].0.contains(&"0.0.0.0/1".into()));
+
+        let except = prepared(
+            crate::core::model::RouteMode::ExceptListed,
+            vec![crate::core::routing::Network::parse("10.0.0.0/8").unwrap()],
+        );
+        let except_pairs = traffic_route_pairs(&except, "amnxray0");
+        assert!(except_pairs.iter().any(|(forward, _)| forward.contains(&"0.0.0.0/1".into())));
+        assert!(except_pairs.iter().any(|(forward, _)| {
+            forward.contains(&"10.0.0.0/8".into()) && forward.contains(&"eth0".into())
+        }));
+        assert!(except_pairs.iter().all(|(_, reverse)| reverse.iter().any(|argument| argument == "delete")));
+    }
+
+    #[test]
+    fn process_identity_uses_kernel_start_ticks() {
+        let pid = std::process::id();
+        let ticks = process_start_ticks(pid).expect("current process has start ticks");
+        let connection = Connection {
+            profile_id: "p".into(),
+            pid: Some(pid),
+            process_start_ticks: Some(ticks),
+            interface: None,
+        };
+        assert_eq!(verify_connection_process(&connection).unwrap(), pid);
+        let mut mismatch = connection;
+        mismatch.process_start_ticks = Some(ticks.saturating_add(1));
+        assert!(verify_connection_process(&mismatch).is_err());
     }
 
     #[test]

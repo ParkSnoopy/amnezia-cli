@@ -53,7 +53,11 @@ fn profile_command(store: &Store, state: &mut State, command: ProfileCommand, ou
             }
         }
         ProfileCommand::Show { id } => writeln!(output, "{}", serde_json::to_string_pretty(profile(state, &id)?)?)?,
-        ProfileCommand::Import { path, name } => writeln!(output, "{}", store.import_profile(state, &path, name)?)?,
+        ProfileCommand::Import { path, name } => {
+            for id in store.import_profile(state, &path, name)? {
+                writeln!(output, "{id}")?;
+            }
+        }
         ProfileCommand::Export { id, destination } => store.export_profile(state, &id, &destination)?,
         ProfileCommand::Remove { id } => store.remove_profile(state, &id)?,
         ProfileCommand::Rename { id, name } => update_state(store, state, |updated| {
@@ -95,8 +99,6 @@ fn server_command(store: &Store, state: &mut State, command: ServerCommand, dry_
                 port: args.port,
                 user: args.user,
                 identity_file: args.identity.map(|path| path.to_string_lossy().into_owned()),
-                default_profile: None,
-                installed_services: Vec::new(),
             };
             update_state(store, state, |updated| {
                 updated.servers.insert(id.clone(), server);
@@ -107,9 +109,6 @@ fn server_command(store: &Store, state: &mut State, command: ServerCommand, dry_
         }
         ServerCommand::Show { id } => writeln!(output, "{}", serde_json::to_string_pretty(server_ref(state, &id)?)?)?,
         ServerCommand::Remove { id } => {
-            if state.profiles.values().any(|profile| profile.server_id.as_deref() == Some(&id)) {
-                bail!("server is referenced by a profile; remove or update the profile first");
-            }
             update_state(store, state, |updated| {
                 updated.servers.remove(&id).with_context(|| format!("unknown server: {id}"))?;
                 if updated.default_server.as_deref() == Some(&id) { updated.default_server = updated.servers.keys().next().cloned(); }
