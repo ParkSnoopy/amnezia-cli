@@ -33,6 +33,7 @@ use anyhow::{
 use crate::core::{
     model::{
         Connection,
+        Ikev2RouteIdentity,
         Profile,
         Protocol,
         Settings,
@@ -126,6 +127,7 @@ struct PreparedPlan {
     interface_existed: bool,
     expected_peer_keys: Vec<String>,
     runtime_directory: Option<PathBuf>,
+    quick_base_created: bool,
     backend_environment: Option<(String, PathBuf)>,
 }
 
@@ -133,6 +135,9 @@ impl Drop for PreparedPlan {
     fn drop(&mut self) {
         if let Some(directory) = &self.runtime_directory {
             let _ = fs::remove_dir_all(directory);
+        }
+        if self.quick_base_created {
+            let _ = fs::remove_dir(Path::new("/etc/wireguard"));
         }
     }
 }
@@ -209,17 +214,20 @@ fn prepare_network_plan(
     {
         bail!("refusing to modify interface not owned by selected profile: {interface}");
     }
-    let (args, rollback_args, runtime_directory) = if stage_profile {
+    let (args, rollback_args, runtime_directory, quick_base_created) = if stage_profile {
         if effective_user_id() != Some(0) {
             bail!("VPN interface changes require running amn as root");
         }
-        let directory = create_root_runtime_directory()?;
+        let (directory, quick_base_created) = create_quick_runtime_directory()?;
         let file_name = Path::new(&profile.source)
             .file_name()
             .context("profile source has no filename")?;
         let staged = directory.join(file_name);
         if let Err(error) = crate::core::store::write_private(&staged, configuration.as_bytes()) {
             let _ = fs::remove_dir_all(&directory);
+            if quick_base_created {
+                let _ = fs::remove_dir(Path::new("/etc/wireguard"));
+            }
             return Err(error).context("stage validated VPN profile");
         }
         let staged = staged.to_string_lossy().into_owned();
@@ -227,9 +235,10 @@ fn prepare_network_plan(
             replace_profile_argument(&plan.args, &profile.source, &staged),
             replace_profile_argument(&plan.rollback_args, &profile.source, &staged),
             Some(directory),
+            quick_base_created,
         )
     } else {
-        (plan.args.clone(), plan.rollback_args.clone(), None)
+        (plan.args.clone(), plan.rollback_args.clone(), None, false)
     };
 
     Ok(PreparedPlan {
@@ -243,6 +252,7 @@ fn prepare_network_plan(
         interface_existed,
         expected_peer_keys: peer_keys,
         runtime_directory,
+        quick_base_created,
         backend_environment,
     })
 }
@@ -253,7 +263,7 @@ pub fn check_profile_dependencies(
     settings: &Settings,
 ) -> Result<()> {
     if profile.protocol == Protocol::Ikev2 {
-        prepare_ikev2(store, profile, settings)?;
+        prepare_ikev2(store, profile, settings, None)?;
         return Ok(());
     }
     if profile.protocol == Protocol::OpenVpn {
@@ -499,8 +509,7 @@ fn create_private_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn create_root_runtime_directory() -> Result<PathBuf> {
-    let base = Path::new("/run/amn");
+fn create_owned_runtime_directory(base: &Path, label: &str) -> Result<PathBuf> {
     match fs::create_dir(base) {
         Ok(()) => {
             #[cfg(unix)]
@@ -510,11 +519,11 @@ fn create_root_runtime_directory() -> Result<PathBuf> {
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error).context("create root VPN runtime directory"),
+        Err(error) => return Err(error).with_context(|| format!("create {label} directory")),
     }
-    let canonical = fs::canonicalize(base).context("inspect root VPN runtime directory")?;
+    let canonical = fs::canonicalize(base).with_context(|| format!("inspect {label} directory"))?;
     if canonical != base {
-        bail!("root VPN runtime directory resolves outside /run/amn");
+        bail!("{label} directory resolves outside its expected path");
     }
     #[cfg(unix)]
     {
@@ -527,12 +536,79 @@ fn create_root_runtime_directory() -> Result<PathBuf> {
             || metadata.uid() != 0
             || metadata.permissions().mode() & 0o777 != 0o700
         {
-            bail!("root VPN runtime directory must be root-owned with mode 0700");
+            bail!("{label} directory must be root-owned with mode 0700");
         }
     }
     let directory = base.join(uuid::Uuid::new_v4().simple().to_string());
     create_private_directory(&directory)?;
     Ok(directory)
+}
+
+fn create_root_runtime_directory() -> Result<PathBuf> {
+    create_owned_runtime_directory(Path::new("/run/amn"), "root VPN runtime")
+}
+
+fn create_quick_runtime_directory() -> Result<(PathBuf, bool)> {
+    let base = Path::new("/etc/wireguard");
+    let base_created = match fs::create_dir(base) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(error).context("create WireGuard runtime directory"),
+    };
+    let result = (|| -> Result<PathBuf> {
+        #[cfg(unix)]
+        if base_created {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(base, fs::Permissions::from_mode(0o700))?;
+        }
+        let canonical = fs::canonicalize(base).context("inspect WireGuard runtime directory")?;
+        if canonical != base {
+            bail!("WireGuard runtime directory resolves outside its expected path");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{
+                MetadataExt,
+                PermissionsExt,
+            };
+            let metadata = fs::metadata(base)?;
+            if !metadata.is_dir()
+                || metadata.uid() != 0
+                || metadata.permissions().mode() & 0o777 != 0o700
+            {
+                bail!("WireGuard runtime directory must be root-owned with mode 0700");
+            }
+        }
+        let directory = base.join(uuid::Uuid::new_v4().simple().to_string());
+        fs::create_dir(&directory)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(error) = fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)) {
+                let rollback = fs::remove_dir(&directory);
+                return match rollback {
+                    Ok(()) => Err(error.into()),
+                    Err(cleanup_error) => {
+                        Err(anyhow!(
+                            "{error}; WireGuard child runtime rollback failed: {cleanup_error}"
+                        ))
+                    }
+                };
+            }
+        }
+        Ok(directory)
+    })();
+    match result {
+        Ok(directory) => Ok((directory, base_created)),
+        Err(error) => {
+            if base_created && let Err(cleanup_error) = fs::remove_dir(base) {
+                return Err(anyhow!(
+                    "{error:#}; WireGuard runtime rollback failed: {cleanup_error}"
+                ));
+            }
+            Err(error)
+        }
+    }
 }
 
 fn fail_with_rollback<T>(
@@ -695,7 +771,7 @@ fn start_openvpn(
         };
         management.set_read_timeout(Some(std::time::Duration::from_millis(250)))?;
         management.write_all(
-            format!("{management_password}\nstate on\nlog on\nbytecount 1\n").as_bytes(),
+            format!("{management_password}\nstate on\nstate\nlog on\nbytecount 1\n").as_bytes(),
         )?;
         management.flush()?;
         let mut reader = BufReader::new(management);
@@ -852,8 +928,9 @@ fn openvpn_process_configuration(pid: u32, expected_executable: Option<&Path>) -
 }
 
 struct PreparedIkev2 {
-    host: String,
     endpoint: String,
+    gateway: String,
+    uplink: String,
     identity: String,
     remote_identity: Option<String>,
     certificate: Vec<u8>,
@@ -869,8 +946,17 @@ struct PreparedIkev2 {
     bypass_routes: Vec<String>,
 }
 
-fn prepare_ikev2(store: &Store, profile: &Profile, settings: &Settings) -> Result<PreparedIkev2> {
-    let configuration = crate::core::ikev2::parse(&store.validated_profile_text(profile)?)?;
+fn prepare_ikev2(
+    store: &Store,
+    profile: &Profile,
+    settings: &Settings,
+    owned_route: Option<&Ikev2RouteIdentity>,
+) -> Result<PreparedIkev2> {
+    let profile_text = store.validated_profile_text(profile)?;
+    let configuration = crate::core::ikev2::parse_for_endpoint(
+        &profile_text,
+        owned_route.map(|route| route.endpoint.as_str()),
+    )?;
     let executable = resolve_network_program("charon-cmd")?;
     let version = Command::new(&executable)
         .arg("--version")
@@ -879,6 +965,32 @@ fn prepare_ikev2(store: &Store, profile: &Profile, settings: &Settings) -> Resul
     if !version.status.success() {
         bail!("charon-cmd failed its dependency check");
     }
+    let ip = resolve_network_program("ip")?;
+    let path = std::env::join_paths(network_program_directories())
+        .context("construct IKEv2 dependency PATH")?;
+    let (endpoint, gateway, uplink) = if let Some(route) = owned_route {
+        (
+            route.endpoint.clone(),
+            route.gateway.clone(),
+            route.uplink.clone(),
+        )
+    } else {
+        let route = Command::new(&ip)
+            .args(["route", "get", &configuration.endpoint])
+            .env("PATH", &path)
+            .output()
+            .context("inspect route to IKEv2 endpoint")?;
+        if !route.status.success() {
+            bail!("cannot determine route to IKEv2 endpoint");
+        }
+        let route = String::from_utf8(route.stdout).context("IKEv2 endpoint route is not UTF-8")?;
+        let fields = route.split_whitespace().collect::<Vec<_>>();
+        let uplink = route_field(&fields, "dev")
+            .context("IKEv2 endpoint route has no uplink interface")?
+            .to_owned();
+        let gateway = route_field(&fields, "via").unwrap_or("-").to_owned();
+        (configuration.endpoint.clone(), gateway, uplink)
+    };
     let routes = settings
         .split_routes
         .iter()
@@ -895,10 +1007,11 @@ fn prepare_ikev2(store: &Store, profile: &Profile, settings: &Settings) -> Resul
         }
     };
     Ok(PreparedIkev2 {
-        host: configuration.host,
-        endpoint: configuration.endpoint,
+        endpoint,
+        gateway,
+        uplink,
         identity: configuration.identity,
-        remote_identity: configuration.remote_identity,
+        remote_identity: configuration.remote_identity.or(Some(configuration.host)),
         certificate: configuration.certificate,
         password: configuration.password,
         ike_proposal: configuration.ike_proposal,
@@ -906,9 +1019,8 @@ fn prepare_ikev2(store: &Store, profile: &Profile, settings: &Settings) -> Resul
         executable,
         setsid: resolve_network_program("setsid")?,
         kill: resolve_network_program("kill")?,
-        ip: resolve_network_program("ip")?,
-        path: std::env::join_paths(network_program_directories())
-            .context("construct IKEv2 dependency PATH")?,
+        ip,
+        path,
         remote_ts,
         bypass_routes,
     })
@@ -962,6 +1074,112 @@ fn run_ikev2_ip(prepared: &PreparedIkev2, arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn install_ikev2_endpoint_route(prepared: &PreparedIkev2) -> Result<()> {
+    let existing_route = Command::new(&prepared.ip)
+        .args(["route", "show", &format!("{}/32", prepared.endpoint)])
+        .env("PATH", &prepared.path)
+        .output()?;
+    if !existing_route.status.success() || !existing_route.stdout.is_empty() {
+        bail!("refusing to replace an existing specific route to the IKEv2 endpoint");
+    }
+    let existing_rule = Command::new(&prepared.ip)
+        .args(["rule", "show", "priority", "186"])
+        .env("PATH", &prepared.path)
+        .output()?;
+    if !existing_rule.status.success() || !existing_rule.stdout.is_empty() {
+        bail!("refusing to replace an existing IP rule at priority 186");
+    }
+    let mut arguments = vec![
+        "route".into(),
+        "add".into(),
+        format!("{}/32", prepared.endpoint),
+    ];
+    if prepared.gateway != "-" {
+        arguments.extend(["via".into(), prepared.gateway.clone()]);
+    }
+    arguments.extend([
+        "dev".into(),
+        prepared.uplink.clone(),
+        "proto".into(),
+        "186".into(),
+    ]);
+    run_ikev2_ip(prepared, &arguments).context("pin IKEv2 endpoint to the original uplink")?;
+    let rule = vec![
+        "rule".into(),
+        "add".into(),
+        "to".into(),
+        format!("{}/32", prepared.endpoint),
+        "lookup".into(),
+        "main".into(),
+        "priority".into(),
+        "186".into(),
+    ];
+    if let Err(error) = run_ikev2_ip(prepared, &rule) {
+        let error = error.context("prioritize the pinned IKEv2 endpoint route");
+        return Err(ikev2_setup_error(
+            error,
+            remove_ikev2_pinned_route(prepared),
+        ));
+    }
+    Ok(())
+}
+
+fn remove_ikev2_pinned_route(prepared: &PreparedIkev2) -> Result<()> {
+    let arguments = vec![
+        "route".into(),
+        "delete".into(),
+        format!("{}/32", prepared.endpoint),
+        "proto".into(),
+        "186".into(),
+    ];
+    let deletion = run_ikev2_ip(prepared, &arguments);
+    let remaining = Command::new(&prepared.ip)
+        .args([
+            "route",
+            "show",
+            &format!("{}/32", prepared.endpoint),
+            "proto",
+            "186",
+        ])
+        .env("PATH", &prepared.path)
+        .output()?;
+    if remaining.status.success() && remaining.stdout.is_empty() {
+        Ok(())
+    } else {
+        deletion.context("remove pinned IKEv2 endpoint route")?;
+        bail!("pinned IKEv2 endpoint route remained after removal")
+    }
+}
+
+fn remove_ikev2_endpoint_route(prepared: &PreparedIkev2) -> Result<()> {
+    let rule = vec![
+        "rule".into(),
+        "delete".into(),
+        "to".into(),
+        format!("{}/32", prepared.endpoint),
+        "lookup".into(),
+        "main".into(),
+        "priority".into(),
+        "186".into(),
+    ];
+    let _ = run_ikev2_ip(prepared, &rule);
+    let rule_remaining = Command::new(&prepared.ip)
+        .args(["rule", "show", "priority", "186"])
+        .env("PATH", &prepared.path)
+        .output()?;
+    let rule_removed = rule_remaining.status.success()
+        && !output_has_endpoint(&rule_remaining.stdout, &prepared.endpoint);
+    let route_removed = remove_ikev2_pinned_route(prepared);
+    combine_ikev2_cleanup([
+        if rule_removed {
+            Ok(())
+        } else {
+            Err(anyhow!("remove pinned IKEv2 endpoint rule"))
+        },
+        route_removed,
+    ])
+}
+
 fn remove_ikev2_bypass_policies(prepared: &PreparedIkev2) -> Result<()> {
     let mut failures = Vec::new();
     for route in prepared.bypass_routes.iter().rev() {
@@ -978,9 +1196,149 @@ fn remove_ikev2_bypass_policies(prepared: &PreparedIkev2) -> Result<()> {
     }
 }
 
+fn output_has_endpoint(output: &[u8], endpoint: &str) -> bool {
+    let endpoint_cidr = format!("{endpoint}/32");
+    String::from_utf8_lossy(output)
+        .split_whitespace()
+        .any(|field| field == endpoint || field == endpoint_cidr)
+}
+
+fn remove_ikev2_kernel_artifacts(prepared: &PreparedIkev2) -> Result<()> {
+    let interface_exists = Command::new(&prepared.ip)
+        .args(["link", "show", "dev", "ipsec0"])
+        .env("PATH", &prepared.path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success();
+    if interface_exists {
+        run_ikev2_ip(
+            prepared,
+            &[
+                "link".into(),
+                "delete".into(),
+                "dev".into(),
+                "ipsec0".into(),
+            ],
+        )
+        .context("remove owned IKEv2 kernel-libipsec interface")?;
+    }
+    let interface_remains = Command::new(&prepared.ip)
+        .args(["link", "show", "dev", "ipsec0"])
+        .env("PATH", &prepared.path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success();
+    let routes = Command::new(&prepared.ip)
+        .args(["route", "show", "table", "220"])
+        .env("PATH", &prepared.path)
+        .output()?;
+    let owned_routes_remain = String::from_utf8_lossy(&routes.stdout)
+        .lines()
+        .any(|line| line.split_whitespace().any(|field| field == "ipsec0"));
+    let states = Command::new(&prepared.ip)
+        .args(["xfrm", "state"])
+        .env("PATH", &prepared.path)
+        .output()?;
+    let policies = Command::new(&prepared.ip)
+        .args(["xfrm", "policy"])
+        .env("PATH", &prepared.path)
+        .output()?;
+    let endpoint_xfrm_state = output_has_endpoint(&states.stdout, &prepared.endpoint);
+    let endpoint_xfrm_policy = output_has_endpoint(&policies.stdout, &prepared.endpoint);
+    if interface_remains
+        || !routes.status.success()
+        || owned_routes_remain
+        || !states.status.success()
+        || !policies.status.success()
+        || endpoint_xfrm_state
+        || endpoint_xfrm_policy
+    {
+        bail!("owned IKEv2 kernel artifacts remained after process termination");
+    }
+    Ok(())
+}
+
+fn cleanup_ikev2_network(prepared: &PreparedIkev2) -> Result<()> {
+    let kernel = remove_ikev2_kernel_artifacts(prepared);
+    let endpoint = remove_ikev2_endpoint_route(prepared);
+    let policies = remove_ikev2_bypass_policies(prepared);
+    combine_ikev2_cleanup([kernel, endpoint, policies])
+}
+
+fn combine_ikev2_cleanup<const N: usize>(results: [Result<()>; N]) -> Result<()> {
+    let failures = results
+        .into_iter()
+        .filter_map(Result::err)
+        .map(|error| format!("{error:#}"))
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!("IKEv2 cleanup failed: {}", failures.join("; "))
+    }
+}
+
+fn stop_and_cleanup_ikev2(prepared: &PreparedIkev2, pid: u32) -> Result<()> {
+    if let Err(stop_error) = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2") {
+        force_stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2")
+            .with_context(|| format!("IKEv2 stop failed: {stop_error:#}"))?;
+    }
+    cleanup_ikev2_network(prepared)
+}
+
+fn rollback_applied_ikev2_policies(
+    prepared: &PreparedIkev2,
+    applied_policies: &[Vec<String>],
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for applied in applied_policies.iter().rev() {
+        let mut reverse = applied.clone();
+        reverse[2] = "delete".into();
+        if let Err(error) = run_ikev2_ip(prepared, &reverse) {
+            failures.push(format!("{error:#}"));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "failed to remove IKEv2 bypass policies: {}",
+            failures.join("; ")
+        )
+    }
+}
+
+fn rollback_ikev2_setup(prepared: &PreparedIkev2, directory: Option<&Path>) -> Result<()> {
+    let network = cleanup_ikev2_network(prepared);
+    let files = match directory {
+        Some(directory) => fs::remove_dir_all(directory).context("remove staged IKEv2 files"),
+        None => Ok(()),
+    };
+    combine_ikev2_cleanup([network, files])
+}
+
+fn ikev2_setup_error(error: anyhow::Error, rollback: Result<()>) -> anyhow::Error {
+    match rollback {
+        Ok(()) => error,
+        Err(rollback_error) => anyhow!("{error:#}; IKEv2 rollback failed: {rollback_error:#}"),
+    }
+}
+
 fn start_ikev2(store: &Store, prepared: &PreparedIkev2, logging: bool) -> Result<(u32, PathBuf)> {
     if effective_user_id() != Some(0) {
         bail!("IKEv2 connection requires running amn as root");
+    }
+    let tunnel_exists = Command::new(&prepared.ip)
+        .args(["link", "show", "dev", "ipsec0"])
+        .env("PATH", &prepared.path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success();
+    if tunnel_exists {
+        bail!("refusing to connect because IKEv2 interface already exists: ipsec0");
     }
     let baseline = Command::new(&prepared.ip)
         .args(["xfrm", "state"])
@@ -994,33 +1352,41 @@ fn start_ikev2(store: &Store, prepared: &PreparedIkev2, logging: bool) -> Result
     for route in &prepared.bypass_routes {
         for arguments in ikev2_policy_arguments("add", route) {
             if let Err(error) = run_ikev2_ip(prepared, &arguments) {
-                for applied in applied_policies.iter().rev() {
-                    let mut reverse = applied.clone();
-                    reverse[2] = "delete".into();
-                    let _ = run_ikev2_ip(prepared, &reverse);
-                }
-                return Err(error).context("install IKEv2 bypass policy");
+                let error = error.context("install IKEv2 bypass policy");
+                return Err(ikev2_setup_error(
+                    error,
+                    rollback_applied_ikev2_policies(prepared, &applied_policies),
+                ));
             }
             applied_policies.push(arguments);
         }
     }
+    if let Err(error) = install_ikev2_endpoint_route(prepared) {
+        return Err(ikev2_setup_error(
+            error,
+            rollback_applied_ikev2_policies(prepared, &applied_policies),
+        ));
+    }
     let directory = match create_root_runtime_directory() {
         Ok(directory) => directory,
         Err(error) => {
-            let _ = remove_ikev2_bypass_policies(prepared);
-            return Err(error);
+            return Err(ikev2_setup_error(
+                error,
+                rollback_ikev2_setup(prepared, None),
+            ));
         }
     };
     let certificate = directory.join("client.p12");
     if let Err(error) = crate::core::store::write_private(&certificate, &prepared.certificate) {
-        let _ = remove_ikev2_bypass_policies(prepared);
-        let _ = fs::remove_dir_all(&directory);
-        return Err(error).context("stage IKEv2 certificate");
+        return Err(ikev2_setup_error(
+            error.context("stage IKEv2 certificate"),
+            rollback_ikev2_setup(prepared, Some(&directory)),
+        ));
     }
     let mut arguments = vec![
         prepared.executable.as_os_str().to_owned(),
         "--host".into(),
-        prepared.host.clone().into(),
+        prepared.endpoint.clone().into(),
         "--identity".into(),
         prepared.identity.clone().into(),
         "--p12".into(),
@@ -1053,17 +1419,19 @@ fn start_ikev2(store: &Store, prepared: &PreparedIkev2, logging: bool) -> Result
         let stdout = match create_private_log(&log_path) {
             Ok(file) => file,
             Err(error) => {
-                let _ = remove_ikev2_bypass_policies(prepared);
-                let _ = fs::remove_dir_all(&directory);
-                return Err(error);
+                return Err(ikev2_setup_error(
+                    error,
+                    rollback_ikev2_setup(prepared, Some(&directory)),
+                ));
             }
         };
         let stderr = match stdout.try_clone() {
             Ok(file) => file,
             Err(error) => {
-                let _ = remove_ikev2_bypass_policies(prepared);
-                let _ = fs::remove_dir_all(&directory);
-                return Err(error.into());
+                return Err(ikev2_setup_error(
+                    error.into(),
+                    rollback_ikev2_setup(prepared, Some(&directory)),
+                ));
             }
         };
         command.stdout(stdout).stderr(stderr);
@@ -1073,9 +1441,11 @@ fn start_ikev2(store: &Store, prepared: &PreparedIkev2, logging: bool) -> Result
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
-            let _ = remove_ikev2_bypass_policies(prepared);
-            let _ = fs::remove_dir_all(&directory);
-            return Err(error).context("start isolated IKEv2 process");
+            return Err(ikev2_setup_error(
+                error.into(),
+                rollback_ikev2_setup(prepared, Some(&directory)),
+            ))
+            .context("start isolated IKEv2 process");
         }
     };
     let startup = (|| -> Result<()> {
@@ -1091,12 +1461,12 @@ fn start_ikev2(store: &Store, prepared: &PreparedIkev2, logging: bool) -> Result
                 .args(["xfrm", "state"])
                 .env("PATH", &prepared.path)
                 .output()?;
-            if state.status.success()
+            let kernel_ready = state.status.success()
                 && state.stdout != baseline.stdout
                 && String::from_utf8_lossy(&state.stdout)
                     .split_whitespace()
-                    .any(|field| field == prepared.endpoint)
-            {
+                    .any(|field| field == prepared.endpoint);
+            if kernel_ready {
                 let policies = Command::new(&prepared.ip)
                     .args(["xfrm", "policy"])
                     .env("PATH", &prepared.path)
@@ -1105,15 +1475,40 @@ fn start_ikev2(store: &Store, prepared: &PreparedIkev2, logging: bool) -> Result
                     return Ok(());
                 }
             }
+            let tunnel = Command::new(&prepared.ip)
+                .args(["-brief", "address", "show", "dev", "ipsec0"])
+                .env("PATH", &prepared.path)
+                .output()?;
+            let routes = Command::new(&prepared.ip)
+                .args(["route", "show", "table", "220", "dev", "ipsec0"])
+                .env("PATH", &prepared.path)
+                .output()?;
+            let has_virtual_ipv4 = String::from_utf8_lossy(&tunnel.stdout)
+                .split_whitespace()
+                .any(|field| field.contains('.') && field.contains('/'));
+            if tunnel.status.success()
+                && routes.status.success()
+                && has_virtual_ipv4
+                && !routes.stdout.is_empty()
+            {
+                return Ok(());
+            }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         bail!("IKEv2 did not establish a new IPsec security association and policy")
     })();
     if let Err(error) = startup {
-        let _ = stop_process_group(&prepared.kill, &prepared.path, child.id(), "IKEv2");
-        let _ = remove_ikev2_bypass_policies(prepared);
-        let _ = fs::remove_dir_all(&directory);
-        return Err(error).context("IKEv2 startup rolled back");
+        let cleanup = stop_and_cleanup_ikev2(prepared, child.id());
+        let directory_cleanup = fs::remove_dir_all(&directory)
+            .context("remove staged IKEv2 certificate after startup failure");
+        return match combine_ikev2_cleanup([cleanup, directory_cleanup]) {
+            Ok(()) => Err(error).context("IKEv2 startup rolled back"),
+            Err(cleanup_error) => {
+                Err(error).context(format!(
+                    "IKEv2 startup failed and rollback failed: {cleanup_error:#}"
+                ))
+            }
+        };
     }
     Ok((child.id(), directory))
 }
@@ -1151,6 +1546,7 @@ fn ikev2_process_certificate(pid: u32, expected_executable: Option<&Path>) -> Re
 struct PreparedXray {
     configuration: String,
     endpoint: String,
+    endpoint_port: u16,
     gateway: String,
     uplink: String,
     executable: PathBuf,
@@ -1171,6 +1567,7 @@ fn prepare_xray(store: &Store, profile: &Profile, settings: &Settings) -> Result
         _ => bail!("protocol does not use the XRay transport backend"),
     };
     let endpoint = raw.endpoint_ipv4()?;
+    let endpoint_port = raw.endpoint_port();
     let configuration = raw.render_for_endpoint(endpoint)?;
     let executable = resolve_network_program("amnezia-xray-runner")?;
     let runner_status = Command::new(&executable)
@@ -1215,6 +1612,7 @@ fn prepare_xray(store: &Store, profile: &Profile, settings: &Settings) -> Result
     Ok(PreparedXray {
         configuration,
         endpoint: endpoint.to_string(),
+        endpoint_port,
         gateway,
         uplink,
         executable,
@@ -1533,6 +1931,11 @@ fn connect_xray(
         return Ok("amnezia-xray-runner <validated-config> <tun2socks> amnxray0 <endpoint> <gateway> <uplink>\nrollback: ip route/address/link delete; terminate XRay worker process group".into());
     }
     let prepared = prepare_xray(store, profile, &state.settings)?;
+    let endpoint = format!("{}:{}", prepared.endpoint, prepared.endpoint_port)
+        .parse()
+        .context("construct XRay endpoint socket address")?;
+    TcpStream::connect_timeout(&endpoint, std::time::Duration::from_secs(5))
+        .context("XRay endpoint is not accepting TCP connections")?;
     let interface = "amnxray0";
     let existing = Command::new(&prepared.ip)
         .args(["link", "show", "dev", interface])
@@ -1568,6 +1971,7 @@ fn connect_xray(
         pid: Some(pid),
         process_start_ticks: Some(start_ticks),
         interface: Some(interface.into()),
+        ikev2_route: None,
     });
     if let Err(error) = store.save(&updated) {
         return match rollback_xray_connect(&prepared, pid, interface, &mut rollback) {
@@ -1852,6 +2256,7 @@ fn connect_openvpn(
         pid: Some(pid),
         process_start_ticks: Some(start_ticks),
         interface: Some(prepared.interface.clone()),
+        ikev2_route: None,
     });
     if let Err(error) = store.save(&updated) {
         let rollback = stop_process_group(&prepared.kill, &prepared.path, pid, "OpenVPN");
@@ -1986,12 +2391,12 @@ fn connect_ikev2(
     if dry_run {
         return Ok("charon-cmd --host <server> --identity <identity> --p12 <validated-certificate> --profile ikev2-pub\nrollback: terminate the owned IKEv2 process group".into());
     }
-    let prepared = prepare_ikev2(store, profile, &state.settings)?;
+    let prepared = prepare_ikev2(store, profile, &state.settings, None)?;
     let (pid, runtime_directory) = start_ikev2(store, &prepared, state.settings.logging)?;
     let Some(start_ticks) = process_start_ticks(pid) else {
-        let rollback = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2")
-            .and_then(|_| remove_ikev2_bypass_policies(&prepared));
-        let _ = fs::remove_dir_all(&runtime_directory);
+        let rollback = stop_and_cleanup_ikev2(&prepared, pid).and_then(|_| {
+            fs::remove_dir_all(&runtime_directory).context("remove staged IKEv2 certificate")
+        });
         rollback.context("IKEv2 process identity could not be read and rollback failed")?;
         bail!("IKEv2 process identity could not be read; connection rolled back");
     };
@@ -2000,12 +2405,17 @@ fn connect_ikev2(
         profile_id: id,
         pid: Some(pid),
         process_start_ticks: Some(start_ticks),
-        interface: None,
+        interface: Some("ipsec0".into()),
+        ikev2_route: Some(Ikev2RouteIdentity {
+            endpoint: prepared.endpoint.clone(),
+            gateway: prepared.gateway.clone(),
+            uplink: prepared.uplink.clone(),
+        }),
     });
     if let Err(error) = store.save(&updated) {
-        let rollback = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2")
-            .and_then(|_| remove_ikev2_bypass_policies(&prepared));
-        let _ = fs::remove_dir_all(&runtime_directory);
+        let rollback = stop_and_cleanup_ikev2(&prepared, pid).and_then(|_| {
+            fs::remove_dir_all(&runtime_directory).context("remove staged IKEv2 certificate")
+        });
         return match rollback {
             Ok(()) => Err(error).context("IKEv2 connection rolled back after state save failed"),
             Err(rollback_error) => {
@@ -2027,9 +2437,9 @@ fn restore_ikev2_connection(
 ) -> Result<()> {
     let (pid, directory) = start_ikev2(store, prepared, state.settings.logging)?;
     let Some(start_ticks) = process_start_ticks(pid) else {
-        let _ = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2");
-        let _ = remove_ikev2_bypass_policies(prepared);
-        let _ = fs::remove_dir_all(directory);
+        stop_and_cleanup_ikev2(prepared, pid)
+            .context("clean restored IKEv2 connection with unreadable process identity")?;
+        fs::remove_dir_all(directory).context("remove restored IKEv2 certificate")?;
         bail!("restored IKEv2 process identity could not be read");
     };
     let mut connection = original.clone();
@@ -2038,9 +2448,9 @@ fn restore_ikev2_connection(
     let mut recovered = state.clone();
     recovered.connection = Some(connection);
     if let Err(error) = store.save(&recovered) {
-        let _ = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2");
-        let _ = remove_ikev2_bypass_policies(prepared);
-        let _ = fs::remove_dir_all(directory);
+        stop_and_cleanup_ikev2(prepared, pid)
+            .context("clean restored IKEv2 connection after persistence failure")?;
+        fs::remove_dir_all(directory).context("remove restored IKEv2 certificate")?;
         return Err(error).context("persist restored IKEv2 connection");
     }
     *state = recovered;
@@ -2055,7 +2465,11 @@ fn disconnect_ikev2(
     dry_run: bool,
 ) -> Result<String> {
     let pid = verify_connection_process(connection).context("verify IKEv2 process identity")?;
-    let prepared = prepare_ikev2(store, profile, &state.settings)?;
+    let owned_route = connection
+        .ikev2_route
+        .as_ref()
+        .context("IKEv2 connection has no persisted endpoint route identity")?;
+    let prepared = prepare_ikev2(store, profile, &state.settings, Some(owned_route))?;
     let certificate = ikev2_process_certificate(pid, Some(&prepared.executable))?;
     if dry_run {
         return Ok(format!(
@@ -2067,25 +2481,20 @@ fn disconnect_ikev2(
     store
         .save(&disconnected)
         .context("persist pending IKEv2 disconnect")?;
-    if let Err(error) = stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2") {
-        if let Err(persist_error) = store.save(state) {
-            let cleanup = force_stop_process_group(&prepared.kill, &prepared.path, pid, "IKEv2")
-                .and_then(|_| remove_ikev2_bypass_policies(&prepared));
-            return match cleanup {
-                Ok(()) => Err(error).context(format!("IKEv2 disconnect failed and connection state could not be restored: {persist_error:#}; process force-stopped")),
-                Err(cleanup_error) => Err(error).context(format!("IKEv2 disconnect, state restoration, and force-stop failed: {persist_error:#}; {cleanup_error:#}")),
-            };
-        }
-        return Err(error).context("IKEv2 disconnect failed; connection state restored");
-    }
-    let cleanup = remove_ikev2_bypass_policies(&prepared).and_then(|_| {
+    let cleanup = stop_and_cleanup_ikev2(&prepared, pid).and_then(|_| {
         if let Some(directory) = certificate.parent() {
             fs::remove_dir_all(directory).context("remove staged IKEv2 certificate")?;
         }
         Ok(())
     });
     if let Err(error) = cleanup {
-        let _ = remove_ikev2_bypass_policies(&prepared);
+        if process_start_ticks(pid) == connection.process_start_ticks {
+            store
+                .save(state)
+                .context("restore connected IKEv2 state after cleanup failure")?;
+            return Err(error).context("IKEv2 disconnect cleanup failed; connection retained");
+        }
+        let _ = cleanup_ikev2_network(&prepared);
         return match restore_ikev2_connection(store, state, connection, &prepared) {
             Ok(()) => Err(error).context("IKEv2 disconnect cleanup failed; connection restored"),
             Err(rollback_error) => {
@@ -2176,6 +2585,7 @@ pub fn connect(
         pid: None,
         process_start_ticks: None,
         interface: plan.interface.clone(),
+        ikev2_route: None,
     };
     let mut updated = state.clone();
     updated.connection = Some(connection);
@@ -2478,6 +2888,22 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_output_matches_host_and_host_cidr_forms() {
+        assert!(output_has_endpoint(
+            b"186: from all to 192.0.2.10 lookup main",
+            "192.0.2.10"
+        ));
+        assert!(output_has_endpoint(
+            b"dst 192.0.2.10/32 tmpl src 10.0.0.2",
+            "192.0.2.10"
+        ));
+        assert!(!output_has_endpoint(
+            b"186: from all to 192.0.2.100 lookup main",
+            "192.0.2.10"
+        ));
+    }
+
+    #[test]
     fn network_plans_always_include_opposite_rollback() {
         let connect = quick_connection_plan(&profile(Protocol::WireGuard)).unwrap();
         assert_eq!(connect.args.first().map(String::as_str), Some("up"));
@@ -2491,6 +2917,7 @@ mod tests {
             pid: None,
             process_start_ticks: None,
             interface: Some("test".into()),
+            ikev2_route: None,
         };
         let disconnect = disconnect_plan(&profile(Protocol::WireGuard), &connection).unwrap();
         assert_eq!(disconnect.args.first().map(String::as_str), Some("down"));
@@ -2535,6 +2962,7 @@ mod tests {
             PreparedXray {
                 configuration: String::new(),
                 endpoint: "192.0.2.1".into(),
+                endpoint_port: 443,
                 gateway: "192.0.2.254".into(),
                 uplink: "eth0".into(),
                 executable: "/bundle/xray".into(),
@@ -2585,6 +3013,7 @@ mod tests {
             pid: Some(pid),
             process_start_ticks: Some(ticks),
             interface: None,
+            ikev2_route: None,
         };
         assert_eq!(verify_connection_process(&connection).unwrap(), pid);
         let mut mismatch = connection;
@@ -2605,6 +3034,7 @@ mod tests {
             interface_existed: false,
             expected_peer_keys: vec!["peer".into()],
             runtime_directory: None,
+            quick_base_created: false,
             backend_environment: Some((
                 "WG_QUICK_USERSPACE_IMPLEMENTATION".into(),
                 "/tools/wireguard-go".into(),

@@ -75,12 +75,21 @@ impl Default for Settings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Ikev2RouteIdentity {
+    pub endpoint: String,
+    pub gateway: String,
+    pub uplink: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connection {
     pub profile_id: String,
     pub pid: Option<u32>,
     #[serde(default)]
     pub process_start_ticks: Option<u64>,
     pub interface: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ikev2_route: Option<Ikev2RouteIdentity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

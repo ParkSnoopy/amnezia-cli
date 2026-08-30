@@ -54,7 +54,7 @@ target/x86_64-unknown-linux-musl/release/libexec/amn/geosite.dat
 
 - Imported configurations are canonicalized beneath the managed profile directory and revalidated before use.
 - Executable hooks and mutable `SaveConfig` directives are rejected, including values with inline comments.
-- Real interface actions require root and stage configuration under a verified root-owned mode-0700 runtime directory.
+- Real interface actions require root and stage configurations in verified root-owned mode-0700 runtime directories; WireGuard-family quick profiles use a private child of `/etc/wireguard` for AppArmor compatibility, while other backends use `/run/amn`.
 - Network executables and every directory in their effective `PATH` are canonical, root-owned, executable where applicable, and not group/world writable.
 - Inherited userspace-backend overrides are removed; only a canonical validated backend executable may be forwarded.
 - Before mutation, preflight resolves protocol tools, `ip`, quick-script utilities, conditional DNS/firewall utilities, and the required kernel module or userspace backend.
@@ -62,7 +62,7 @@ target/x86_64-unknown-linux-musl/release/libexec/amn/geosite.dat
 - Every raw XRay address, link, endpoint-route, split-default-route, and worker-process mutation has a recorded reverse action; disconnect persists its pending state before mutation and restores the worker and routes if a later action fails.
 - Shadowsocks accepts SIP002 links and Shadowsocks XRay JSON, normalizes both to a loopback-only SOCKS inbound, and uses the same endpoint-pinned XRay lifecycle and rollback gates.
 - OpenVPN rejects executable, background, external-credential-file, and interactive-challenge directives; it uses a private staged configuration, fixed owned interface, isolated process group, startup interface verification, and process-group rollback.
-- IKEv2 accepts validated Amnezia JSON with a PKCS#12 certificate, stages only the decoded certificate privately, passes its password through stdin rather than argv, verifies an endpoint security association, and owns an isolated `charon-cmd` process group.
+- IKEv2 accepts validated Amnezia JSON with a PKCS#12 certificate, stages only the decoded certificate privately, passes its password through stdin rather than argv, persists the exact endpoint-route identity, verifies kernel or kernel-libipsec readiness, and owns an isolated `charon-cmd` process group. Endpoint pinning refuses pre-existing route/rule ownership and rolls back only mutations completed by the current connection attempt. Disconnect and rollback verify removal of `ipsec0`, its table-220 routes, endpoint rules/routes, and endpoint XFRM state and policy before reporting success.
 - Amnezia connection keys are decoded with size-checked Qt-compatible compression and normalized to their preferred supported protocol during import; no generic non-connectable protocol entry is stored.
 - Every supported connect and disconnect plan has the opposite rollback action.
 - Connect rollback removes an interface only when its exact live peer set matches the selected profile.

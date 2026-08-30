@@ -117,7 +117,7 @@ const AMNEZIA_REMOTE: &str =
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/core/amnezia_xray_runner.c");
+    println!("cargo:rerun-if-changed=src/core/amnezia_xray_runner.rs");
     println!("cargo:rerun-if-changed=amnezia-client/conanfile.py");
     println!("cargo:rerun-if-changed=amnezia-client/recipes");
 
@@ -189,26 +189,40 @@ fn main() {
     let deployed_packages = deploy.join("full_deploy").join("host");
     let xray_package = deployed_packages.join("amnezia-xray-bindings/1.3.0/x86_64");
     let xray_library = xray_package.join("lib/libamnezia_xray.a");
-    let xray_header = xray_package.join("include/amnezia_xray.h");
     validate_artifact(&xray_library, false);
-    require_file(&xray_header);
-    let xray_runner_source = manifest.join("src/core/amnezia_xray_runner.c");
+    let xray_runner_source = manifest.join("src/core/amnezia_xray_runner.rs");
     require_file(&xray_runner_source);
     let xray_runner = bundle.join("amnezia-xray-runner");
-    let compiler = require_program("cc", "C compiler");
+    let compiler = PathBuf::from(required_env("RUSTC"));
+    let helper_target = required_env("HOST");
+    if helper_target != "x86_64-unknown-linux-gnu" {
+        panic!(
+            "the bundled Amnezia XRay library requires a native Linux x86_64 GNU helper; build host is {helper_target}"
+        );
+    }
     run_os(
         &compiler,
         &[
             xray_runner_source.into_os_string(),
-            xray_library.into_os_string(),
-            format!("-I{}", xray_package.join("include").display()).into(),
-            "-Wall".into(),
-            "-Wextra".into(),
-            "-Werror".into(),
-            "-pthread".into(),
-            "-ldl".into(),
-            "-lm".into(),
-            "-lresolv".into(),
+            "--edition=2024".into(),
+            "--target".into(),
+            helper_target.into(),
+            "-D".into(),
+            "warnings".into(),
+            "-C".into(),
+            "opt-level=2".into(),
+            "-L".into(),
+            format!("native={}", xray_package.join("lib").display()).into(),
+            "-l".into(),
+            "static=amnezia_xray".into(),
+            "-l".into(),
+            "pthread".into(),
+            "-l".into(),
+            "dl".into(),
+            "-l".into(),
+            "m".into(),
+            "-l".into(),
+            "resolv".into(),
             "-o".into(),
             xray_runner.as_os_str().to_owned(),
         ],

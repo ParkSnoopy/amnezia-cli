@@ -32,14 +32,23 @@ pub fn validate(text: &str) -> Result<()> {
 }
 
 pub fn parse(text: &str) -> Result<Configuration> {
+    parse_for_endpoint(text, None)
+}
+
+pub fn parse_for_endpoint(text: &str, endpoint: Option<&str>) -> Result<Configuration> {
     let fields = parse_fields(text)?;
-    let endpoint = (fields.host.as_str(), 500)
-        .to_socket_addrs()
-        .with_context(|| format!("resolve IKEv2 endpoint {}", fields.host))?
-        .find(|address| address.is_ipv4())
-        .context("IKEv2 endpoint has no IPv4 address")?
-        .ip()
-        .to_string();
+    let endpoint = match endpoint {
+        Some(endpoint) => endpoint.to_owned(),
+        None => {
+            (fields.host.as_str(), 500)
+                .to_socket_addrs()
+                .with_context(|| format!("resolve IKEv2 endpoint {}", fields.host))?
+                .find(|address| address.is_ipv4())
+                .context("IKEv2 endpoint has no IPv4 address")?
+                .ip()
+                .to_string()
+        }
+    };
     Ok(Configuration {
         host: fields.host,
         endpoint,
@@ -152,6 +161,13 @@ mod tests {
             Some("aes256-sha256-modp2048")
         );
         assert_eq!(configuration.esp_proposal.as_deref(), Some("aes128gcm16"));
+    }
+
+    #[test]
+    fn persisted_endpoint_does_not_require_dns_resolution() {
+        let profile = r#"{"hostName":"invalid.invalid","userName":"client","cert":"AA=="}"#;
+        let configuration = parse_for_endpoint(profile, Some("192.0.2.10")).unwrap();
+        assert_eq!(configuration.endpoint, "192.0.2.10");
     }
 
     #[test]

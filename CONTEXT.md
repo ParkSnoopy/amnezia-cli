@@ -22,7 +22,7 @@
 - Direct connections: OpenVPN, WireGuard, AmneziaWG, raw-transport XRay VLESS Reality, Shadowsocks, and IKEv2.
 - OpenVPN owns a fixed `amnovpn0` interface and an isolated process group; accepted profiles are self-contained and non-interactive.
 - Shadowsocks uses the isolated XRay and `tun2socks` lifecycle through either SIP002 or Shadowsocks XRay JSON profiles.
-- IKEv2 uses an isolated `charon-cmd` process with a private staged PKCS#12 certificate and verifies that an IPsec security association was established.
+- IKEv2 uses an isolated `charon-cmd` process with a private staged PKCS#12 certificate, persists its exact endpoint-route identity, accepts kernel or kernel-libipsec readiness, and verifies owned network artifacts are removed during disconnect and rollback.
 - `raw XRay`: a JSON XRay profile with a VLESS outbound whose transport is `raw` and security is `reality`; imported share links are not the primary raw runtime format.
 - Bundled artifacts: `openvpn`, `tun2socks`, `amneziawg-go`, `amnezia-xray-runner`, `geoip.dat`, and `geosite.dat`; IKEv2 additionally requires trusted system `charon-cmd`.
 - Build inputs: upstream Conan recipes under `amnezia-client/recipes` and an already configured Amnezia Conan remote.

@@ -144,6 +144,10 @@ impl RawConfiguration {
             .context("raw XRay endpoint has no IPv4 address")
     }
 
+    pub fn endpoint_port(&self) -> u16 {
+        self.endpoint_port
+    }
+
     pub fn render_for_endpoint(mut self, endpoint: std::net::Ipv4Addr) -> Result<String> {
         let outbounds = self
             .document
