@@ -129,7 +129,7 @@ const BUNDLE_ARTIFACTS: &[&str] = &[
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=src/core/amnezia_xray_runner.rs");
+    println!("cargo:rerun-if-changed=src/core/amnezia_xray_runner.go");
     println!("cargo:rerun-if-changed=src/core/amn_dns.rs");
     println!("cargo:rerun-if-changed=thirdparty/amnezia-client/recipes");
     println!("cargo:rerun-if-changed=thirdparty/wireguard-tools/src");
@@ -230,12 +230,11 @@ fn main() {
         XrayBuildTools {
             conan: &conan,
             go: &go,
-            musl_compiler: &musl_compiler,
             readelf: &readelf,
         },
         &recipes.join("amnezia-xray-bindings"),
-        &manifest.join("src/core/amnezia_xray_runner.rs"),
-        &conan_output.join("amnezia-xray-bindings-musl"),
+        &manifest.join("src/core/amnezia_xray_runner.go"),
+        &conan_output.join("amnezia-xray-runner"),
         &bundle,
     );
     build_static_rust_helper(
@@ -290,7 +289,6 @@ fn main() {
 struct XrayBuildTools<'a> {
     conan: &'a Path,
     go: &'a Path,
-    musl_compiler: &'a Path,
     readelf: &'a Path,
 }
 
@@ -304,7 +302,13 @@ fn build_xray_runner(
     require_file(runner_source);
     copy_directory(recipe, build);
     run(tools.conan, ["source", "."], build);
-    let library = build.join("libamnezia_xray.a");
+    fs::copy(runner_source, build.join("main.go")).unwrap_or_else(|error| {
+        panic!(
+            "copy XRay runner source {}: {error}",
+            runner_source.display()
+        )
+    });
+    let runner = bundle.join("amnezia-xray-runner");
     let go_cache = build.join("go-cache");
     let go_path = build.join("go-path");
     fs::create_dir_all(&go_cache)
@@ -316,13 +320,11 @@ fn build_xray_runner(
             "build",
             "-mod=readonly",
             "-trimpath",
-            "-ldflags=-w",
-            "-buildmode=c-archive",
+            "-ldflags=-s -w",
             "-o",
         ])
-        .arg(&library)
-        .env("CC", tools.musl_compiler)
-        .env("CGO_ENABLED", "1")
+        .arg(&runner)
+        .env("CGO_ENABLED", "0")
         .env("GOOS", "linux")
         .env("GOARCH", "amd64")
         .env("GOTOOLCHAIN", "local")
@@ -334,40 +336,6 @@ fn build_xray_runner(
     if !status.success() {
         panic!("{} failed with {status}", tools.go.display());
     }
-    validate_artifact(&library, false);
-
-    let runner = bundle.join("amnezia-xray-runner");
-    let compiler = PathBuf::from(required_env("RUSTC"));
-    run_os(
-        &compiler,
-        &[
-            runner_source.as_os_str().to_owned(),
-            "--edition=2024".into(),
-            "--target".into(),
-            "x86_64-unknown-linux-musl".into(),
-            "-D".into(),
-            "warnings".into(),
-            "-C".into(),
-            "opt-level=2".into(),
-            "-C".into(),
-            format!("linker={}", tools.musl_compiler.display()).into(),
-            "-L".into(),
-            format!("native={}", build.display()).into(),
-            "-l".into(),
-            "static=amnezia_xray".into(),
-            "-l".into(),
-            "pthread".into(),
-            "-l".into(),
-            "dl".into(),
-            "-l".into(),
-            "m".into(),
-            "-l".into(),
-            "resolv".into(),
-            "-o".into(),
-            runner.as_os_str().to_owned(),
-        ],
-        build,
-    );
     validate_artifact(&runner, true);
     validate_static_elf(tools.readelf, &runner, build);
 }
@@ -725,7 +693,7 @@ fn source_fingerprint(manifest: &Path) -> u64 {
     fingerprint.update(required_env("HOST").as_bytes());
     for input in [
         "build.rs",
-        "src/core/amnezia_xray_runner.rs",
+        "src/core/amnezia_xray_runner.go",
         "src/core/amn_dns.rs",
         "thirdparty/amnezia-client/recipes",
         "thirdparty/wireguard-tools/src",

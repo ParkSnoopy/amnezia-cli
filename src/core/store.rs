@@ -893,6 +893,28 @@ fn decode_qcompress(data: &[u8]) -> Option<Vec<u8>> {
     (output.len() == expected).then_some(output)
 }
 
+fn amnezia_server_dns(document: &serde_json::Value, key: &str) -> Option<String> {
+    document
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        .map(|value| value.to_string())
+}
+
+fn resolve_amnezia_dns_placeholders(
+    configuration: String,
+    document: &serde_json::Value,
+) -> String {
+    let mut configuration = configuration;
+    for (placeholder, key) in [("$PRIMARY_DNS", "dns1"), ("$SECONDARY_DNS", "dns2")] {
+        if let Some(server) = amnezia_server_dns(document, key) {
+            configuration = configuration.replace(placeholder, &server);
+        }
+    }
+    configuration
+}
+
 fn extract_amnezia_protocols(document: &serde_json::Value) -> Result<Vec<(String, Protocol)>> {
     let containers = document
         .get("containers")
@@ -975,6 +997,11 @@ fn extract_amnezia_protocols(document: &serde_json::Value) -> Result<Vec<(String
                 .unwrap_or_else(|| last.to_owned())
         } else {
             last.to_owned()
+        };
+        let configuration = if matches!(protocol, Protocol::WireGuard | Protocol::AmneziaWg) {
+            resolve_amnezia_dns_placeholders(configuration, document)
+        } else {
+            configuration
         };
         profiles.push((configuration, protocol));
     }
@@ -1296,15 +1323,20 @@ mod tests {
     #[test]
     fn extracts_every_supported_protocol_from_amnezia_bundle() {
         let bundle = r#"{
+            "dns1":"10.64.0.1",
+            "dns2":"10.64.0.2",
             "defaultContainer":"amnezia-awg",
             "containers":[
                 {"container":"amnezia-openvpn","openvpn":{"last_config":"{\"config\":\"client\\nremote vpn.example 1194\"}"}},
-                {"container":"amnezia-awg","awg":{"last_config":"{\"config\":\"[Interface]\\nPrivateKey=x\\n[Peer]\\nPublicKey=y\"}"}}
+                {"container":"amnezia-awg","awg":{"last_config":"{\"config\":\"[Interface]\\nDNS = $PRIMARY_DNS, $SECONDARY_DNS\\nPrivateKey=x\\n[Peer]\\nPublicKey=y\"}"}}
             ]
         }"#;
         let configurations = normalize_imported_profiles(bundle, Path::new("bundle.json")).unwrap();
         assert_eq!(configurations.len(), 2);
         assert_eq!(configurations[0].1, Protocol::AmneziaWg);
+        assert!(configurations[0].0.contains("DNS = 10.64.0.1, 10.64.0.2"));
+        assert!(!configurations[0].0.contains("$PRIMARY_DNS"));
+        assert!(!configurations[0].0.contains("$SECONDARY_DNS"));
         assert_eq!(configurations[1].1, Protocol::OpenVpn);
     }
 

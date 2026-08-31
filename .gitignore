@@ -3,3 +3,4 @@
 
 # Testing Key
 /.ssh
+*.backup

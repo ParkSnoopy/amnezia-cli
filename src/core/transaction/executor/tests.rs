@@ -71,6 +71,17 @@ mod tests {
         assert!(effective.contains("DNS = 9.9.9.9, 149.112.112.112"));
         validate_quick_dns(&effective).unwrap();
 
+        let upstream_placeholders = "[Interface]\nDNS = $PRIMARY_DNS, $SECONDARY_DNS\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = key\n";
+        let effective = effective_quick_configuration(upstream_placeholders, &settings).unwrap();
+        assert!(effective.contains("DNS = 9.9.9.9, 149.112.112.112"));
+        assert!(!effective.contains("$PRIMARY_DNS"));
+        assert!(!effective.contains("$SECONDARY_DNS"));
+        validate_quick_dns(&effective).unwrap();
+
+        let unknown_placeholder = "[Interface]\nDNS = $UNKNOWN_DNS\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = key\n";
+        let effective = effective_quick_configuration(unknown_placeholder, &settings).unwrap();
+        assert!(validate_quick_dns(&effective).is_err());
+
         let profile_dns = "[Interface]\nDNS = 10.64.0.1\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = key\n";
         let effective = effective_quick_configuration(profile_dns, &settings).unwrap();
         assert!(effective.contains("DNS = 10.64.0.1"));

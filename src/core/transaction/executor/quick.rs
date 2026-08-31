@@ -346,6 +346,11 @@ fn validate_quick_dns(configuration: &str) -> Result<()> {
     Ok(())
 }
 
+fn is_amnezia_dns_placeholder(value: &str) -> bool {
+    value.eq_ignore_ascii_case("$PRIMARY_DNS")
+        || value.eq_ignore_ascii_case("$SECONDARY_DNS")
+}
+
 fn effective_quick_configuration(configuration: &str, settings: &Settings) -> Result<String> {
     let profile_values = quick_dns_values(configuration);
     let mut servers = profile_values
@@ -355,7 +360,10 @@ fn effective_quick_configuration(configuration: &str, settings: &Settings) -> Re
         .collect::<Vec<_>>();
     let search_domains = profile_values
         .iter()
-        .filter(|value| value.parse::<std::net::IpAddr>().is_err())
+        .filter(|value| {
+            value.parse::<std::net::IpAddr>().is_err()
+                && !is_amnezia_dns_placeholder(value)
+        })
         .cloned()
         .collect::<Vec<_>>();
     if servers.is_empty() {

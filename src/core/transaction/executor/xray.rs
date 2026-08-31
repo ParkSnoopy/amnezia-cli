@@ -342,6 +342,7 @@ fn start_xray_worker(
     }
     let directory = create_root_runtime_directory()?;
     let configuration = directory.join("xray.json");
+    let startup_error = directory.join("startup-error");
     if let Err(error) =
         crate::core::store::write_private(&configuration, prepared.configuration.as_bytes())
     {
@@ -364,6 +365,7 @@ fn start_xray_worker(
             std::ffi::OsStr::new(&prepared.endpoint),
             std::ffi::OsStr::new(&prepared.gateway),
             std::ffi::OsStr::new(&prepared.uplink),
+            startup_error.as_os_str(),
         ])
         .env("PATH", &prepared.path)
         .stdin(Stdio::null());
@@ -418,10 +420,29 @@ fn start_xray_worker(
     Ok((child.id(), directory))
 }
 
-fn wait_xray_interface(prepared: &PreparedXray, pid: u32, interface: &str) -> Result<()> {
+fn wait_xray_interface(
+    prepared: &PreparedXray,
+    pid: u32,
+    interface: &str,
+    runtime_directory: &Path,
+) -> Result<()> {
     for _ in 0..50 {
         if !process_is_running(pid) {
-            bail!("XRay worker exited before creating its TUN interface");
+            let message = match fs::read_to_string(runtime_directory.join("startup-error"))
+                .ok()
+                .as_deref()
+            {
+                Some("configuration") => {
+                    "bundled XRay engine rejected the normalized configuration"
+                }
+                Some("xray-start") => "bundled XRay engine could not start",
+                Some("tun2socks-start") => "bundled tun2socks could not start",
+                Some("tun2socks-exit") => {
+                    "bundled tun2socks exited before creating its TUN interface"
+                }
+                _ => "XRay worker exited before creating its TUN interface",
+            };
+            bail!("{message}");
         }
         let exists = Command::new(&prepared.ip)
             .args(["link", "show", "dev", interface])
@@ -805,7 +826,9 @@ fn connect_xray(
     let (pid, runtime_directory) =
         start_xray_worker(store, state, &id, &prepared, interface, logging)?;
     let mut rollback = Vec::new();
-    if let Err(start_error) = wait_xray_interface(&prepared, pid, interface) {
+    if let Err(start_error) =
+        wait_xray_interface(&prepared, pid, interface, &runtime_directory)
+    {
         return match rollback_or_retain_xray(
             store,
             state,
@@ -1145,7 +1168,9 @@ fn restore_xray_disconnect(
             logging,
         )?;
         pid = started_pid;
-        if let Err(start_error) = wait_xray_interface(prepared, pid, interface) {
+        if let Err(start_error) =
+            wait_xray_interface(prepared, pid, interface, &runtime_directory)
+        {
             let rollback = rollback_or_retain_xray(
                 store,
                 state,
