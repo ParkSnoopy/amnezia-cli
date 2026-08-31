@@ -122,13 +122,17 @@ fn prepare_network_plan(
     store: &Store,
     profile: &Profile,
     plan: &CommandPlan,
+    settings: &Settings,
     stage_profile: bool,
 ) -> Result<PreparedPlan> {
-    let configuration = store.validated_profile_text(profile)?;
+    let configuration = effective_quick_configuration(
+        &store.validated_profile_text(profile)?,
+        settings,
+    )?;
     let recipe = super::prepare_protocol(
         &profile.protocol,
         &configuration,
-        &Settings::default(),
+        settings,
     )?;
     let super::ProtocolRecipe::Quick(recipe_program) = recipe else {
         bail!("quick connection received a non-quick protocol recipe");
@@ -262,7 +266,7 @@ pub fn check_profile_dependencies(
         return Ok(());
     }
     let plan = quick_connection_plan(profile)?;
-    prepare_network_plan(store, profile, &plan, false)?;
+    prepare_network_plan(store, profile, &plan, settings, false)?;
     Ok(())
 }
 
@@ -287,8 +291,26 @@ fn configuration_values(configuration: &str, expected: &str) -> Vec<String> {
         .collect()
 }
 
-fn validate_quick_dns(configuration: &str) -> Result<()> {
-    let values = configuration_values(configuration, "DNS")
+fn quick_interface_values(configuration: &str, expected: &str) -> Vec<String> {
+    let mut in_interface = false;
+    configuration
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') {
+                in_interface = trimmed.eq_ignore_ascii_case("[Interface]");
+                return None;
+            }
+            let (key, value) = line.split_once('=')?;
+            let value = configuration_value(value);
+            (in_interface && key.trim().eq_ignore_ascii_case(expected) && !value.is_empty())
+                .then(|| value.to_owned())
+        })
+        .collect()
+}
+
+fn quick_dns_values(configuration: &str) -> Vec<String> {
+    quick_interface_values(configuration, "DNS")
         .into_iter()
         .flat_map(|value| {
             value
@@ -298,7 +320,11 @@ fn validate_quick_dns(configuration: &str) -> Result<()> {
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         })
-        .collect::<Vec<_>>();
+        .collect()
+}
+
+fn validate_quick_dns(configuration: &str) -> Result<()> {
+    let values = quick_dns_values(configuration);
     if !values
         .iter()
         .any(|value| value.parse::<std::net::IpAddr>().is_ok())
@@ -318,6 +344,71 @@ fn validate_quick_dns(configuration: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn effective_quick_configuration(configuration: &str, settings: &Settings) -> Result<String> {
+    let profile_values = quick_dns_values(configuration);
+    let mut servers = profile_values
+        .iter()
+        .filter(|value| value.parse::<std::net::IpAddr>().is_ok())
+        .cloned()
+        .collect::<Vec<_>>();
+    let search_domains = profile_values
+        .iter()
+        .filter(|value| value.parse::<std::net::IpAddr>().is_err())
+        .cloned()
+        .collect::<Vec<_>>();
+    if servers.is_empty() {
+        servers = settings
+            .dns_servers
+            .iter()
+            .map(|value| {
+                value
+                    .parse::<std::net::IpAddr>()
+                    .map(|_| value.clone())
+                    .with_context(|| format!("invalid configured DNS server: {value}"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+    }
+    if servers.is_empty() {
+        bail!("connection DNS settings contain no IP address");
+    }
+    servers.extend(search_domains);
+    let replacement = format!("DNS = {}", servers.join(", "));
+
+    let mut output = Vec::new();
+    let mut in_interface = false;
+    let mut wrote_dns = false;
+    for line in configuration.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_interface && !wrote_dns {
+                output.push(replacement.clone());
+                wrote_dns = true;
+            }
+            in_interface = trimmed.eq_ignore_ascii_case("[Interface]");
+        }
+        let is_dns = in_interface
+            && line
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim().eq_ignore_ascii_case("DNS"));
+        if is_dns {
+            if !wrote_dns {
+                output.push(replacement.clone());
+                wrote_dns = true;
+            }
+        } else {
+            output.push(line.to_owned());
+        }
+    }
+    if in_interface && !wrote_dns {
+        output.push(replacement);
+        wrote_dns = true;
+    }
+    if !wrote_dns {
+        bail!("WireGuard-family profile has no Interface section");
+    }
+    Ok(format!("{}\n", output.join("\n")))
 }
 
 fn configuration_has_default_route(configuration: &str) -> bool {

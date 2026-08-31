@@ -49,6 +49,35 @@ mod tests {
     }
 
     #[test]
+    fn quick_profiles_use_configured_dns_when_import_has_no_server() {
+        let settings = Settings {
+            dns_servers: vec!["9.9.9.9".into(), "149.112.112.112".into()],
+            ..Settings::default()
+        };
+        let search_only = "[Interface]\nDNS = corp.example\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = key\n";
+        let effective = effective_quick_configuration(search_only, &settings).unwrap();
+        assert!(effective.contains("DNS = 9.9.9.9, 149.112.112.112, corp.example"));
+        validate_quick_dns(&effective).unwrap();
+
+        let omitted = "[Interface]\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = key\n";
+        let effective = effective_quick_configuration(omitted, &settings).unwrap();
+        assert!(effective.contains("DNS = 9.9.9.9, 149.112.112.112"));
+        validate_quick_dns(&effective).unwrap();
+
+        let empty_placeholders =
+            "[Interface]\nDNS = ,\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = key\n";
+        assert!(validate_quick_dns(empty_placeholders).is_err());
+        let effective = effective_quick_configuration(empty_placeholders, &settings).unwrap();
+        assert!(effective.contains("DNS = 9.9.9.9, 149.112.112.112"));
+        validate_quick_dns(&effective).unwrap();
+
+        let profile_dns = "[Interface]\nDNS = 10.64.0.1\nAddress = 10.0.0.2/32\n\n[Peer]\nPublicKey = key\n";
+        let effective = effective_quick_configuration(profile_dns, &settings).unwrap();
+        assert!(effective.contains("DNS = 10.64.0.1"));
+        assert!(!effective.contains("9.9.9.9"));
+    }
+
+    #[test]
     fn exited_processes_do_not_keep_process_groups_alive() {
         let stat = fs::read_to_string(format!("/proc/{}/stat", std::process::id())).unwrap();
         let (state, group, start_ticks) = process_stat_identity(&stat).unwrap();

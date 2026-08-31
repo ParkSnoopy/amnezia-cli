@@ -383,7 +383,7 @@ pub fn connect(
         return Ok(plan.display());
     }
 
-    let prepared = prepare_network_plan(store, &profile, &plan, true)?;
+    let prepared = prepare_network_plan(store, &profile, &plan, &state.settings, true)?;
     if prepared.interface_existed {
         bail!(
             "refusing to connect because interface already exists: {}",
@@ -532,7 +532,7 @@ pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<Str
     if dry_run {
         return Ok(plan.display());
     }
-    let prepared = prepare_network_plan(store, &profile, &plan, true)?;
+    let prepared = prepare_network_plan(store, &profile, &plan, &state.settings, true)?;
     if !prepared.interface_existed {
         let mut disconnected = state.clone();
         disconnected.connection = None;
