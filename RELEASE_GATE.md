@@ -37,11 +37,11 @@ git diff --check
 The release artifact must also satisfy:
 
 ```text
-file target/bundle/amn
-ldd target/bundle/amn
+file target/bundle/amn target/bundle/libexec/amn/amnezia-xray-runner target/bundle/libexec/amn/amn-dns
+ldd target/bundle/amn target/bundle/libexec/amn/amnezia-xray-runner target/bundle/libexec/amn/amn-dns
 ```
 
-Required result: `amn` is an x86-64 static PIE and `ldd` reports it as statically linked.
+Required result: `amn`, `amnezia-xray-runner`, and `amn-dns` are x86-64 static PIE executables, `ldd` reports them as statically linked, and the XRay runner has no `GLIBC_*` version requirements.
 
 The release bundle must contain nonempty validated artifacts at:
 
@@ -56,6 +56,7 @@ target/bundle/libexec/amn/openvpn
 target/bundle/libexec/amn/tun2socks
 target/bundle/libexec/amn/amneziawg-go
 target/bundle/libexec/amn/amnezia-xray-runner
+target/bundle/libexec/amn/amn-dns
 target/bundle/libexec/amn/geoip.dat
 target/bundle/libexec/amn/geosite.dat
 ```
@@ -67,7 +68,8 @@ target/bundle/libexec/amn/geosite.dat
 - Real interface actions require root and stage configurations in verified root-owned mode-0700 runtime directories; WireGuard-family quick profiles use a private child of `/etc/wireguard` for AppArmor compatibility, while other backends use `/run/amn`.
 - Network executables and every directory in their effective `PATH` are canonical, root-owned, executable where applicable, and not group/world writable.
 - Inherited userspace-backend overrides are removed; only a canonical validated backend executable may be forwarded.
-- Before mutation, preflight resolves protocol tools, `ip`, quick-script utilities, conditional DNS/firewall utilities, and the required kernel module or userspace backend.
+- Before mutation, preflight resolves protocol tools, `ip`, quick-script utilities, the bundled DNS helper, conditional firewall utilities, and the required kernel module or userspace backend.
+- XRay, WireGuard, and AmneziaWG DNS changes atomically record and replace the resolved `/etc/resolv.conf` target through `amn-dns`; disconnect restores exact prior contents only while the applied contents and target still prove ownership, otherwise it retains recovery state and refuses to overwrite external changes.
 - XRay accepts the Linux-relevant formats, protocols, transports, and authenticated security combinations supported by the configured upstream Amnezia client branch, rejects insecure verification and external security-file inputs, replaces imported inbounds with a loopback-only SOCKS inbound, resolves and pins endpoints before route mutation, blocks IPv6 leakage with a reversible unreachable route, and preflights the bundled runner, `tun2socks`, `ip`, `setsid`, and `kill`.
 - Every XRay address, link, endpoint-route, split-default-route, DNS, and worker-process mutation has a recorded reverse action; disconnect persists its pending state before mutation and restores the worker, DNS, and routes if a later action fails.
 - OpenVPN rejects executable, background, external-credential-file, and interactive-challenge directives; it uses a private staged configuration, fixed interface, isolated process group, startup verification, and a persisted interface index plus random ownership alias. Stale cleanup requires both interface identities and retains the private runtime path for retries.

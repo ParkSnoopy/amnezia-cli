@@ -158,7 +158,8 @@ fn prepare_network_plan(
         spec.userspace_backend,
     ));
     if configuration_has_key(&configuration, "DNS") {
-        resolve_network_program("resolvconf")?;
+        validate_quick_dns(&configuration)?;
+        resolve_network_program("amn-dns")?;
     }
     if configuration_has_default_route(&configuration) {
         resolve_network_program("sysctl")?;
@@ -284,6 +285,39 @@ fn configuration_values(configuration: &str, expected: &str) -> Vec<String> {
                 .then(|| value.to_owned())
         })
         .collect()
+}
+
+fn validate_quick_dns(configuration: &str) -> Result<()> {
+    let values = configuration_values(configuration, "DNS")
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if !values
+        .iter()
+        .any(|value| value.parse::<std::net::IpAddr>().is_ok())
+    {
+        bail!("WireGuard-family DNS requires at least one IP address");
+    }
+    for value in values
+        .iter()
+        .filter(|value| value.parse::<std::net::IpAddr>().is_err())
+    {
+        if value.len() > 253
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte))
+        {
+            bail!("WireGuard-family DNS contains an invalid search domain");
+        }
+    }
+    Ok(())
 }
 
 fn configuration_has_default_route(configuration: &str) -> bool {

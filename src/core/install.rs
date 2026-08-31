@@ -16,6 +16,7 @@ const PROGRAMS: &[&str] = &[
     "tun2socks",
     "amneziawg-go",
     "amnezia-xray-runner",
+    "amn-dns",
 ];
 const DATA_FILES: &[&str] = &["geoip.dat", "geosite.dat"];
 

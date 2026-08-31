@@ -901,6 +901,7 @@ fn is_bundled_network_program(program: &str) -> bool {
             | "openvpn"
             | "tun2socks"
             | "amnezia-xray-runner"
+            | "amn-dns"
     )
 }
 

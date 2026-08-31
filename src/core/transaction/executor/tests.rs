@@ -40,6 +40,8 @@ mod tests {
     fn configuration_dependencies_are_detected() {
         let configuration = "[Interface]\nDNS = 1.1.1.1 # resolver\n[Peer]\nAllowedIPs = 10.0.0.0/8, 0:0:0:0:0:0:0:0/0 # default\n";
         assert!(configuration_has_key(configuration, "dns"));
+        validate_quick_dns(configuration).unwrap();
+        assert!(validate_quick_dns("DNS = example.test").is_err());
         assert!(configuration_has_default_route(configuration));
         assert!(!configuration_has_default_route(
             "AllowedIPs = 10.0.0.0/8 # ::/0"
@@ -80,7 +82,7 @@ mod tests {
                 setsid: "/usr/bin/setsid".into(),
                 kill: "/usr/bin/kill".into(),
                 ip: "/usr/bin/ip".into(),
-                resolvectl: "/usr/bin/resolvectl".into(),
+                dns_helper: "/bundle/amn-dns".into(),
                 path: "/usr/bin".into(),
                 route_mode,
                 split_routes,
@@ -225,6 +227,9 @@ mod tests {
         );
         assert!(is_bundled_network_program("wireguard-go"));
         assert!(is_bundled_network_program("amnezia-xray-runner"));
+        assert!(is_bundled_network_program("amn-dns"));
+        assert!(!is_bundled_network_program("resolvectl"));
+        assert!(!is_bundled_network_program("resolvconf"));
         assert!(!is_bundled_network_program("ip"));
     }
 }

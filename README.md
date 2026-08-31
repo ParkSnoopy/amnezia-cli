@@ -50,7 +50,7 @@ OpenVPN profiles must be self-contained. Inline certificates and credentials are
 
 XRay profiles are normalized to a loopback-only SOCKS inbound. AmneziaWG and WireGuard require their matching quick-script and control tools. All connections require trusted `ip`, `setsid`, and process-control tools where applicable.
 
-Before changing the network, `amn` validates the managed profile, root privileges, protocol programs, conditional DNS and firewall helpers, and kernel or userspace backends. Private profiles, state, backups, runtime configurations, and logs use owner-only permissions where supported.
+Before changing the network, `amn` validates the managed profile, root privileges, protocol programs, its bundled DNS helper, conditional firewall helpers, and kernel or userspace backends. Private profiles, state, backups, runtime configurations, and logs use owner-only permissions where supported.
 
 ## AmneziaVPN TUI
 
@@ -81,7 +81,7 @@ amn settings set logging true
 amn settings set dns-servers 1.1.1.1,1.0.0.1
 ```
 
-The DNS list is attached to XRay tunnels through Linux per-link DNS. `status` also reports received and transmitted bytes when the active tunnel exposes Linux interface counters.
+The DNS list is applied transactionally while a VPN connection is active and the prior resolver contents are restored on disconnect. `amn` refuses rollback if another program changes the resolver during the connection. `status` also reports received and transmitted bytes when the active tunnel exposes Linux interface counters.
 
 ## Backup and logs
 

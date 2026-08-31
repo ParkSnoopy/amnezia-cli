@@ -122,6 +122,7 @@ const BUNDLE_ARTIFACTS: &[&str] = &[
     "tun2socks",
     "amneziawg-go",
     "amnezia-xray-runner",
+    "amn-dns",
     "geoip.dat",
     "geosite.dat",
 ];
@@ -129,6 +130,7 @@ const BUNDLE_ARTIFACTS: &[&str] = &[
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/core/amnezia_xray_runner.rs");
+    println!("cargo:rerun-if-changed=src/core/amn_dns.rs");
     println!("cargo:rerun-if-changed=thirdparty/amnezia-client/recipes");
     println!("cargo:rerun-if-changed=thirdparty/wireguard-tools/src");
     println!("cargo:rerun-if-changed=thirdparty/amneziawg-tools/src");
@@ -164,10 +166,8 @@ fn main() {
     let _ninja = require_program("ninja", "Ninja");
     let make = require_program("make", "Make");
     let go = require_program("go", "Go compiler");
-
-    if required_env("TARGET") == "x86_64-unknown-linux-musl" {
-        let _musl_compiler = require_program("musl-gcc", "musl C compiler");
-    }
+    let musl_compiler = require_program("musl-gcc", "musl C compiler");
+    let readelf = require_program("readelf", "ELF inspection tool");
     run(&conan, ["--version"], &manifest);
     run(&conan, ["profile", "path", "default"], &manifest);
     let remotes = run_capture(&conan, ["remote", "list"], &manifest);
@@ -196,7 +196,7 @@ fn main() {
     let client_conanfile = conan_output.join("conanfile.txt");
     fs::write(
         &client_conanfile,
-        "[requires]\nopenvpn/2.7.0\ntun2socks/2.6.0\nawg-go/3.1.20260814\namnezia-xray-bindings/1.3.0\nv2ray-rules-dat/202603162227\n",
+        "[requires]\nopenvpn/2.7.0\ntun2socks/2.6.0\nawg-go/3.1.20260814\nv2ray-rules-dat/202603162227\n",
     )
     .unwrap_or_else(|error| {
         panic!(
@@ -212,7 +212,6 @@ fn main() {
         "--build=openvpn/*".into(),
         "--build=tun2socks/*".into(),
         "--build=awg-go/*".into(),
-        "--build=amnezia-xray-bindings/*".into(),
         "--deployer=full_deploy".into(),
         format!("--deployer-folder={}", deploy.display()).into(),
     ];
@@ -227,48 +226,24 @@ fn main() {
         panic!("create bundle {}: {error}", bundle.display());
     });
     let deployed_packages = deploy.join("full_deploy").join("host");
-    let xray_package = deployed_packages.join("amnezia-xray-bindings/1.3.0/x86_64");
-    let xray_library = xray_package.join("lib/libamnezia_xray.a");
-    validate_artifact(&xray_library, false);
-    let xray_runner_source = manifest.join("src/core/amnezia_xray_runner.rs");
-    require_file(&xray_runner_source);
-    let xray_runner = bundle.join("amnezia-xray-runner");
-    let compiler = PathBuf::from(required_env("RUSTC"));
-    let helper_target = required_env("HOST");
-    if helper_target != "x86_64-unknown-linux-gnu" {
-        panic!(
-            "the bundled Amnezia XRay library requires a native Linux x86_64 GNU helper; build host is {helper_target}"
-        );
-    }
-    run_os(
-        &compiler,
-        &[
-            xray_runner_source.into_os_string(),
-            "--edition=2024".into(),
-            "--target".into(),
-            helper_target.into(),
-            "-D".into(),
-            "warnings".into(),
-            "-C".into(),
-            "opt-level=2".into(),
-            "-L".into(),
-            format!("native={}", xray_package.join("lib").display()).into(),
-            "-l".into(),
-            "static=amnezia_xray".into(),
-            "-l".into(),
-            "pthread".into(),
-            "-l".into(),
-            "dl".into(),
-            "-l".into(),
-            "m".into(),
-            "-l".into(),
-            "resolv".into(),
-            "-o".into(),
-            xray_runner.as_os_str().to_owned(),
-        ],
-        &manifest,
+    build_xray_runner(
+        XrayBuildTools {
+            conan: &conan,
+            go: &go,
+            musl_compiler: &musl_compiler,
+            readelf: &readelf,
+        },
+        &recipes.join("amnezia-xray-bindings"),
+        &manifest.join("src/core/amnezia_xray_runner.rs"),
+        &conan_output.join("amnezia-xray-bindings-musl"),
+        &bundle,
     );
-    validate_artifact(&xray_runner, true);
+    build_static_rust_helper(
+        &musl_compiler,
+        &readelf,
+        &manifest.join("src/core/amn_dns.rs"),
+        &bundle.join("amn-dns"),
+    );
 
     for artifact_kind in
         std::iter::successors(Some(RecipeArtifact::OpenVpn), |artifact| artifact.next())
@@ -310,6 +285,153 @@ fn main() {
         &bundle,
     );
     write_bundle_cache(&bundle, &cache, source_fingerprint);
+}
+
+struct XrayBuildTools<'a> {
+    conan: &'a Path,
+    go: &'a Path,
+    musl_compiler: &'a Path,
+    readelf: &'a Path,
+}
+
+fn build_xray_runner(
+    tools: XrayBuildTools<'_>,
+    recipe: &Path,
+    runner_source: &Path,
+    build: &Path,
+    bundle: &Path,
+) {
+    require_file(runner_source);
+    copy_directory(recipe, build);
+    run(tools.conan, ["source", "."], build);
+    let library = build.join("libamnezia_xray.a");
+    let go_cache = build.join("go-cache");
+    let go_path = build.join("go-path");
+    fs::create_dir_all(&go_cache)
+        .unwrap_or_else(|error| panic!("create Go cache {}: {error}", go_cache.display()));
+    fs::create_dir_all(&go_path)
+        .unwrap_or_else(|error| panic!("create Go path {}: {error}", go_path.display()));
+    let status = Command::new(tools.go)
+        .args([
+            "build",
+            "-mod=readonly",
+            "-trimpath",
+            "-ldflags=-w",
+            "-buildmode=c-archive",
+            "-o",
+        ])
+        .arg(&library)
+        .env("CC", tools.musl_compiler)
+        .env("CGO_ENABLED", "1")
+        .env("GOOS", "linux")
+        .env("GOARCH", "amd64")
+        .env("GOTOOLCHAIN", "local")
+        .env("GOCACHE", &go_cache)
+        .env("GOPATH", &go_path)
+        .current_dir(build)
+        .status()
+        .unwrap_or_else(|error| panic!("run {}: {error}", tools.go.display()));
+    if !status.success() {
+        panic!("{} failed with {status}", tools.go.display());
+    }
+    validate_artifact(&library, false);
+
+    let runner = bundle.join("amnezia-xray-runner");
+    let compiler = PathBuf::from(required_env("RUSTC"));
+    run_os(
+        &compiler,
+        &[
+            runner_source.as_os_str().to_owned(),
+            "--edition=2024".into(),
+            "--target".into(),
+            "x86_64-unknown-linux-musl".into(),
+            "-D".into(),
+            "warnings".into(),
+            "-C".into(),
+            "opt-level=2".into(),
+            "-C".into(),
+            format!("linker={}", tools.musl_compiler.display()).into(),
+            "-L".into(),
+            format!("native={}", build.display()).into(),
+            "-l".into(),
+            "static=amnezia_xray".into(),
+            "-l".into(),
+            "pthread".into(),
+            "-l".into(),
+            "dl".into(),
+            "-l".into(),
+            "m".into(),
+            "-l".into(),
+            "resolv".into(),
+            "-o".into(),
+            runner.as_os_str().to_owned(),
+        ],
+        build,
+    );
+    validate_artifact(&runner, true);
+    validate_static_elf(tools.readelf, &runner, build);
+}
+
+fn build_static_rust_helper(
+    musl_compiler: &Path,
+    readelf: &Path,
+    source: &Path,
+    output: &Path,
+) {
+    require_file(source);
+    let compiler = PathBuf::from(required_env("RUSTC"));
+    run_os(
+        &compiler,
+        &[
+            source.as_os_str().to_owned(),
+            "--edition=2024".into(),
+            "--target".into(),
+            "x86_64-unknown-linux-musl".into(),
+            "-D".into(),
+            "warnings".into(),
+            "-C".into(),
+            "opt-level=2".into(),
+            "-C".into(),
+            format!("linker={}", musl_compiler.display()).into(),
+            "-o".into(),
+            output.as_os_str().to_owned(),
+        ],
+        output.parent().unwrap_or_else(|| Path::new(".")),
+    );
+    validate_artifact(output, true);
+    validate_static_elf(
+        readelf,
+        output,
+        output.parent().unwrap_or_else(|| Path::new(".")),
+    );
+}
+
+fn validate_static_elf(readelf: &Path, executable: &Path, directory: &Path) {
+    let program_headers = run_capture_os(
+        readelf,
+        &[
+            "--program-headers".into(),
+            executable.as_os_str().to_owned(),
+        ],
+        directory,
+    );
+    if program_headers.lines().any(|line| line.contains(" INTERP ")) {
+        panic!(
+            "bundled executable is dynamically linked: {}",
+            executable.display()
+        );
+    }
+    let versions = run_capture_os(
+        readelf,
+        &["--version-info".into(), executable.as_os_str().to_owned()],
+        directory,
+    );
+    if versions.contains("GLIBC_") {
+        panic!(
+            "bundled executable depends on glibc: {}",
+            executable.display()
+        );
+    }
 }
 
 fn build_wireguard_go(go: &Path, source: &Path, build: &Path, bundle: &Path) {
@@ -371,14 +493,37 @@ fn build_quick_tools(
     let quick = build.join("wg-quick/linux.bash");
     require_file(&quick);
     let destination = bundle.join(quick_program);
-    fs::copy(&quick, &destination).unwrap_or_else(|error| {
+    stage_quick_dns_helper(&quick, &destination);
+    make_executable(&destination);
+}
+
+fn stage_quick_dns_helper(source: &Path, destination: &Path) {
+    const INSERTION: &str = "# ~~ function override insertion point ~~";
+    const OVERRIDES: &str = r#"set_dns() {
+    [[ ${#DNS[@]} -gt 0 || ${#DNS_SEARCH[@]} -gt 0 ]] || return 0
+    cmd amn-dns set "$INTERFACE" "${DNS[@]}" --search "${DNS_SEARCH[@]}"
+    HAVE_SET_DNS=1
+}
+
+unset_dns() {
+    [[ ${#DNS[@]} -gt 0 || ${#DNS_SEARCH[@]} -gt 0 ]] || return 0
+    cmd amn-dns unset "$INTERFACE"
+}
+"#;
+    let script = fs::read_to_string(source)
+        .unwrap_or_else(|error| panic!("read quick tool {}: {error}", source.display()));
+    if script.matches(INSERTION).count() != 1 || script.matches("unset_dns || true").count() != 1 {
+        panic!("quick tool DNS integration point changed: {}", source.display());
+    }
+    let script = script
+        .replace(INSERTION, OVERRIDES)
+        .replace("unset_dns || true", "unset_dns");
+    fs::write(destination, script).unwrap_or_else(|error| {
         panic!(
-            "copy {} to {}: {error}",
-            quick.display(),
+            "write DNS-integrated quick tool {}: {error}",
             destination.display()
         )
     });
-    make_executable(&destination);
 }
 
 fn copy_directory(source: &Path, destination: &Path) {
@@ -474,6 +619,15 @@ fn export_recipes(conan: &Path, recipes: &Path) {
 }
 
 fn run_capture<const N: usize>(program: &Path, arguments: [&str; N], directory: &Path) -> String {
+    let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
+    run_capture_os(program, &arguments, directory)
+}
+
+fn run_capture_os(
+    program: &Path,
+    arguments: &[std::ffi::OsString],
+    directory: &Path,
+) -> String {
     let output = Command::new(program)
         .args(arguments)
         .current_dir(directory)
@@ -572,6 +726,7 @@ fn source_fingerprint(manifest: &Path) -> u64 {
     for input in [
         "build.rs",
         "src/core/amnezia_xray_runner.rs",
+        "src/core/amn_dns.rs",
         "thirdparty/amnezia-client/recipes",
         "thirdparty/wireguard-tools/src",
         "thirdparty/amneziawg-tools/src",

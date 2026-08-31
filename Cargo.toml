@@ -1,7 +1,11 @@
 [package]
 name = "amn"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2024"
+
+[[bin]]
+name = "amn-dns"
+path = "src/core/amn_dns.rs"
 
 [dependencies]
 anyhow = "1"

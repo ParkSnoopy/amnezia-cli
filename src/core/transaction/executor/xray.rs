@@ -10,7 +10,7 @@ struct PreparedXray {
     setsid: PathBuf,
     kill: PathBuf,
     ip: PathBuf,
-    resolvectl: PathBuf,
+    dns_helper: PathBuf,
     path: std::ffi::OsString,
     route_mode: crate::core::model::RouteMode,
     split_routes: Vec<crate::core::routing::Network>,
@@ -43,7 +43,7 @@ fn prepare_xray(store: &Store, profile: &Profile, settings: &Settings) -> Result
     let setsid = resolve_network_program("setsid")?;
     let kill = resolve_network_program("kill")?;
     let ip = resolve_network_program("ip")?;
-    let resolvectl = resolve_network_program("resolvectl")?;
+    let dns_helper = resolve_network_program("amn-dns")?;
     let path = std::env::join_paths(network_program_directories())
         .context("construct XRay dependency PATH")?;
     let route = Command::new(&ip)
@@ -89,7 +89,7 @@ fn prepare_xray(store: &Store, profile: &Profile, settings: &Settings) -> Result
         setsid,
         kill,
         ip,
-        resolvectl,
+        dns_helper,
         path,
         route_mode: settings.route_mode.clone(),
         split_routes,
@@ -128,36 +128,27 @@ fn xray_dns_set(prepared: &PreparedXray, interface: &str) -> Result<()> {
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>();
-    let status = Command::new(&prepared.resolvectl)
-        .arg("dns")
+    let status = Command::new(&prepared.dns_helper)
+        .arg("set")
         .arg(interface)
         .args(&servers)
         .env("PATH", &prepared.path)
         .status()
         .context("configure XRay DNS servers")?;
     if !status.success() {
-        bail!("resolvectl dns exited with {status}");
+        bail!("bundled DNS helper exited with {status}");
     }
-    let domain_result = Command::new(&prepared.resolvectl)
-        .args(["domain", interface, "~."])
-        .env("PATH", &prepared.path)
-        .status();
-    let domain_error = match domain_result {
-        Ok(status) if status.success() => return Ok(()),
-        Ok(status) => anyhow::anyhow!("resolvectl domain exited with {status}"),
-        Err(error) => anyhow::Error::new(error).context("configure XRay DNS routing domain"),
-    };
-    Err(domain_error)
+    Ok(())
 }
 
 fn xray_dns_revert(prepared: &PreparedXray, interface: &str) -> Result<()> {
-    let status = Command::new(&prepared.resolvectl)
-        .args(["revert", interface])
+    let status = Command::new(&prepared.dns_helper)
+        .args(["unset", interface])
         .env("PATH", &prepared.path)
         .status()
         .context("revert XRay DNS")?;
     if !status.success() {
-        bail!("resolvectl revert exited with {status}");
+        bail!("bundled DNS helper rollback exited with {status}");
     }
     Ok(())
 }

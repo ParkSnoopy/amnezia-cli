@@ -17,14 +17,15 @@
 - `Amnezia bundle`: a `vpn://` connection key or JSON full-access bundle. Import selects the preferred supported container and stores only its normalized native protocol profile; it is not retained as a fake protocol.
 - `ownership`: exact equality between the selected profile's peer public-key set and the live interface peer set; interface-name existence alone is not ownership.
 - `dependency preflight`: resolution and validation of all command-line tools, conditional DNS/firewall helpers, privilege requirements, and kernel or userspace backend requirements before a network mutation begins.
-- `static frontend`: the `x86_64-unknown-linux-musl` `amn` executable; bundled upstream helpers may retain their own linkage requirements.
+- `static frontend`: the `x86_64-unknown-linux-musl` `amn` executable; the XRay runner and DNS helper are also static musl executables, while other bundled upstream helpers retain their audited linkage requirements.
 
 ## Project Concepts
 
 - Direct connections: OpenVPN, WireGuard, AmneziaWG, and general XRay.
 - OpenVPN owns a fixed `amnovpn0` interface and an isolated process group; accepted profiles are self-contained and non-interactive.
 - `XRay`: the Linux-relevant XRay formats, protocols, transports, and security combinations supported by the configured upstream Amnezia client branch; support is not limited to VLESS Reality or the `raw` transport. Imported inbounds, bypass outbounds, and routing rules are not trusted: normalization retains one supported proxy outbound, installs the loopback inbound owned by the Linux runner, and forces that inbound through the retained outbound. Rejecting malformed links and unknown transport or security values that upstream may pass through is an intentional Linux safety deviation.
-- Bundled artifacts: source-built `wg`, `wg-quick`, `wireguard-go`, `awg`, `awg-quick`, `openvpn`, `tun2socks`, `amneziawg-go`, and `amnezia-xray-runner`, plus validated `geoip.dat` and `geosite.dat` data.
+- Bundled artifacts: source-built `wg`, `wg-quick`, `wireguard-go`, `awg`, `awg-quick`, `openvpn`, `tun2socks`, `amneziawg-go`, `amnezia-xray-runner`, and `amn-dns`, plus validated `geoip.dat` and `geosite.dat` data. The XRay bindings and runner are built against musl so the installed runner does not depend on the build host's glibc.
+- DNS lifecycle: XRay, WireGuard, and AmneziaWG use the bundled `amn-dns` helper. It records the exact resolver target, mode, previous contents, and applied contents under protected runtime state, atomically applies DNS, restores only when ownership still matches, and retains recovery state instead of overwriting an external resolver change.
 - Bundle cache: Cargo `build.rs` reuses the complete locally built helper bundle only when both its source inputs and every cached artifact still match their recorded content fingerprints; changed, missing, or partial bundles are rebuilt from source.
 - Installation: `amn init` requires root, reads only the complete bundle relative to the running executable, and installs the command under `/usr/local/bin` with its programs under `/usr/local/libexec/amn`.
 - Interface: the TUI uses a dark canvas, light text, hairline cards, restrained blue focus, grouped human-readable actions, and responsive wide and narrow layouts.
