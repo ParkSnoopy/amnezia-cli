@@ -15,7 +15,7 @@ use strum::EnumIter;
 pub enum Command {
     Status,
     Connect {
-        profile: Option<String>,
+        profile: Option<usize>,
     },
     Disconnect,
     Reconnect,
@@ -37,7 +37,7 @@ pub enum Command {
 pub enum ProfileCommand {
     List,
     Show {
-        id: String,
+        order: usize,
     },
     Import {
         path: PathBuf,
@@ -45,24 +45,24 @@ pub enum ProfileCommand {
         name: Option<String>,
     },
     Export {
-        id: String,
+        order: usize,
         destination: PathBuf,
     },
     Remove {
-        id: String,
+        order: usize,
     },
     Rename {
-        id: String,
+        order: usize,
         name: String,
     },
     Enable {
-        id: String,
+        order: usize,
     },
     Disable {
-        id: String,
+        order: usize,
     },
     Default {
-        id: String,
+        order: usize,
     },
 }
 
@@ -158,11 +158,11 @@ impl TuiAction for FeatureAction {
     fn info(self) -> ActionInfo {
         match self {
             Self::Status => ActionInfo::new("Connection", "Status", "status", ""),
-            Self::Connect => ActionInfo::new("Connection", "Connect", "connect", "[PROFILE_ID]"),
+            Self::Connect => ActionInfo::new("Connection", "Connect", "connect", "[PROFILE_NUMBER]"),
             Self::Disconnect => ActionInfo::new("Connection", "Disconnect", "disconnect", ""),
             Self::Reconnect => ActionInfo::new("Connection", "Reconnect", "reconnect", ""),
             Self::ProfileList => ActionInfo::new("Profiles", "List", "profile list", ""),
-            Self::ProfileShow => ActionInfo::new("Profiles", "Show", "profile show", "<ID>"),
+            Self::ProfileShow => ActionInfo::new("Profiles", "Show", "profile show", "<NUMBER>"),
             Self::ProfileImport => {
                 ActionInfo::new(
                     "Profiles",
@@ -172,18 +172,18 @@ impl TuiAction for FeatureAction {
                 )
             }
             Self::ProfileExport => {
-                ActionInfo::new("Profiles", "Export", "profile export", "<ID> <DESTINATION>")
+                ActionInfo::new("Profiles", "Export", "profile export", "<NUMBER> <DESTINATION>")
             }
-            Self::ProfileRemove => ActionInfo::new("Profiles", "Remove", "profile remove", "<ID>"),
+            Self::ProfileRemove => ActionInfo::new("Profiles", "Remove", "profile remove", "<NUMBER>"),
             Self::ProfileRename => {
-                ActionInfo::new("Profiles", "Rename", "profile rename", "<ID> <NAME>")
+                ActionInfo::new("Profiles", "Rename", "profile rename", "<NUMBER> <NAME>")
             }
-            Self::ProfileEnable => ActionInfo::new("Profiles", "Enable", "profile enable", "<ID>"),
+            Self::ProfileEnable => ActionInfo::new("Profiles", "Enable", "profile enable", "<NUMBER>"),
             Self::ProfileDisable => {
-                ActionInfo::new("Profiles", "Disable", "profile disable", "<ID>")
+                ActionInfo::new("Profiles", "Disable", "profile disable", "<NUMBER>")
             }
             Self::ProfileDefault => {
-                ActionInfo::new("Profiles", "Set default", "profile default", "<ID>")
+                ActionInfo::new("Profiles", "Set default", "profile default", "<NUMBER>")
             }
 
             Self::SettingsShow => ActionInfo::new("Settings", "Show", "settings show", ""),

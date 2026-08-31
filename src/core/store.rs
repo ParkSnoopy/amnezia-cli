@@ -211,7 +211,7 @@ impl Store {
         let profile = state
             .profiles
             .get(id)
-            .with_context(|| format!("unknown profile: {id}"))?;
+            .context("selected profile no longer exists")?;
         if state
             .connection
             .as_ref()
@@ -251,7 +251,7 @@ impl Store {
         let profile = state
             .profiles
             .get(id)
-            .with_context(|| format!("unknown profile: {id}"))?;
+            .context("selected profile no longer exists")?;
         let data = fs::read(&profile.source)?;
         write_private(destination, &data)
             .with_context(|| format!("export profile to {}", destination.display()))
@@ -312,28 +312,44 @@ impl Store {
         }
         let profiles_root = self.root.join("profiles");
         let mut destinations = BTreeSet::new();
-        for (id, profile) in &state.profiles {
+        for (index, (id, profile)) in state.profiles.iter().enumerate() {
             let parsed_id = Uuid::parse_str(id)
-                .with_context(|| format!("invalid profile ID in backup: {id}"))?;
+                .with_context(|| format!("backup profile {} has an invalid identity", index + 1))?;
             if parsed_id.simple().to_string() != *id || profile.id != *id {
-                bail!("profile ID does not match canonical backup key: {id}");
+                bail!("backup profile {} has inconsistent identity data", index + 1);
             }
             let text = backup
                 .profiles
                 .get(id)
-                .with_context(|| format!("missing profile data: {id}"))?;
+                .with_context(|| format!("backup profile {} has no configuration", index + 1))?;
             if text.len() > MAX_PROFILE_BYTES {
-                bail!("backup profile exceeds the 16 MiB size limit: {id}");
+                bail!("backup profile {} exceeds the 16 MiB size limit", index + 1);
             }
             reject_executable_directives(text, &profile.protocol)?;
             validate_protocol_configuration(text, &profile.protocol)?;
             let destination = restored_profile_path(&profiles_root, id, &profile.protocol);
             if !destinations.insert(destination) {
-                bail!("backup profile IDs resolve to duplicate filenames");
+                bail!("backup profiles resolve to duplicate filenames");
             }
         }
         self.validate_state(&state)?;
 
+        let previous_profiles = current
+            .profiles
+            .values()
+            .enumerate()
+            .map(|(index, profile)| {
+                let source = Path::new(&profile.source);
+                let file_name = source
+                    .file_name()
+                    .context("current profile path has no file name")?
+                    .to_owned();
+                let data = fs::read(source).with_context(|| {
+                    format!("read current profile configuration {}", index + 1)
+                })?;
+                Ok((file_name, data))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let transaction_id = Uuid::new_v4().simple().to_string();
         let staging = self.root.join(format!("profiles.restore-{transaction_id}"));
         let previous = self
@@ -355,33 +371,57 @@ impl Store {
             Ok(())
         })();
         if let Err(error) = staged_result {
-            let _ = fs::remove_dir_all(&staging);
+            cleanup_restore_directory(&staging, "partial restored profiles").with_context(|| {
+                format!("backup restore staging failed and cleanup also failed: {error:#}")
+            })?;
             return Err(error);
         }
 
-        fs::rename(&profiles_root, &previous)?;
+        if let Err(error) = fs::rename(&profiles_root, &previous) {
+            cleanup_restore_directory(&staging, "staged restored profiles").with_context(|| {
+                format!("current profiles could not be staged and imported-profile cleanup failed: {error:#}")
+            })?;
+            return Err(error).context("stage current profiles for backup restore");
+        }
         if let Err(error) = fs::rename(&staging, &profiles_root) {
-            let _ = fs::rename(&previous, &profiles_root);
-            let _ = fs::remove_dir_all(&staging);
+            if let Err(rollback_error) = fs::rename(&previous, &profiles_root) {
+                restore_profile_tree(&profiles_root, &previous_profiles).with_context(|| {
+                    format!(
+                        "activate restored profiles failed and current-profile rename rollback failed: {error:#}; {rollback_error:#}"
+                    )
+                })?;
+                let previous_cleanup = cleanup_restore_directory(&previous, "previous profiles");
+                let staging_cleanup =
+                    cleanup_restore_directory(&staging, "staged restored profiles");
+                if let Err(previous_error) = previous_cleanup {
+                    return Err(previous_error).context(format!(
+                        "restored profiles were not activated and current profiles were reconstructed: {error:#}; {rollback_error:#}; staging cleanup: {staging_cleanup:?}"
+                    ));
+                }
+                staging_cleanup.with_context(|| {
+                    format!("activate restored profiles failed and staging cleanup also failed: {error:#}")
+                })?;
+                return Err(error).context("activate restored profiles");
+            }
+            cleanup_restore_directory(&staging, "staged restored profiles").with_context(|| {
+                format!("activate restored profiles failed and staging cleanup also failed: {error:#}")
+            })?;
             return Err(error).context("activate restored profiles");
+        }
+        if let Err(error) = fs::remove_dir_all(&previous) {
+            restore_profile_tree(&profiles_root, &previous_profiles)
+                .context("restore current profiles after old-profile cleanup failed")?;
+            return Err(error).context("remove replaced profiles before committing restore");
         }
         let commit_result = self
             .validate_state(&state)
             .and_then(|_| self.validate_profile_sources(&state))
             .and_then(|_| self.save(&state));
         if let Err(error) = commit_result {
-            let failed = self.root.join(format!("profiles.failed-{transaction_id}"));
-            let _ = fs::rename(&profiles_root, &failed);
-            let rollback_result = fs::rename(&previous, &profiles_root);
-            let _ = fs::remove_dir_all(&failed);
-            if let Err(rollback_error) = rollback_result {
-                return Err(error).context(format!(
-                    "restore failed and profile rollback failed: {rollback_error}"
-                ));
-            }
+            restore_profile_tree(&profiles_root, &previous_profiles)
+                .context("restore current profiles after state commit failed")?;
             return Err(error).context("restore rolled back");
         }
-        fs::remove_dir_all(previous)?;
         Ok(state)
     }
 
@@ -396,85 +436,148 @@ impl Store {
         let mut updated = current.clone();
         update_amnezia_settings(&mut updated, object)?;
 
+        let Some(value) = object.get("Servers/serversList") else {
+            updated.connection = None;
+            self.validate_state(&updated)?;
+            self.save(&updated)?;
+            return Ok(updated);
+        };
+
+        let servers = amnezia_server_list(value)?;
+        let default_server = object
+            .get("Servers/defaultServerIndex")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok());
+        let default_server_id = object
+            .get("Servers/defaultServerId")
+            .and_then(serde_json::Value::as_str);
         let mut configurations = Vec::new();
         let mut default_configuration = None;
-        if let Some(value) = object.get("Servers/serversList") {
-            let servers = amnezia_server_list(value)?;
-            let default_server = object
-                .get("Servers/defaultServerIndex")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok());
-            for (server_index, server) in servers.iter().enumerate() {
-                let name = server
-                    .get("description")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|value| !value.trim().is_empty())
-                    .unwrap_or("VPN");
-                let Ok(extracted) = extract_amnezia_protocols(server) else {
-                    continue;
-                };
-                let multiple = extracted.len() > 1;
-                for (text, protocol) in extracted {
-                    reject_executable_directives(&text, &protocol)
-                        .and_then(|_| validate_protocol_configuration(&text, &protocol))
-                        .with_context(|| format!("{protocol} configuration is unusable"))?;
-                    if text.len() > MAX_PROFILE_BYTES {
-                        bail!("backup profile exceeds the 16 MiB size limit");
-                    }
-                    let profile_name = if multiple {
-                        format!("{name} {protocol}")
-                    } else {
-                        name.to_owned()
-                    };
-                    if default_server == Some(server_index) && default_configuration.is_none() {
-                        default_configuration = Some(configurations.len());
-                    }
-                    configurations.push((profile_name, text, protocol));
+        for (server_index, server) in servers.iter().enumerate() {
+            let name = server
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or("VPN");
+            let Ok(extracted) = extract_amnezia_protocols(server) else {
+                continue;
+            };
+            let multiple = extracted.len() > 1;
+            for (text, protocol) in extracted {
+                reject_executable_directives(&text, &protocol)
+                    .and_then(|_| validate_protocol_configuration(&text, &protocol))
+                    .with_context(|| format!("{protocol} configuration is unusable"))?;
+                if text.len() > MAX_PROFILE_BYTES {
+                    bail!("backup profile exceeds the 16 MiB size limit");
                 }
+                let profile_name = if multiple {
+                    format!("{name} {protocol}")
+                } else {
+                    name.to_owned()
+                };
+                let is_default = default_server == Some(server_index)
+                    || default_server_id.is_some_and(|id| {
+                        server
+                            .get("storageServerId")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(id)
+                    });
+                if is_default && default_configuration.is_none() {
+                    default_configuration = Some(configurations.len());
+                }
+                configurations.push((profile_name, text, protocol));
             }
-            if !servers.is_empty() && configurations.is_empty() {
-                bail!("Amnezia backup contains no supported VPN protocol configuration");
-            }
+        }
+        if !servers.is_empty() && configurations.is_empty() {
+            bail!("Amnezia backup contains no supported VPN protocol configuration");
         }
 
-        let mut written = Vec::new();
-        for (name, text, protocol) in configurations {
-            let id = Uuid::new_v4().simple().to_string();
-            let file_stem = if matches!(protocol, Protocol::WireGuard | Protocol::AmneziaWg) {
-                format!("amn{}", id.chars().take(11).collect::<String>())
-            } else {
-                id.clone()
-            };
-            let destination = self
-                .root
-                .join("profiles")
-                .join(format!("{file_stem}.{}", profile_extension(&protocol)));
-            if let Err(error) = write_private(&destination, text.as_bytes()) {
-                for path in written {
-                    let _ = fs::remove_file(path);
-                }
-                return Err(error).context("backup import rolled back");
-            }
-            written.push(destination.clone());
-            updated.profiles.insert(
-                id.clone(),
-                Profile {
-                    id: id.clone(),
-                    name,
-                    protocol,
-                    source: destination.to_string_lossy().into_owned(),
-                    enabled: true,
-                },
-            );
-            if default_configuration == Some(written.len() - 1) {
-                updated.default_profile = Some(id);
-            }
-        }
+        let profiles_root = self.root.join("profiles");
+        let previous_profiles = current
+            .profiles
+            .values()
+            .enumerate()
+            .map(|(index, profile)| {
+                let source = Path::new(&profile.source);
+                let file_name = source
+                    .file_name()
+                    .context("current profile path has no file name")?
+                    .to_owned();
+                let data = fs::read(source).with_context(|| {
+                    format!("read current profile configuration {}", index + 1)
+                })?;
+                Ok((file_name, data))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let transaction_id = Uuid::new_v4().simple().to_string();
+        let staging = self.root.join(format!("profiles.import-{transaction_id}"));
+        let previous = self
+            .root
+            .join(format!("profiles.previous-{transaction_id}"));
+        create_private_directory(&staging)?;
+
+        updated.profiles.clear();
+        updated.default_profile = None;
         updated.connection = None;
-        if let Err(error) = self.validate_state(&updated).and_then(|_| self.save(&updated)) {
-            for path in written {
-                let _ = fs::remove_file(path);
+        let stage_result = configurations.into_iter().enumerate().try_for_each(
+            |(index, (name, text, protocol))| -> Result<()> {
+                let id = Uuid::new_v4().simple().to_string();
+                let staged = restored_profile_path(&staging, &id, &protocol);
+                write_private(&staged, text.as_bytes())?;
+                let destination = restored_profile_path(&profiles_root, &id, &protocol);
+                updated.profiles.insert(
+                    id.clone(),
+                    Profile {
+                        id: id.clone(),
+                        name,
+                        protocol,
+                        source: destination.to_string_lossy().into_owned(),
+                        enabled: true,
+                    },
+                );
+                if default_configuration == Some(index) {
+                    updated.default_profile = Some(id);
+                }
+                Ok(())
+            },
+        );
+        if let Err(error) = stage_result {
+            cleanup_restore_directory(&staging, "partial imported server list")
+                .context("backup import failed and staging cleanup also failed")?;
+            return Err(error).context("backup import rolled back");
+        }
+        self.validate_state(&updated)?;
+
+        if let Err(error) = fs::rename(&profiles_root, &previous) {
+            cleanup_restore_directory(&staging, "staged imported server list")
+                .context("backup import failed and staging cleanup also failed")?;
+            return Err(error).context("stage current profiles for server-list replacement");
+        }
+        if let Err(error) = fs::rename(&staging, &profiles_root) {
+            if fs::rename(&previous, &profiles_root).is_err() {
+                restore_profile_tree(&profiles_root, &previous_profiles)
+                    .context("reconstruct current profiles after import activation failed")?;
+                let previous_cleanup = cleanup_restore_directory(&previous, "previous profiles");
+                let staging_cleanup =
+                    cleanup_restore_directory(&staging, "staged imported server list");
+                previous_cleanup.context("remove previous profiles after reconstruction")?;
+                staging_cleanup.context("remove staged server list after reconstruction")?;
+                return Err(error).context("activate imported server list");
             }
+            cleanup_restore_directory(&staging, "staged imported server list")?;
+            return Err(error).context("activate imported server list");
+        }
+        if let Err(error) = fs::remove_dir_all(&previous) {
+            restore_profile_tree(&profiles_root, &previous_profiles)
+                .context("restore current profiles after server-list cleanup failed")?;
+            return Err(error).context("remove replaced server list before committing import");
+        }
+        if let Err(error) = self
+            .validate_profile_sources(&updated)
+            .and_then(|_| self.save(&updated))
+        {
+            restore_profile_tree(&profiles_root, &previous_profiles)
+                .context("restore current profiles after server-list commit failed")?;
             return Err(error).context("backup import rolled back");
         }
         Ok(updated)
@@ -484,22 +587,19 @@ impl Store {
         if let Some(id) = &state.default_profile
             && !state.profiles.contains_key(id)
         {
-            bail!("default profile does not exist: {id}");
+            bail!("default profile no longer exists");
         }
 
-        for (id, profile) in &state.profiles {
+        for (index, (id, profile)) in state.profiles.iter().enumerate() {
             if profile.id != *id {
-                bail!("profile ID does not match state key: {id}");
+                bail!("profile {} has inconsistent internal identity", index + 1);
             }
         }
 
         if let Some(connection) = &state.connection
             && !state.profiles.contains_key(&connection.profile_id)
         {
-            bail!(
-                "connection references unknown profile: {}",
-                connection.profile_id
-            );
+            bail!("connection references a profile that no longer exists");
         }
         Ok(())
     }
@@ -510,24 +610,18 @@ impl Store {
             return Ok(());
         }
         let profiles_root = fs::canonicalize(self.root.join("profiles"))?;
-        let source = fs::canonicalize(source)
-            .with_context(|| format!("inspect removed profile source: {}", source.display()))?;
+        let source = fs::canonicalize(source).context("inspect removed profile configuration")?;
         if source.parent() == Some(profiles_root.as_path()) {
-            fs::remove_file(&source)
-                .with_context(|| format!("remove unsupported profile: {}", source.display()))?;
+            fs::remove_file(&source).context("remove unsupported profile configuration")?;
         }
         Ok(())
     }
 
     pub(crate) fn validated_profile_text(&self, profile: &Profile) -> Result<String> {
         let profiles_root = fs::canonicalize(self.root.join("profiles"))?;
-        let source = fs::canonicalize(&profile.source)
-            .with_context(|| format!("profile file is missing: {}", profile.source))?;
+        let source = fs::canonicalize(&profile.source).context("profile configuration is missing")?;
         if source.parent() != Some(profiles_root.as_path()) {
-            bail!(
-                "profile source is outside managed profile directory: {}",
-                profile.source
-            );
+            bail!("profile configuration is outside the managed profile directory");
         }
         let text = fs::read_to_string(&source)?;
         reject_executable_directives(&text, &profile.protocol)?;
@@ -549,6 +643,28 @@ fn is_amnezia_settings_backup(document: &serde_json::Value) -> bool {
             .keys()
             .any(|key| key.starts_with("Servers/") || key.starts_with("Conf/"))
     })
+}
+
+fn cleanup_restore_directory(path: &Path, label: &str) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {label}")),
+    }
+}
+
+fn restore_profile_tree(
+    profiles_root: &Path,
+    profiles: &[(std::ffi::OsString, Vec<u8>)],
+) -> Result<()> {
+    if profiles_root.exists() {
+        fs::remove_dir_all(profiles_root)?;
+    }
+    create_private_directory(profiles_root)?;
+    for (file_name, data) in profiles {
+        write_private(&profiles_root.join(file_name), data)?;
+    }
+    Ok(())
 }
 
 fn amnezia_server_list(value: &serde_json::Value) -> Result<Vec<serde_json::Value>> {
@@ -575,32 +691,40 @@ fn backup_bool(value: &serde_json::Value) -> Option<bool> {
 }
 
 fn backup_routes(value: &serde_json::Value) -> Result<Vec<String>> {
-    let values = match value {
+    let mut values = match value {
         serde_json::Value::Array(values) => values
             .iter()
             .filter_map(serde_json::Value::as_str)
             .map(str::to_owned)
             .collect::<Vec<_>>(),
-        serde_json::Value::Object(values) => values
-            .iter()
-            .filter_map(|(key, value)| {
-                let value = value.as_str().unwrap_or_default();
-                crate::core::routing::Network::parse(key)
-                    .is_ok()
-                    .then(|| key.clone())
-                    .or_else(|| {
-                        crate::core::routing::Network::parse(value)
-                            .is_ok()
-                            .then(|| value.to_owned())
-                    })
-            })
-            .collect::<Vec<_>>(),
+        serde_json::Value::Object(entries) => {
+            let mut routes = Vec::new();
+            for (key, value) in entries {
+                if crate::core::routing::Network::parse(key).is_ok() {
+                    routes.push(key.clone());
+                    continue;
+                }
+                match value {
+                    serde_json::Value::String(value) => routes.push(value.clone()),
+                    serde_json::Value::Array(values) => routes.extend(
+                        values
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(str::to_owned),
+                    ),
+                    _ => {}
+                }
+            }
+            routes
+        }
         _ => bail!("split-tunnel backup setting must be an object or array"),
     };
     for route in &values {
         crate::core::routing::Network::parse(route)
             .with_context(|| format!("invalid split-tunnel route in backup: {route}"))?;
     }
+    values.sort();
+    values.dedup();
     Ok(values)
 }
 
@@ -639,14 +763,19 @@ fn update_amnezia_settings(
     let secondary = object.get("Conf/secondaryDns");
     if primary.is_some() || secondary.is_some() {
         let mut servers = state.settings.dns_servers.clone();
-        servers.resize(2, String::new());
         if let Some(value) = primary {
+            if servers.is_empty() {
+                servers.push(String::new());
+            }
             servers[0] = value
                 .as_str()
                 .context("Conf/primaryDns must be an IP address")?
                 .to_owned();
         }
         if let Some(value) = secondary {
+            if servers.len() < 2 {
+                servers.resize(2, String::new());
+            }
             servers[1] = value
                 .as_str()
                 .context("Conf/secondaryDns must be an IP address")?
@@ -1190,6 +1319,7 @@ mod tests {
         let source = root.join("external.backup");
         let servers = serde_json::json!([{
             "description": "Imported",
+            "storageServerId": "server-2",
             "defaultContainer": "amnezia-openvpn",
             "containers": [{
                 "container": "amnezia-openvpn",
@@ -1199,17 +1329,35 @@ mod tests {
             }]
         }]);
         let document = serde_json::json!({
-            "Servers/serversList": servers.to_string()
+            "Servers/serversList": servers.to_string(),
+            "Servers/defaultServerId": "server-2"
         });
         fs::write(&source, serde_json::to_vec(&document).unwrap()).unwrap();
         let store = Store { root: root.clone() };
+        let old_source = root.join("profiles").join("old.ovpn");
+        write_private(&old_source, b"client\nremote old.example 1194").unwrap();
         let mut current = State::default();
         current.settings.logging = false;
+        current.default_profile = Some("old-profile".into());
+        current.profiles.insert(
+            "old-profile".into(),
+            Profile {
+                id: "old-profile".into(),
+                name: "Old".into(),
+                protocol: Protocol::OpenVpn,
+                source: old_source.to_string_lossy().into_owned(),
+                enabled: true,
+            },
+        );
 
         let restored = store.restore(&current, &source).unwrap();
 
         assert_eq!(restored.profiles.len(), 1);
-        assert_eq!(restored.profiles.values().next().unwrap().name, "Imported");
+        assert!(!restored.profiles.contains_key("old-profile"));
+        assert!(!old_source.exists());
+        let profile = restored.profiles.values().next().unwrap();
+        assert_eq!(profile.name, "Imported");
+        assert_eq!(restored.default_profile.as_deref(), Some(profile.id.as_str()));
         assert!(!restored.settings.logging);
         fs::remove_dir_all(root).unwrap();
     }
@@ -1219,8 +1367,15 @@ mod tests {
         let mut state = State::default();
         state.settings.route_mode = RouteMode::ExceptListed;
         state.settings.split_routes = vec!["10.0.0.0/8".into()];
-        state.settings.dns_servers = vec!["9.9.9.9".into(), "149.112.112.112".into()];
-        let document = serde_json::json!({"Conf/saveLogs": false});
+        state.settings.dns_servers = vec![
+            "9.9.9.9".into(),
+            "149.112.112.112".into(),
+            "8.8.8.8".into(),
+        ];
+        let document = serde_json::json!({
+            "Conf/saveLogs": false,
+            "Conf/primaryDns": "1.1.1.1"
+        });
 
         update_amnezia_settings(&mut state, document.as_object().unwrap()).unwrap();
 
@@ -1229,8 +1384,19 @@ mod tests {
         assert_eq!(state.settings.split_routes, ["10.0.0.0/8"]);
         assert_eq!(
             state.settings.dns_servers,
-            ["9.9.9.9", "149.112.112.112"]
+            ["1.1.1.1", "149.112.112.112", "8.8.8.8"]
         );
+    }
+
+    #[test]
+    fn imports_upstream_domain_route_arrays() {
+        let routes = backup_routes(&serde_json::json!({
+            "example.com": ["203.0.113.10", "203.0.113.11"],
+            "10.0.0.0/8": []
+        }))
+        .unwrap();
+
+        assert_eq!(routes, ["10.0.0.0/8", "203.0.113.10", "203.0.113.11"]);
     }
 
     #[test]
@@ -1275,6 +1441,36 @@ mod tests {
     }
 
     #[test]
+    fn profile_validation_errors_do_not_expose_internal_identity() {
+        let root = std::env::temp_dir().join(format!(
+            "amn-profile-error-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        create_private_directory(&root).unwrap();
+        create_private_directory(&root.join("profiles")).unwrap();
+        let identity = "0123456789abcdef0123456789abcdef";
+        let profile = Profile {
+            id: identity.into(),
+            name: "Missing".into(),
+            protocol: Protocol::OpenVpn,
+            source: root
+                .join("profiles")
+                .join(format!("{identity}.ovpn"))
+                .to_string_lossy()
+                .into_owned(),
+            enabled: true,
+        };
+        let error = Store { root: root.clone() }
+            .validated_profile_text(&profile)
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, "profile configuration is missing");
+        assert!(!error.contains(identity));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rejects_missing_default_profile_reference() {
         let store = Store {
             root: PathBuf::new(),
@@ -1285,7 +1481,7 @@ mod tests {
         };
         assert_eq!(
             store.validate_state(&state).unwrap_err().to_string(),
-            "default profile does not exist: missing"
+            "default profile no longer exists"
         );
     }
 }

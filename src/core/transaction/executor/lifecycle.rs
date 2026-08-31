@@ -363,7 +363,7 @@ pub fn connect(
     let profile = state
         .profiles
         .get(&id)
-        .with_context(|| format!("unknown profile: {id}"))?
+        .context("selected profile no longer exists")?
         .clone();
     if !profile.enabled {
         bail!("profile is disabled");

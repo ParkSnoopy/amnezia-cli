@@ -15,11 +15,14 @@ Import a profile and connect:
 ```text
 amn profile import ~/vpn/home.conf --name Home
 amn profile list
-amn connect
+amn profile show 1
+amn connect 1
 amn status
 amn reconnect
 amn disconnect
 ```
+
+Profile commands use the number shown by `amn profile list`. Numbering starts at `1`.
 
 Use `--dry-run` to preview a connection and its rollback without changing the network:
 
@@ -32,7 +35,7 @@ amn --dry-run connect
 - **AmneziaWG** through `awg-quick`
 - **WireGuard** through `wg-quick`
 - **OpenVPN** through the bundled OpenVPN client
-- **XRay** profiles supported by the pinned upstream Amnezia Linux client
+- **XRay** profiles supported by the upstream Amnezia Linux client source branch
 - **Amnezia connection keys and full-access bundles**, normalized to their selected supported protocol during import
 
 OpenVPN profiles must be self-contained. Inline certificates and credentials are accepted; executable hooks, external credential files, background process directives, and interactive challenges are rejected.
@@ -52,8 +55,6 @@ Use `↑` and `↓` to select connection, profile, settings, split-tunnel, backu
 - `q` or `Esc`: quit
 
 The TUI exposes the same operations as the command-line interface.
-It uses the `FullColor` color profile with the `tokio-night` palette.
-
 
 ## Routing
 
@@ -84,6 +85,8 @@ amn logs export ~/amnezia-connection.log
 amn logs clear
 ```
 
-Restore accepts both `amn` backups and partial AmneziaVPN settings backups. Supplied server lists and supported settings are imported into the current configuration; unrelated settings and existing profiles are preserved.
+Restore accepts both `amn` backups and partial AmneziaVPN settings backups. Every supplied field replaces the corresponding overall setting: a supplied server list replaces the installed profile list, while omitted settings remain unchanged.
 
 Run `amn doctor` to check the runtime tools required by every imported profile.
+
+The complete portable build is placed in `target/bundle/`. Keep `amn` and its `libexec/amn/` directory together when copying it to another Linux system.

@@ -13,11 +13,12 @@ A release is ready only when every applicable gate below passes against the curr
 ## Build prerequisites
 
 - Rust includes the `x86_64-unknown-linux-musl` target.
-- Conan 2, a C compiler, `musl-gcc`, CMake, and Ninja are available.
+- Go, Conan 2, a C compiler, `musl-gcc`, CMake, Ninja, and Make are available.
 - The Conan default profile exists.
 - The configured `amnezia` remote resolves to `https://artifactory.amnezia.org/artifactory/api/conan/client-prebuilts`.
-- Every required recipe and `conanfile.py` exists under `amnezia-client/recipes`.
-- Make is not an explicit frontend build prerequisite.
+- Every required recipe and `conanfile.py` exists under `thirdparty/amnezia-client/recipes`.
+- The configured branch-tracked source submodules under `thirdparty/` are initialized at their recorded revisions.
+- Conan rebuilds executable packages from their recipes; remote executable package binaries are not deployed into the bundle.
 
 ## Automated gates
 
@@ -26,15 +27,15 @@ Run from the repository root:
 ```text
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
-cargo build --release
+cargo run --release --bin amn-bundle
 git diff --check
 ```
 
 The release artifact must also satisfy:
 
 ```text
-file target/x86_64-unknown-linux-musl/release/amn
-ldd target/x86_64-unknown-linux-musl/release/amn
+file target/bundle/amn
+ldd target/bundle/amn
 ```
 
 Required result: `amn` is an x86-64 static PIE and `ldd` reports it as statically linked.
@@ -42,12 +43,18 @@ Required result: `amn` is an x86-64 static PIE and `ldd` reports it as staticall
 The release bundle must contain nonempty validated artifacts at:
 
 ```text
-target/x86_64-unknown-linux-musl/release/libexec/amn/openvpn
-target/x86_64-unknown-linux-musl/release/libexec/amn/tun2socks
-target/x86_64-unknown-linux-musl/release/libexec/amn/amneziawg-go
-target/x86_64-unknown-linux-musl/release/libexec/amn/amnezia-xray-runner
-target/x86_64-unknown-linux-musl/release/libexec/amn/geoip.dat
-target/x86_64-unknown-linux-musl/release/libexec/amn/geosite.dat
+target/bundle/amn
+target/bundle/libexec/amn/wg
+target/bundle/libexec/amn/wg-quick
+target/bundle/libexec/amn/wireguard-go
+target/bundle/libexec/amn/awg
+target/bundle/libexec/amn/awg-quick
+target/bundle/libexec/amn/openvpn
+target/bundle/libexec/amn/tun2socks
+target/bundle/libexec/amn/amneziawg-go
+target/bundle/libexec/amn/amnezia-xray-runner
+target/bundle/libexec/amn/geoip.dat
+target/bundle/libexec/amn/geosite.dat
 ```
 
 ## Security and mutation gates
@@ -58,11 +65,12 @@ target/x86_64-unknown-linux-musl/release/libexec/amn/geosite.dat
 - Network executables and every directory in their effective `PATH` are canonical, root-owned, executable where applicable, and not group/world writable.
 - Inherited userspace-backend overrides are removed; only a canonical validated backend executable may be forwarded.
 - Before mutation, preflight resolves protocol tools, `ip`, quick-script utilities, conditional DNS/firewall utilities, and the required kernel module or userspace backend.
-- XRay accepts the Linux-relevant formats, protocols, transports, and authenticated security combinations supported by the pinned upstream Amnezia client, rejects insecure verification and external security-file inputs, replaces imported inbounds with a loopback-only SOCKS inbound, resolves and pins endpoints before route mutation, blocks IPv6 leakage with a reversible unreachable route, and preflights the bundled runner, `tun2socks`, `ip`, `setsid`, and `kill`.
+- XRay accepts the Linux-relevant formats, protocols, transports, and authenticated security combinations supported by the configured upstream Amnezia client branch, rejects insecure verification and external security-file inputs, replaces imported inbounds with a loopback-only SOCKS inbound, resolves and pins endpoints before route mutation, blocks IPv6 leakage with a reversible unreachable route, and preflights the bundled runner, `tun2socks`, `ip`, `setsid`, and `kill`.
 - Every XRay address, link, endpoint-route, split-default-route, DNS, and worker-process mutation has a recorded reverse action; disconnect persists its pending state before mutation and restores the worker, DNS, and routes if a later action fails.
 - OpenVPN rejects executable, background, external-credential-file, and interactive-challenge directives; it uses a private staged configuration, fixed interface, isolated process group, startup verification, and a persisted interface index plus random ownership alias. Stale cleanup requires both interface identities and retains the private runtime path for retries.
 - Amnezia connection keys are decoded with size-checked Qt-compatible compression and normalized to their preferred supported protocol during import; no generic non-connectable protocol entry is stored.
-- Backup restore accepts partial upstream AmneziaVPN settings objects, including a standalone `Servers/serversList`, without requiring an `amn` format marker; supplied compatible settings and profiles are merged while omitted local state is preserved.
+- Backup restore accepts partial upstream AmneziaVPN settings objects, including a standalone `Servers/serversList`, without requiring an `amn` format marker; every supplied field replaces its corresponding overall setting, including complete replacement of the installed profile list, while omitted settings are preserved.
+- Profile lists, selectors, diagnostics, and action prompts expose readable 1-based profile numbers and names rather than internal IDs.
 - Every supported connect and disconnect plan has the opposite rollback action.
 - WireGuard-family connect marks and persists a random interface ownership alias and kernel interface index in addition to the exact peer set.
 - Connect rollback and disconnect remove a WireGuard-family interface only when its persisted index, ownership alias, and exact live peer set all match; failed persistence either restores actionable ownership metadata or retries teardown toward the persisted disconnected state.

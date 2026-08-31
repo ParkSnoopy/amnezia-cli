@@ -38,6 +38,7 @@ use ratatui::{
     text::{
         Line,
         Span,
+        Text,
     },
     widgets::{
         Block,
@@ -62,16 +63,6 @@ use crate::{
     sanitize_terminal,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ColorProfile {
-    FullColor,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ColorPalette {
-    TokioNight,
-}
-
 #[derive(Clone, Copy)]
 struct Theme {
     background: Color,
@@ -84,27 +75,14 @@ struct Theme {
 
 impl Theme {
     const fn active() -> Self {
-        let profile = ColorProfile::FullColor;
-        let palette = ColorPalette::TokioNight;
-        match (profile, palette) {
-            (ColorProfile::FullColor, ColorPalette::TokioNight) => {
-                Self {
-                    background: Color::Rgb(26, 27, 38),
-                    foreground: Color::Rgb(192, 202, 245),
-                    accent: Color::Rgb(122, 162, 247),
-                    accent_text: Color::Rgb(26, 27, 38),
-                    border: Color::Rgb(86, 95, 137),
-                    muted: Color::Rgb(169, 177, 214),
-                }
-            }
+        Self {
+            background: Color::Rgb(26, 27, 38),
+            foreground: Color::Rgb(192, 202, 245),
+            accent: Color::Rgb(122, 162, 247),
+            accent_text: Color::Rgb(26, 27, 38),
+            border: Color::Rgb(86, 95, 137),
+            muted: Color::Rgb(169, 177, 214),
         }
-    }
-
-    const fn profile_name() -> &'static str {
-        "FullColor"
-    }
-    const fn palette_name() -> &'static str {
-        "tokio-night"
     }
 
     fn block(self, title: &'static str) -> Block<'static> {
@@ -170,6 +148,8 @@ fn event_loop(
             crate::core::Connections::new(store, state).status(!ui.dry_run)
         {
             ui.output = format!("connection recovery required: {error:#}");
+            ui.output_scroll = 0;
+            ui.message = "Connection recovery required".into();
         }
         terminal.draw(|frame| render(frame, state, &ui))?;
         if !event::poll(Duration::from_millis(250))? {
@@ -227,7 +207,11 @@ fn event_loop(
                         *state = loaded;
                         ui.message = "Reloaded".into();
                     }
-                    Err(error) => ui.message = format!("Error: {error:#}"),
+                    Err(error) => {
+                        ui.output = format!("Error\n\n{error:#}");
+                        ui.output_scroll = 0;
+                        ui.message = "Reload failed".into();
+                    }
                 }
             }
             _ => {}
@@ -272,7 +256,11 @@ fn run_action(store: &Store, state: &mut State, ui: &mut UiState, input: &str) {
             ui.output_scroll = 0;
             ui.message = format!("{} / {}", info.category, info.label);
         }
-        Err(error) => ui.message = format!("Error: {error:#}"),
+        Err(error) => {
+            ui.output = format!("Error\n\n{error:#}");
+            ui.output_scroll = 0;
+            ui.message = "Action failed".into();
+        }
     }
 }
 
@@ -283,7 +271,11 @@ fn run_command(store: &Store, state: &mut State, ui: &mut UiState, command: Comm
             ui.output_scroll = 0;
             ui.message = "Connection action completed".into();
         }
-        Err(error) => ui.message = format!("Error: {error:#}"),
+        Err(error) => {
+            ui.output = format!("Error\n\n{error:#}");
+            ui.output_scroll = 0;
+            ui.message = "Connection action failed".into();
+        }
     }
 }
 
@@ -303,7 +295,7 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
             Constraint::Length(3),
             Constraint::Min(10),
             Constraint::Length(3),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(frame.area());
     let mut areas = layout.iter().copied();
@@ -331,10 +323,6 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
             if ui.dry_run { "  PREVIEW" } else { "" },
             Style::default().fg(theme.muted).bg(theme.background),
         ),
-        Span::styled(
-            format!("  {} / {}", Theme::profile_name(), Theme::palette_name()),
-            Style::default().fg(theme.muted).bg(theme.background),
-        ),
     ]))
     .style(Style::default().fg(theme.foreground).bg(theme.background))
     .block(theme.block(""));
@@ -342,7 +330,7 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
 
     let column_layout = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(44), Constraint::Percentage(56)])
+        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
         .split(main_area);
     let mut columns = column_layout.iter().copied();
     let features_area = columns.next().expect("features area");
@@ -357,7 +345,7 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
     let mut list_state = ListState::default().with_selected(selected);
     let list = List::new(actions)
         .style(Style::default().fg(theme.foreground).bg(theme.background))
-        .block(theme.block("All features"))
+        .block(theme.block("Actions"))
         .highlight_style(
             Style::default()
                 .bg(theme.accent)
@@ -367,23 +355,49 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
         .highlight_symbol("> ");
     frame.render_stateful_widget(list, features_area, &mut list_state);
 
-    let profile = state
+    let active_profile = state
         .connection
         .as_ref()
         .and_then(|connection| state.profiles.get(&connection.profile_id))
         .map(|profile| sanitize_terminal(&profile.name))
-        .unwrap_or_else(|| "None".into());
-    let summary = format!(
-        "Profile: {profile}\nProfiles: {}\n\n{}",
-        state.profiles.len(),
-        sanitize_terminal(&ui.output)
-    );
+        .unwrap_or_else(|| "—".into());
+    let connection = if state.connection.is_some() {
+        "Connected"
+    } else {
+        "Disconnected"
+    };
+    let label_style = Style::default()
+        .fg(theme.muted)
+        .bg(theme.background)
+        .add_modifier(Modifier::BOLD);
+    let value_style = Style::default().fg(theme.foreground).bg(theme.background);
+    let mut result_lines = vec![
+        Line::from(vec![
+            Span::styled("Connection  ", label_style),
+            Span::styled(connection, value_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Active      ", label_style),
+            Span::styled(active_profile, value_style),
+        ]),
+        Line::from(vec![
+            Span::styled("Profiles    ", label_style),
+            Span::styled(state.profiles.len().to_string(), value_style),
+        ]),
+    ];
+    let output = sanitize_terminal(&ui.output);
+    if !output.trim().is_empty() {
+        result_lines.push(Line::default());
+        result_lines.push(Line::styled("Output", label_style));
+        result_lines.push(Line::default());
+        result_lines.extend(output.lines().map(|line| Line::raw(line.to_owned())));
+    }
     frame.render_widget(
-        Paragraph::new(summary)
+        Paragraph::new(Text::from(result_lines))
             .style(Style::default().fg(theme.foreground).bg(theme.background))
             .scroll((ui.output_scroll, 0))
             .wrap(Wrap { trim: false })
-            .block(theme.block("Result")),
+            .block(theme.block("Details")),
         result_area,
     );
 
@@ -392,19 +406,34 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
         Some(value) => format!("{} {}: {value}_", info.command, info.prompt),
         None => format!("Enter: {} / {}  {}", info.category, info.label, info.prompt),
     };
+    let input_width = action_area.width.saturating_sub(2) as usize;
+    let input_scroll = ui
+        .input
+        .as_ref()
+        .map(|_| Line::raw(input.as_str()).width().saturating_sub(input_width) as u16)
+        .unwrap_or(0);
     frame.render_widget(
         Paragraph::new(input)
             .style(Style::default().fg(theme.foreground).bg(theme.background))
+            .scroll((0, input_scroll))
             .block(theme.block("Action")),
         action_area,
     );
 
-    let message = format!(
-        "↑/↓ select  PgUp/PgDn result  p preview  Enter run  c connect  d disconnect  r reload  q quit    {}",
-        sanitize_terminal(&ui.message)
-    );
+    let shortcuts = if footer_area.width >= 120 {
+        "↑/↓ select  PgUp/PgDn details  p preview  Enter run  c connect  d disconnect  r reload  q quit"
+    } else {
+        "↑/↓ select  Enter run  p preview  q quit"
+    };
+    let footer = Text::from(vec![
+        Line::raw(shortcuts),
+        Line::styled(
+            sanitize_terminal(&ui.message),
+            Style::default().fg(theme.foreground),
+        ),
+    ]);
     frame.render_widget(
-        Paragraph::new(message)
+        Paragraph::new(footer)
             .style(Style::default().fg(theme.muted).bg(theme.background))
             .block(theme.block("")),
         footer_area,
@@ -412,10 +441,19 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
 }
 
 pub fn render_snapshot(state: &State, width: u16, height: u16) -> Result<String> {
+    render_snapshot_with_ui(state, &UiState::default(), width, height)
+}
+
+fn render_snapshot_with_ui(
+    state: &State,
+    ui: &UiState,
+    width: u16,
+    height: u16,
+) -> Result<String> {
     use ratatui::backend::TestBackend;
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)?;
-    terminal.draw(|frame| render(frame, state, &UiState::default()))?;
+    terminal.draw(|frame| render(frame, state, ui))?;
     let buffer = terminal.backend().buffer();
     let mut output = String::new();
     for y in 0..height {
@@ -441,11 +479,10 @@ mod tests {
         assert!(snapshot.contains("Profiles / List"));
         assert!(snapshot.contains("Settings / Show"));
         assert!(snapshot.contains("Split tunnel / List"));
-        assert!(snapshot.contains("FullColor / tokio-night"));
     }
 
     #[test]
-    fn dashboard_uses_full_color_tokio_night_palette() {
+    fn dashboard_applies_configured_colors() {
         use ratatui::backend::TestBackend;
         let theme = Theme::active();
         let backend = TestBackend::new(120, 40);
@@ -461,17 +498,72 @@ mod tests {
                 .iter()
                 .any(|cell| cell.bg == theme.background)
         );
-        assert_eq!(Theme::profile_name(), "FullColor");
-        assert_eq!(Theme::palette_name(), "tokio-night");
+    }
+
+    #[test]
+    fn profile_output_uses_readable_numbered_rows() {
+        let mut state = State::default();
+        state.profiles.insert(
+            "internal-a".into(),
+            crate::core::model::Profile {
+                id: "internal-a".into(),
+                name: "KR 027".into(),
+                protocol: crate::core::model::Protocol::Xray,
+                source: "/private/profile.json".into(),
+                enabled: true,
+            },
+        );
+        state.profiles.insert(
+            "internal-b".into(),
+            crate::core::model::Profile {
+                id: "internal-b".into(),
+                name: "JP 005".into(),
+                protocol: crate::core::model::Protocol::AmneziaWg,
+                source: "/private/profile.conf".into(),
+                enabled: true,
+            },
+        );
+        let ui = UiState {
+            output: "  1. XRay        KR 027  default\n  2. AmneziaWG   JP 005".into(),
+            ..UiState::default()
+        };
+
+        let snapshot = render_snapshot_with_ui(&state, &ui, 160, 40).unwrap();
+
+        assert!(snapshot.contains("Connection  Disconnected"));
+        assert!(snapshot.contains("Active      —"));
+        assert!(snapshot.contains("1. XRay        KR 027"));
+        assert!(snapshot.contains("2. AmneziaWG   JP 005"));
+        assert!(!snapshot.contains("internal-a"));
+        println!("{snapshot}");
+    }
+
+    #[test]
+    fn narrow_layout_keeps_errors_and_input_cursor_visible() {
+        let ui = UiState {
+            selected: FeatureAction::ProfileImport,
+            input: Some(
+                "/home/user/very/long/path/to/backups/amnezia/备份/配置.backup".into(),
+            ),
+            output: "Error\n\nThe selected backup could not be opened".into(),
+            message: "Action failed".into(),
+            ..UiState::default()
+        };
+
+        let snapshot = render_snapshot_with_ui(&State::default(), &ui, 80, 32).unwrap();
+
+        assert!(snapshot.contains("The selected backup"));
+        assert!(snapshot.contains("Action failed"));
+        assert!(snapshot.contains("backup_"));
+        println!("{snapshot}");
     }
 
     #[test]
     fn action_parser_uses_clap_commands() {
-        let command =
-            parse_action(FeatureAction::ProfileRename, "profile-id \"New Name\"").unwrap();
+        let command = parse_action(FeatureAction::ProfileRename, "1 \"New Name\"").unwrap();
         assert!(matches!(
             command,
-            Command::Profile(crate::core::ProfileCommand::Rename { .. })
+            Command::Profile(crate::core::ProfileCommand::Rename { order: 1, .. })
         ));
     }
 }

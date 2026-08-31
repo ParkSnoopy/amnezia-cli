@@ -62,6 +62,9 @@ pub fn execute(
             }
         }
         Command::Connect { profile } => {
+            let profile = profile
+                .map(|order| profile_id_by_order(state, order))
+                .transpose()?;
             let mut connections = Connections::new(store, state);
             let result = if dry_run {
                 connections.preview(Operation::Connect {
@@ -143,51 +146,75 @@ fn profile_command(
 ) -> Result<()> {
     match command {
         ProfileCommand::List => {
-            for profile in state.profiles.values() {
+            for (index, profile) in state.profiles.values().enumerate() {
                 let default = if state.default_profile.as_deref() == Some(&profile.id) {
-                    " default"
+                    "  default"
                 } else {
                     ""
                 };
+                let disabled = if profile.enabled { "" } else { "  disabled" };
                 writeln!(
                     output,
-                    "{}\t{}\t{}{}",
-                    profile.id,
-                    profile.protocol,
+                    "{:>3}. {:<10}  {}{}{}",
+                    index + 1,
+                    profile.protocol.to_string(),
                     sanitize_terminal(&profile.name),
-                    default
+                    default,
+                    disabled,
                 )?;
             }
         }
-        ProfileCommand::Show { id } => {
+        ProfileCommand::Show { order } => {
+            let profile = profile_by_order(state, order)?;
             writeln!(
                 output,
-                "{}",
-                serde_json::to_string_pretty(profile(state, &id)?)?
-            )?
+                "Profile {order}\n\nName      {}\nProtocol  {}\nEnabled   {}\nDefault   {}",
+                sanitize_terminal(&profile.name),
+                profile.protocol,
+                if profile.enabled { "yes" } else { "no" },
+                if state.default_profile.as_deref() == Some(&profile.id) {
+                    "yes"
+                } else {
+                    "no"
+                },
+            )?;
         }
         ProfileCommand::Import { path, name } => {
             for id in store.import_profile(state, &path, name)? {
-                writeln!(output, "{id}")?;
+                let order = profile_order(state, &id).context("imported profile disappeared")?;
+                let profile = profile_by_order(state, order)?;
+                writeln!(
+                    output,
+                    "Imported profile {order}: {} [{}]",
+                    sanitize_terminal(&profile.name),
+                    profile.protocol,
+                )?;
             }
         }
-        ProfileCommand::Export { id, destination } => {
+        ProfileCommand::Export { order, destination } => {
+            let id = profile_id_by_order(state, order)?;
             store.export_profile(state, &id, &destination)?
         }
-        ProfileCommand::Remove { id } => store.remove_profile(state, &id)?,
-        ProfileCommand::Rename { id, name } => {
+        ProfileCommand::Remove { order } => {
+            let id = profile_id_by_order(state, order)?;
+            store.remove_profile(state, &id)?
+        }
+        ProfileCommand::Rename { order, name } => {
+            let id = profile_id_by_order(state, order)?;
             update_state(store, state, |updated| {
                 profile_mut(updated, &id)?.name = name;
                 Ok(())
             })?
         }
-        ProfileCommand::Enable { id } => {
+        ProfileCommand::Enable { order } => {
+            let id = profile_id_by_order(state, order)?;
             update_state(store, state, |updated| {
                 profile_mut(updated, &id)?.enabled = true;
                 Ok(())
             })?
         }
-        ProfileCommand::Disable { id } => {
+        ProfileCommand::Disable { order } => {
+            let id = profile_id_by_order(state, order)?;
             if state
                 .connection
                 .as_ref()
@@ -198,9 +225,10 @@ fn profile_command(
             update_state(store, state, |updated| {
                 profile_mut(updated, &id)?.enabled = false;
                 Ok(())
-            })?;
+            })?
         }
-        ProfileCommand::Default { id } => {
+        ProfileCommand::Default { order } => {
+            let id = profile_id_by_order(state, order)?;
             update_state(store, state, |updated| {
                 profile(updated, &id)?;
                 updated.default_profile = Some(id);
@@ -378,10 +406,19 @@ fn log_paths(store: &Store) -> Result<Vec<std::path::PathBuf>> {
 
 fn doctor(store: &Store, state: &State, output: &mut String) -> Result<()> {
     let mut failures = Vec::new();
-    for profile in state.profiles.values() {
+    for (index, profile) in state.profiles.values().enumerate() {
         match transaction::check_profile_dependencies(store, profile, &state.settings) {
-            Ok(()) => writeln!(output, "profile {}: ok", profile.id)?,
-            Err(error) => failures.push(format!("profile {}: {error:#}", profile.id)),
+            Ok(()) => writeln!(
+                output,
+                "profile {} ({}): ok",
+                index + 1,
+                sanitize_terminal(&profile.name),
+            )?,
+            Err(error) => failures.push(format!(
+                "profile {} ({}): {error:#}",
+                index + 1,
+                sanitize_terminal(&profile.name),
+            )),
         }
     }
     if !failures.is_empty() {
@@ -405,16 +442,41 @@ fn update_state(
     Ok(())
 }
 
+fn profile_id_by_order(state: &State, order: usize) -> Result<String> {
+    if order == 0 {
+        bail!("profile numbers start at 1");
+    }
+    state
+        .profiles
+        .keys()
+        .nth(order - 1)
+        .cloned()
+        .with_context(|| format!("unknown profile number: {order}"))
+}
+
+fn profile_order(state: &State, id: &str) -> Option<usize> {
+    state
+        .profiles
+        .keys()
+        .position(|candidate| candidate == id)
+        .map(|index| index + 1)
+}
+
+fn profile_by_order(state: &State, order: usize) -> Result<&model::Profile> {
+    let id = profile_id_by_order(state, order)?;
+    profile(state, &id)
+}
+
 fn profile<'a>(state: &'a State, id: &str) -> Result<&'a model::Profile> {
     state
         .profiles
         .get(id)
-        .with_context(|| format!("unknown profile: {id}"))
+        .context("selected profile no longer exists")
 }
 
 fn profile_mut<'a>(state: &'a mut State, id: &str) -> Result<&'a mut model::Profile> {
     state
         .profiles
         .get_mut(id)
-        .with_context(|| format!("unknown profile: {id}"))
+        .context("selected profile no longer exists")
 }

@@ -115,12 +115,18 @@ const AMNEZIA_REMOTE: &str =
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/core/amnezia_xray_runner.rs");
-    println!("cargo:rerun-if-changed=amnezia-client/recipes");
+    println!("cargo:rerun-if-changed=thirdparty/amnezia-client/recipes");
+    println!("cargo:rerun-if-changed=thirdparty/wireguard-tools/src");
+    println!("cargo:rerun-if-changed=thirdparty/amneziawg-tools/src");
+    println!("cargo:rerun-if-changed=thirdparty/wireguard-go");
 
     let manifest = PathBuf::from(required_env("CARGO_MANIFEST_DIR"));
-    let source = manifest.join("amnezia-client");
+    let source = manifest.join("thirdparty/amnezia-client");
     let recipes = source.join("recipes");
     require_directory(&recipes);
+    require_directory(&manifest.join("thirdparty/wireguard-tools/src"));
+    require_directory(&manifest.join("thirdparty/amneziawg-tools/src"));
+    require_file(&manifest.join("thirdparty/wireguard-go/go.mod"));
     for recipe in std::iter::successors(Some(RecipeInput::OpenVpn), |recipe| recipe.next()) {
         require_file(&recipes.join(recipe.directory()).join("conanfile.py"));
     }
@@ -133,6 +139,9 @@ fn main() {
     let _compiler = require_program("cc", "C compiler");
     let _cmake = require_program("cmake", "CMake");
     let _ninja = require_program("ninja", "Ninja");
+    let make = require_program("make", "Make");
+    let go = require_program("go", "Go compiler");
+
     if required_env("TARGET") == "x86_64-unknown-linux-musl" {
         let _musl_compiler = require_program("musl-gcc", "musl C compiler");
     }
@@ -177,7 +186,10 @@ fn main() {
         "install".into(),
         client_conanfile.as_os_str().to_owned(),
         format!("--output-folder={}", conan_output.display()).into(),
-        "--build=missing".into(),
+        "--build=openvpn/*".into(),
+        "--build=tun2socks/*".into(),
+        "--build=awg-go/*".into(),
+        "--build=amnezia-xray-bindings/*".into(),
         "--deployer=full_deploy".into(),
         format!("--deployer-folder={}", deploy.display()).into(),
     ];
@@ -253,6 +265,153 @@ fn main() {
             make_executable(&destination);
         }
     }
+    build_quick_tools(
+        &make,
+        &manifest.join("thirdparty/wireguard-tools/src"),
+        &conan_output.join("wireguard-tools"),
+        &bundle,
+        "wg",
+        "wg-quick",
+    );
+    build_quick_tools(
+        &make,
+        &manifest.join("thirdparty/amneziawg-tools/src"),
+        &conan_output.join("amneziawg-tools"),
+        &bundle,
+        "awg",
+        "awg-quick",
+    );
+    build_wireguard_go(
+        &go,
+        &manifest.join("thirdparty/wireguard-go"),
+        &conan_output.join("wireguard-go"),
+        &bundle,
+    );
+}
+
+fn build_wireguard_go(go: &Path, source: &Path, build: &Path, bundle: &Path) {
+    copy_directory(source, build);
+    let output = build.join("wireguard-go");
+    let status = Command::new(go)
+        .args(["build", "-trimpath", "-buildvcs=false", "-o"])
+        .arg(&output)
+        .env("GOTOOLCHAIN", "local")
+        .current_dir(build)
+        .status()
+        .unwrap_or_else(|error| panic!("run {}: {error}", go.display()));
+    if !status.success() {
+        panic!("{} failed with {status}", go.display());
+    }
+    validate_artifact(&output, true);
+    let destination = bundle.join("wireguard-go");
+    fs::copy(&output, &destination).unwrap_or_else(|error| {
+        panic!(
+            "copy {} to {}: {error}",
+            output.display(),
+            destination.display()
+        )
+    });
+    make_executable(&destination);
+}
+
+fn build_quick_tools(
+    make: &Path,
+    source: &Path,
+    build: &Path,
+    bundle: &Path,
+    program: &str,
+    quick_program: &str,
+) {
+    copy_directory(source, build);
+    run_os(
+        make,
+        &[
+            "WITH_BASHCOMPLETION=no".into(),
+            "WITH_SYSTEMDUNITS=no".into(),
+            "WITH_WGQUICK=yes".into(),
+            "RUNSTATEDIR=/run".into(),
+        ],
+        build,
+    );
+    let executable = build.join("wg");
+    validate_artifact(&executable, true);
+    let destination = bundle.join(program);
+    fs::copy(&executable, &destination).unwrap_or_else(|error| {
+        panic!(
+            "copy {} to {}: {error}",
+            executable.display(),
+            destination.display()
+        )
+    });
+    make_executable(&destination);
+
+    let quick = build.join("wg-quick/linux.bash");
+    require_file(&quick);
+    let destination = bundle.join(quick_program);
+    fs::copy(&quick, &destination).unwrap_or_else(|error| {
+        panic!(
+            "copy {} to {}: {error}",
+            quick.display(),
+            destination.display()
+        )
+    });
+    make_executable(&destination);
+}
+
+fn copy_directory(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination)
+        .unwrap_or_else(|error| panic!("create {}: {error}", destination.display()));
+    for entry in fs::read_dir(source)
+        .unwrap_or_else(|error| panic!("read {}: {error}", source.display()))
+    {
+        let entry = entry.unwrap_or_else(|error| panic!("read {} entry: {error}", source.display()));
+        if entry.file_name() == OsStr::new(".git") {
+            continue;
+        }
+        let source = entry.path();
+        let destination = destination.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .unwrap_or_else(|error| panic!("inspect {}: {error}", source.display()));
+        if file_type.is_dir() {
+            copy_directory(&source, &destination);
+        } else if file_type.is_file() {
+            fs::copy(&source, &destination).unwrap_or_else(|error| {
+                panic!(
+                    "copy build input {} to {}: {error}",
+                    source.display(),
+                    destination.display()
+                )
+            });
+        } else if file_type.is_symlink() {
+            copy_symlink(&source, &destination);
+        } else {
+            panic!("build input is not a regular file, directory, or symbolic link: {}", source.display());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn copy_symlink(source: &Path, destination: &Path) {
+    use std::os::unix::fs::symlink;
+
+    let target = fs::read_link(source)
+        .unwrap_or_else(|error| panic!("read symbolic link {}: {error}", source.display()));
+    if target.is_absolute() {
+        panic!("build input symbolic link is absolute: {}", source.display());
+    }
+    symlink(&target, destination).unwrap_or_else(|error| {
+        panic!(
+            "copy symbolic link {} to {}: {error}",
+            source.display(),
+            destination.display()
+        )
+    });
+}
+
+#[cfg(not(unix))]
+fn copy_symlink(source: &Path, _destination: &Path) {
+    panic!("symbolic build input is unsupported: {}", source.display());
 }
 
 fn export_recipes(conan: &Path, recipes: &Path) {
