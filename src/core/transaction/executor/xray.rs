@@ -115,11 +115,171 @@ fn xray_ip_command(prepared: &PreparedXray, arguments: &[String]) -> Result<()> 
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XrayRouteDisposition {
+    Missing,
+    SatisfiedExternally,
+    Collision,
+}
+
+fn xray_route_destination(arguments: &[String]) -> Result<(&str, Option<&str>)> {
+    let action_index = arguments
+        .iter()
+        .position(|argument| argument == "add" || argument == "delete")
+        .context("XRay route has no mutation action")?;
+    let route_type = arguments
+        .get(action_index + 1)
+        .filter(|value| value.as_str() == "unreachable")
+        .map(String::as_str);
+    let destination = arguments
+        .get(action_index + 1 + usize::from(route_type.is_some()))
+        .context("XRay route has no destination")?;
+    Ok((destination, route_type))
+}
+
+fn xray_route_path_matches(arguments: &[String], line: &str) -> Result<bool> {
+    let (destination, route_type) = xray_route_destination(arguments)?;
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    let destination_matches = match route_type {
+        Some(kind) => {
+            fields.first().copied() == Some(kind)
+                && fields
+                    .get(1)
+                    .is_some_and(|value| xray_route_destination_matches(destination, value))
+        }
+        None => fields
+            .first()
+            .is_some_and(|value| xray_route_destination_matches(destination, value)),
+    };
+    Ok(destination_matches
+        && ["via", "dev"].into_iter().all(|field| {
+            route_field(&fields, field)
+                == arguments
+                    .iter()
+                    .position(|argument| argument == field)
+                    .and_then(|index| arguments.get(index + 1))
+                    .map(String::as_str)
+        }))
+}
+
+fn classify_xray_route(arguments: &[String], output: &str) -> Result<XrayRouteDisposition> {
+    let lines = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Ok(XrayRouteDisposition::Missing);
+    }
+    for line in lines {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if !xray_route_path_matches(arguments, line)?
+            || route_field(&fields, "proto") == Some("66")
+        {
+            return Ok(XrayRouteDisposition::Collision);
+        }
+    }
+    Ok(XrayRouteDisposition::SatisfiedExternally)
+}
+
+fn exact_xray_route_query(arguments: &[String]) -> Result<Vec<String>> {
+    let ipv6 = arguments.first().is_some_and(|argument| argument == "-6");
+    let (destination, _) = xray_route_destination(arguments)?;
+    let mut query = vec!["-N".to_owned()];
+    if ipv6 {
+        query.push("-6".to_owned());
+    }
+    query.extend([
+        "route".to_owned(),
+        "show".to_owned(),
+        "exact".to_owned(),
+        destination.to_owned(),
+    ]);
+    Ok(query)
+}
+
+fn inspect_xray_route(
+    prepared: &PreparedXray,
+    arguments: &[String],
+) -> Result<XrayRouteDisposition> {
+    let query = exact_xray_route_query(arguments)?;
+    let output = Command::new(&prepared.ip)
+        .args(&query)
+        .env("PATH", &prepared.path)
+        .output()
+        .context("inspect existing route before XRay mutation")?;
+    if !output.status.success() {
+        bail!("inspect existing XRay route exited with {}", output.status);
+    }
+    let output = String::from_utf8(output.stdout).context("existing route output is not UTF-8")?;
+    classify_xray_route(arguments, &output)
+}
+
+fn is_xray_bypass_route(prepared: &PreparedXray, arguments: &[String]) -> Result<bool> {
+    if prepared.route_mode != crate::core::model::RouteMode::ExceptListed {
+        return Ok(false);
+    }
+    let (destination, route_type) = xray_route_destination(arguments)?;
+    Ok(route_type.is_none()
+        && arguments
+            .iter()
+            .position(|argument| argument == "dev")
+            .and_then(|index| arguments.get(index + 1))
+            .is_some_and(|device| device == &prepared.uplink)
+        && prepared
+            .split_routes
+            .iter()
+            .any(|route| route.cidr() == destination))
+}
+
+fn preflight_xray_routes(prepared: &PreparedXray, interface: &str) -> Result<()> {
+    for (route, _) in traffic_route_pairs(prepared, interface) {
+        if !is_xray_bypass_route(prepared, &route)? {
+            continue;
+        }
+        if inspect_xray_route(prepared, &route)? == XrayRouteDisposition::Collision {
+            let (destination, _) = xray_route_destination(&route)?;
+            bail!(
+                "XRay route already exists with an incompatible path or ownership: {destination}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn verify_xray_bypass_routes(
+    prepared: &PreparedXray,
+    interface: &str,
+    rollback: &[XrayRollback],
+) -> Result<()> {
+    for (route, reverse) in traffic_route_pairs(prepared, interface) {
+        if !is_xray_bypass_route(prepared, &route)? {
+            continue;
+        }
+        let owned = xray_rollback_owns_route(rollback, &reverse);
+        let satisfied = if owned {
+            xray_route_exists(prepared, &reverse)?
+        } else {
+            inspect_xray_route(prepared, &route)? == XrayRouteDisposition::SatisfiedExternally
+        };
+        if !satisfied {
+            let (destination, _) = xray_route_destination(&route)?;
+            bail!("XRay bypass route changed during connection setup: {destination}");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 enum XrayRollback {
     Ip(Vec<String>),
     DnsRevert { interface: String },
     DnsSet { interface: String },
+}
+
+fn xray_rollback_owns_route(rollback: &[XrayRollback], route: &[String]) -> bool {
+    rollback
+        .iter()
+        .any(|action| matches!(action, XrayRollback::Ip(arguments) if arguments == route))
 }
 
 fn xray_dns_set(prepared: &PreparedXray, interface: &str) -> Result<()> {
@@ -180,6 +340,29 @@ fn apply_xray_mutation(
     Ok(())
 }
 
+fn apply_xray_route_mutation(
+    prepared: &PreparedXray,
+    forward: Vec<String>,
+    reverse: Vec<String>,
+    rollback: &mut Vec<XrayRollback>,
+) -> Result<()> {
+    if !is_xray_bypass_route(prepared, &forward)? {
+        return apply_xray_mutation(prepared, forward, reverse, rollback);
+    }
+    match inspect_xray_route(prepared, &forward)? {
+        XrayRouteDisposition::Missing => {
+            apply_xray_mutation(prepared, forward, reverse, rollback)
+        }
+        XrayRouteDisposition::SatisfiedExternally => Ok(()),
+        XrayRouteDisposition::Collision => {
+            let (destination, _) = xray_route_destination(&forward)?;
+            bail!(
+                "XRay route already exists with an incompatible path or ownership: {destination}"
+            )
+        }
+    }
+}
+
 fn endpoint_route_arguments(prepared: &PreparedXray, action: &str) -> Vec<String> {
     let mut arguments = vec![
         "route".into(),
@@ -215,9 +398,13 @@ fn xray_route_line_matches(arguments: &[String], line: &str) -> Result<bool> {
     let destination_matches = match route_type {
         Some(kind) => {
             fields.first().copied() == Some(kind)
-                && fields.get(1).copied() == Some(destination.as_str())
+                && fields
+                    .get(1)
+                    .is_some_and(|value| xray_route_destination_matches(destination, value))
         }
-        None => fields.first().copied() == Some(destination.as_str()),
+        None => fields
+            .first()
+            .is_some_and(|value| xray_route_destination_matches(destination, value)),
     };
     Ok(destination_matches
         && ["via", "dev", "proto", "metric"].into_iter().all(|field| {
@@ -230,13 +417,19 @@ fn xray_route_line_matches(arguments: &[String], line: &str) -> Result<bool> {
         }))
 }
 
+fn xray_route_destination_matches(expected: &str, rendered: &str) -> bool {
+    expected == rendered
+        || rendered == "default" && matches!(expected, "0.0.0.0/0" | "::/0")
+        || expected
+            .strip_suffix("/32")
+            .is_some_and(|address| address == rendered)
+        || expected
+            .strip_suffix("/128")
+            .is_some_and(|address| address == rendered)
+}
+
 fn xray_route_exists(prepared: &PreparedXray, arguments: &[String]) -> Result<bool> {
-    let ipv6 = arguments.first().is_some_and(|argument| argument == "-6");
-    let mut query = Vec::new();
-    if ipv6 {
-        query.push("-6");
-    }
-    query.extend(["route", "show", "proto", "66"]);
+    let query = exact_xray_route_query(arguments)?;
     let output = Command::new(&prepared.ip)
         .args(&query)
         .env("PATH", &prepared.path)
@@ -599,14 +792,14 @@ fn configure_xray_interface(
         ],
         rollback,
     )?;
-    apply_xray_mutation(
+    apply_xray_route_mutation(
         prepared,
         endpoint_route_arguments(prepared, "add"),
         endpoint_route_arguments(prepared, "delete"),
         rollback,
     )?;
     for (forward, reverse) in traffic_route_pairs(prepared, interface) {
-        apply_xray_mutation(prepared, forward, reverse, rollback)?;
+        apply_xray_route_mutation(prepared, forward, reverse, rollback)?;
     }
     rollback.push(XrayRollback::DnsRevert {
         interface: interface.into(),
@@ -822,6 +1015,7 @@ fn connect_xray(
     if existing {
         bail!("refusing to connect because interface already exists: {interface}");
     }
+    preflight_xray_routes(&prepared, interface)?;
     let logging = state.settings.logging;
     let (pid, runtime_directory) =
         start_xray_worker(store, state, &id, &prepared, interface, logging)?;
@@ -949,7 +1143,9 @@ fn connect_xray(
             uplink: prepared.uplink.clone(),
         }),
     });
-    if let Err(error) = configure_xray_interface(&prepared, interface, &mut rollback) {
+    let configure_result = configure_xray_interface(&prepared, interface, &mut rollback)
+        .and_then(|()| verify_xray_bypass_routes(&prepared, interface, &rollback));
+    if let Err(error) = configure_result {
         return match rollback_xray_connect(
             &prepared,
             pid,

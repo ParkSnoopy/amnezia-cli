@@ -198,8 +198,29 @@ mod tests {
         assert!(
             except_pairs
                 .iter()
+                .any(|(forward, _)| is_xray_bypass_route(&except, forward).unwrap())
+        );
+        assert!(
+            except_pairs
+                .iter()
+                .filter(|(forward, _)| forward.contains(&"0.0.0.0/1".into()))
+                .all(|(forward, _)| !is_xray_bypass_route(&except, forward).unwrap())
+        );
+        assert!(
+            except_pairs
+                .iter()
                 .all(|(_, reverse)| reverse.iter().any(|argument| argument == "delete"))
         );
+        let bypass_reverse = except_pairs
+            .iter()
+            .find(|(forward, _)| is_xray_bypass_route(&except, forward).unwrap())
+            .map(|(_, reverse)| reverse.clone())
+            .unwrap();
+        assert!(!xray_rollback_owns_route(&[], &bypass_reverse));
+        assert!(xray_rollback_owns_route(
+            &[XrayRollback::Ip(bypass_reverse.clone())],
+            &bypass_reverse
+        ));
     }
 
     #[test]
@@ -220,11 +241,97 @@ mod tests {
             "unreachable ::/0 proto 66 metric 42760 pref medium"
         )
         .unwrap());
+        assert!(xray_route_line_matches(
+            &arguments,
+            "unreachable default proto 66 metric 42760 pref medium"
+        )
+        .unwrap());
         assert!(!xray_route_line_matches(
             &arguments,
             "unreachable ::/0 proto 66 metric 999 pref medium"
         )
         .unwrap());
+    }
+
+    #[test]
+    fn xray_route_preflight_reuses_only_compatible_external_routes() {
+        let bypass = vec![
+            "route".into(),
+            "add".into(),
+            "192.168.0.0/16".into(),
+            "via".into(),
+            "192.168.1.1".into(),
+            "dev".into(),
+            "wlp1s0".into(),
+            "proto".into(),
+            "66".into(),
+            "metric".into(),
+            "5".into(),
+        ];
+        assert_eq!(
+            classify_xray_route(
+                &bypass,
+                "192.168.0.0/16 via 192.168.1.1 dev wlp1s0"
+            )
+            .unwrap(),
+            XrayRouteDisposition::SatisfiedExternally
+        );
+        assert_eq!(
+            classify_xray_route(
+                &bypass,
+                "192.168.0.0/16 via 192.168.1.1 dev wlp1s0 proto static metric 20"
+            )
+            .unwrap(),
+            XrayRouteDisposition::SatisfiedExternally
+        );
+        assert_eq!(
+            classify_xray_route(
+                &bypass,
+                "192.168.0.0/16 via 192.168.1.1 dev wlp1s0 proto 66 metric 5"
+            )
+            .unwrap(),
+            XrayRouteDisposition::Collision
+        );
+        assert_eq!(
+            classify_xray_route(
+                &bypass,
+                "192.168.0.0/16 via 192.168.1.254 dev wlp1s0 proto static"
+            )
+            .unwrap(),
+            XrayRouteDisposition::Collision
+        );
+        assert_eq!(
+            classify_xray_route(&bypass, "").unwrap(),
+            XrayRouteDisposition::Missing
+        );
+        let host_bypass = bypass
+            .iter()
+            .map(|argument| {
+                if argument == "192.168.0.0/16" {
+                    "192.168.1.25/32".to_owned()
+                } else {
+                    argument.clone()
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            classify_xray_route(
+                &host_bypass,
+                "192.168.1.25 via 192.168.1.1 dev wlp1s0 proto 3"
+            )
+            .unwrap(),
+            XrayRouteDisposition::SatisfiedExternally
+        );
+        assert_eq!(
+            exact_xray_route_query(&bypass).unwrap(),
+            ["-N", "route", "show", "exact", "192.168.0.0/16"]
+        );
+        let ipv6 = ["-6", "route", "add", "unreachable", "::/0", "proto", "66"]
+            .map(str::to_owned);
+        assert_eq!(
+            exact_xray_route_query(&ipv6).unwrap(),
+            ["-N", "-6", "route", "show", "exact", "::/0"]
+        );
     }
 
     #[test]

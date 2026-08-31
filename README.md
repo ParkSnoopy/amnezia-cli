@@ -82,7 +82,7 @@ amn settings set logging true
 amn settings set dns-servers 1.1.1.1,1.0.0.1
 ```
 
-The DNS list is applied transactionally while a VPN connection is active and the prior resolver contents are restored on disconnect. Imported WireGuard and AmneziaWG profiles that omit DNS servers or contain the GUI application's DNS placeholders are resolved automatically, so they do not need to be edited after import. `amn` refuses rollback if another program changes the resolver during the connection. `status` also reports received and transmitted bytes when the active tunnel exposes Linux interface counters.
+The DNS list is applied transactionally while a VPN connection is active and the prior resolver contents are restored on disconnect. Imported WireGuard and AmneziaWG profiles that omit DNS servers or contain the GUI application's DNS placeholders are resolved automatically, so they do not need to be edited after import. XRay reuses an existing split-tunnel bypass route when it already follows the required gateway and interface, without taking ownership of or removing that route. `amn` refuses rollback if another program changes the resolver during the connection. `status` also reports received and transmitted bytes when the active tunnel exposes Linux interface counters.
 
 ## Backup and logs
 
