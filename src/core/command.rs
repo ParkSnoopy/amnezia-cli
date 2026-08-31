@@ -5,7 +5,6 @@ use anyhow::{
     Result,
 };
 use clap::{
-    Args,
     Parser,
     Subcommand,
     ValueEnum,
@@ -19,10 +18,10 @@ pub enum Command {
         profile: Option<String>,
     },
     Disconnect,
+    Reconnect,
     #[command(subcommand)]
     Profile(ProfileCommand),
-    #[command(subcommand)]
-    Server(ServerCommand),
+
     #[command(subcommand)]
     Settings(SettingsCommand),
     #[command(subcommand)]
@@ -67,48 +66,6 @@ pub enum ProfileCommand {
     },
 }
 
-#[derive(Debug, Args)]
-pub struct ServerAdd {
-    pub host: String,
-    #[arg(long)]
-    pub name: Option<String>,
-    #[arg(long, default_value = "root")]
-    pub user: String,
-    #[arg(long, default_value_t = 22)]
-    pub port: u16,
-    #[arg(long)]
-    pub identity: Option<PathBuf>,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ServerCommand {
-    List,
-    Add(ServerAdd),
-    Show {
-        id: String,
-    },
-    Remove {
-        id: String,
-    },
-    Rename {
-        id: String,
-        name: String,
-    },
-    Default {
-        id: String,
-    },
-    Test {
-        id: String,
-    },
-    Scan {
-        id: String,
-    },
-    Reboot {
-        id: String,
-        #[arg(long)]
-        yes: bool,
-    },
-}
 
 #[derive(Debug, Subcommand)]
 pub enum SettingsCommand {
@@ -170,6 +127,7 @@ pub enum FeatureAction {
     Status,
     Connect,
     Disconnect,
+    Reconnect,
     ProfileList,
     ProfileShow,
     ProfileImport,
@@ -179,15 +137,7 @@ pub enum FeatureAction {
     ProfileEnable,
     ProfileDisable,
     ProfileDefault,
-    ServerList,
-    ServerAdd,
-    ServerShow,
-    ServerRemove,
-    ServerRename,
-    ServerDefault,
-    ServerTest,
-    ServerScan,
-    ServerReboot,
+
     SettingsShow,
     SettingsSet,
     SettingsReset,
@@ -210,6 +160,7 @@ impl TuiAction for FeatureAction {
             Self::Status => ActionInfo::new("Connection", "Status", "status", ""),
             Self::Connect => ActionInfo::new("Connection", "Connect", "connect", "[PROFILE_ID]"),
             Self::Disconnect => ActionInfo::new("Connection", "Disconnect", "disconnect", ""),
+            Self::Reconnect => ActionInfo::new("Connection", "Reconnect", "reconnect", ""),
             Self::ProfileList => ActionInfo::new("Profiles", "List", "profile list", ""),
             Self::ProfileShow => ActionInfo::new("Profiles", "Show", "profile show", "<ID>"),
             Self::ProfileImport => {
@@ -234,28 +185,7 @@ impl TuiAction for FeatureAction {
             Self::ProfileDefault => {
                 ActionInfo::new("Profiles", "Set default", "profile default", "<ID>")
             }
-            Self::ServerList => ActionInfo::new("Servers", "List", "server list", ""),
-            Self::ServerAdd => {
-                ActionInfo::new(
-                    "Servers",
-                    "Add",
-                    "server add",
-                    "<HOST> [--name NAME] [--user USER] [--port PORT] [--identity PATH]",
-                )
-            }
-            Self::ServerShow => ActionInfo::new("Servers", "Show", "server show", "<ID>"),
-            Self::ServerRemove => ActionInfo::new("Servers", "Remove", "server remove", "<ID>"),
-            Self::ServerRename => {
-                ActionInfo::new("Servers", "Rename", "server rename", "<ID> <NAME>")
-            }
-            Self::ServerDefault => {
-                ActionInfo::new("Servers", "Set default", "server default", "<ID>")
-            }
-            Self::ServerTest => ActionInfo::new("Servers", "Test", "server test", "<ID>"),
-            Self::ServerScan => ActionInfo::new("Servers", "Scan", "server scan", "<ID>"),
-            Self::ServerReboot => {
-                ActionInfo::new("Servers", "Reboot", "server reboot", "<ID> --yes")
-            }
+
             Self::SettingsShow => ActionInfo::new("Settings", "Show", "settings show", ""),
             Self::SettingsSet => {
                 ActionInfo::new("Settings", "Set", "settings set", "<KEY> <VALUE>")

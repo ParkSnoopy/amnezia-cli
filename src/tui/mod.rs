@@ -58,7 +58,6 @@ use crate::{
         State,
         Store,
         TuiAction,
-        runner,
     },
     sanitize_terminal,
 };
@@ -167,10 +166,10 @@ fn event_loop(
 ) -> Result<()> {
     let mut ui = UiState::default();
     loop {
-        let had_connection = state.connection.is_some();
-        runner::refresh_connection(state);
-        if had_connection && state.connection.is_none() {
-            store.save(state)?;
+        if let Err(error) =
+            crate::core::Connections::new(store, state).status(!ui.dry_run)
+        {
+            ui.output = format!("connection recovery required: {error:#}");
         }
         terminal.draw(|frame| render(frame, state, &ui))?;
         if !event::poll(Duration::from_millis(250))? {
@@ -375,9 +374,8 @@ fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
         .map(|profile| sanitize_terminal(&profile.name))
         .unwrap_or_else(|| "None".into());
     let summary = format!(
-        "Profile: {profile}\nProfiles: {}\nServers: {}\n\n{}",
+        "Profile: {profile}\nProfiles: {}\n\n{}",
         state.profiles.len(),
-        state.servers.len(),
         sanitize_terminal(&ui.output)
     );
     frame.render_widget(
@@ -441,7 +439,6 @@ mod tests {
         assert!(snapshot.contains("AmneziaVPN TUI"));
         assert!(snapshot.contains("Connection / Status"));
         assert!(snapshot.contains("Profiles / List"));
-        assert!(snapshot.contains("Servers / List"));
         assert!(snapshot.contains("Settings / Show"));
         assert!(snapshot.contains("Split tunnel / List"));
         assert!(snapshot.contains("FullColor / tokio-night"));

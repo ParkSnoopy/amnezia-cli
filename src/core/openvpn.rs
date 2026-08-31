@@ -1,15 +1,26 @@
-use anyhow::{
-    Result,
-    bail,
-};
+use anyhow::{Result, bail};
 
 use crate::core::{
-    model::{
-        RouteMode,
-        Settings,
-    },
+    model::{RouteMode, Settings},
     routing::Network,
 };
+
+pub(crate) struct Adapter;
+
+impl crate::core::transaction::sealed::Sealed for Adapter {}
+
+impl crate::core::transaction::ProtocolAdapter for Adapter {
+    const PROTOCOL: crate::core::model::Protocol = crate::core::model::Protocol::OpenVpn;
+
+    fn prepare(
+        request: crate::core::transaction::PrepareRequest<'_>,
+    ) -> anyhow::Result<crate::core::transaction::ProtocolRecipe> {
+        Ok(crate::core::transaction::ProtocolRecipe::OpenVpn(prepare(
+            request.source,
+            request.settings,
+        )?))
+    }
+}
 
 pub struct Configuration {
     pub text: String,
@@ -17,10 +28,7 @@ pub struct Configuration {
 }
 
 pub fn prepare(source: &str, settings: &Settings) -> Result<Configuration> {
-    if !source
-        .lines()
-        .any(|line| line.trim_start().starts_with("remote "))
-    {
+    if !source.lines().any(|line| line.trim_start().starts_with("remote ")) {
         bail!("OpenVPN profile has no remote server");
     }
     let mut text = source.to_owned();

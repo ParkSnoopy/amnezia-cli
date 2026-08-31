@@ -8,7 +8,6 @@ use anyhow::{
     Result,
     bail,
 };
-use uuid::Uuid;
 
 use crate::{
     core::{
@@ -17,7 +16,6 @@ use crate::{
             Command,
             LogsCommand,
             ProfileCommand,
-            ServerCommand,
             SettingsCommand,
             SplitKind,
             SplitMode,
@@ -26,11 +24,11 @@ use crate::{
         model::{
             self,
             RouteMode,
-            Server,
             State,
         },
-        runner,
-        server,
+        Connections,
+        Operation,
+        transaction,
         store,
         store::Store,
     },
@@ -43,21 +41,51 @@ pub fn execute(
     command: Command,
     dry_run: bool,
 ) -> Result<String> {
+    if dry_run
+        && !matches!(
+            &command,
+            Command::Status
+                | Command::Connect { .. }
+                | Command::Disconnect
+                | Command::Reconnect
+        )
+    {
+        bail!("--dry-run is supported only for status and connection commands");
+    }
     let mut output = String::new();
     match command {
-        Command::Status => print_status(state, &mut output)?,
+        Command::Status => {
+            let recovery_error = Connections::new(store, state).status(!dry_run).err();
+            print_status(state, &mut output)?;
+            if let Some(error) = recovery_error {
+                writeln!(output, "Recovery required: {error:#}")?;
+            }
+        }
         Command::Connect { profile } => {
-            writeln!(
-                output,
-                "{}",
-                runner::connect(store, state, profile.as_deref(), dry_run)?
-            )?;
+            let mut connections = Connections::new(store, state);
+            let result = if dry_run {
+                connections.preview(Operation::Connect {
+                    profile: profile.as_deref(),
+                })?
+            } else {
+                connections.connect(profile.as_deref())?
+            };
+            writeln!(output, "{}", result)?;
         }
         Command::Disconnect => {
-            writeln!(output, "{}", runner::disconnect(store, state, dry_run)?)?;
+            let mut connections = Connections::new(store, state);
+            let result = if dry_run {
+                connections.preview(Operation::Disconnect)?
+            } else {
+                connections.disconnect()?
+            };
+            writeln!(output, "{}", result)?;
+        }
+        Command::Reconnect => {
+            let result = Connections::new(store, state).reconnect(dry_run)?;
+            writeln!(output, "{}", result)?;
         }
         Command::Profile(command) => profile_command(store, state, command, &mut output)?,
-        Command::Server(command) => server_command(store, state, command, dry_run, &mut output)?,
         Command::Settings(command) => settings_command(store, state, command, &mut output)?,
         Command::SplitTunnel(command) => split_command(store, state, command, &mut output)?,
         Command::Backup(command) => backup_command(store, state, command)?,
@@ -81,13 +109,30 @@ fn print_status(state: &State, output: &mut String) -> Result<()> {
             }
             if let Some(interface) = &connection.interface {
                 writeln!(output, "interface: {interface}")?;
+                if let Some((received, transmitted)) = interface_traffic(interface) {
+                    writeln!(output, "received: {received}")?;
+                    writeln!(output, "transmitted: {transmitted}")?;
+                }
             }
         }
         None => writeln!(output, "disconnected")?,
     }
     writeln!(output, "profiles: {}", state.profiles.len())?;
-    writeln!(output, "servers: {}", state.servers.len())?;
     Ok(())
+}
+
+fn interface_traffic(interface: &str) -> Option<(u64, u64)> {
+    if interface.is_empty()
+        || !interface
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "_.-".contains(character))
+    {
+        return None;
+    }
+    let root = std::path::Path::new("/sys/class/net").join(interface).join("statistics");
+    let received = fs::read_to_string(root.join("rx_bytes")).ok()?.trim().parse().ok()?;
+    let transmitted = fs::read_to_string(root.join("tx_bytes")).ok()?.trim().parse().ok()?;
+    Some((received, transmitted))
 }
 
 fn profile_command(
@@ -166,119 +211,6 @@ fn profile_command(
     Ok(())
 }
 
-fn server_command(
-    store: &Store,
-    state: &mut State,
-    command: ServerCommand,
-    dry_run: bool,
-    output: &mut String,
-) -> Result<()> {
-    match command {
-        ServerCommand::List => {
-            for server in state.servers.values() {
-                let default = if state.default_server.as_deref() == Some(&server.id) {
-                    " default"
-                } else {
-                    ""
-                };
-                writeln!(
-                    output,
-                    "{}\t{}@{}:{}\t{}{}",
-                    server.id,
-                    sanitize_terminal(&server.user),
-                    sanitize_terminal(&server.host),
-                    server.port,
-                    sanitize_terminal(&server.name),
-                    default
-                )?;
-            }
-        }
-        ServerCommand::Add(args) => {
-            let id = Uuid::new_v4().simple().to_string();
-            let server = Server {
-                id: id.clone(),
-                name: args.name.unwrap_or_else(|| args.host.clone()),
-                host: args.host,
-                port: args.port,
-                user: args.user,
-                identity_file: args
-                    .identity
-                    .map(|path| path.to_string_lossy().into_owned()),
-            };
-            update_state(store, state, |updated| {
-                updated.servers.insert(id.clone(), server);
-                if updated.default_server.is_none() {
-                    updated.default_server = Some(id.clone());
-                }
-                Ok(())
-            })?;
-            writeln!(output, "{id}")?;
-        }
-        ServerCommand::Show { id } => {
-            writeln!(
-                output,
-                "{}",
-                serde_json::to_string_pretty(server_ref(state, &id)?)?
-            )?
-        }
-        ServerCommand::Remove { id } => {
-            update_state(store, state, |updated| {
-                updated
-                    .servers
-                    .remove(&id)
-                    .with_context(|| format!("unknown server: {id}"))?;
-                if updated.default_server.as_deref() == Some(&id) {
-                    updated.default_server = updated.servers.keys().next().cloned();
-                }
-                Ok(())
-            })?;
-        }
-        ServerCommand::Rename { id, name } => {
-            update_state(store, state, |updated| {
-                updated
-                    .servers
-                    .get_mut(&id)
-                    .with_context(|| format!("unknown server: {id}"))?
-                    .name = name;
-                Ok(())
-            })?
-        }
-        ServerCommand::Default { id } => {
-            update_state(store, state, |updated| {
-                server_ref(updated, &id)?;
-                updated.default_server = Some(id);
-                Ok(())
-            })?
-        }
-        ServerCommand::Test { id } => {
-            writeln!(
-                output,
-                "{}",
-                sanitize_terminal(&server::run_ssh(
-                    server_ref(state, &id)?,
-                    &["true"],
-                    dry_run
-                )?)
-            )?
-        }
-        ServerCommand::Scan { id } => {
-            writeln!(
-                output,
-                "{}",
-                sanitize_terminal(&server::scan(server_ref(state, &id)?, dry_run)?)
-            )?
-        }
-        ServerCommand::Reboot { id, yes } => {
-            writeln!(
-                output,
-                "{}",
-                sanitize_terminal(&server::reboot(server_ref(state, &id)?, yes, dry_run)?)
-            )?
-        }
-    }
-    Ok(())
-}
-
 fn settings_command(
     store: &Store,
     state: &mut State,
@@ -290,12 +222,18 @@ fn settings_command(
             writeln!(output, "{}", serde_json::to_string_pretty(&state.settings)?)?
         }
         SettingsCommand::Reset => {
+            if state.connection.is_some() {
+                bail!("disconnect VPN before resetting connection settings");
+            }
             update_state(store, state, |updated| {
                 updated.settings = Default::default();
                 Ok(())
             })?
         }
         SettingsCommand::Set { key, value } => {
+            if state.connection.is_some() {
+                bail!("disconnect VPN before changing connection settings");
+            }
             update_state(store, state, |updated| set_setting(updated, &key, &value))?
         }
     }
@@ -310,6 +248,19 @@ fn set_setting(state: &mut State, key: &str, value: &str) -> Result<()> {
     };
     match key {
         "logging" => state.settings.logging = boolean()?,
+        "dns-servers" => {
+            let servers = value
+                .split(',')
+                .map(str::trim)
+                .filter(|server| !server.is_empty())
+                .map(|server| server.parse::<std::net::IpAddr>().map(|_| server.to_owned()))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .context("dns-servers expects comma-separated IP addresses")?;
+            if servers.is_empty() {
+                bail!("dns-servers requires at least one IP address");
+            }
+            state.settings.dns_servers = servers;
+        }
         _ => bail!("unknown setting: {key}"),
     }
     Ok(())
@@ -427,25 +378,10 @@ fn log_paths(store: &Store) -> Result<Vec<std::path::PathBuf>> {
 
 fn doctor(store: &Store, state: &State, output: &mut String) -> Result<()> {
     let mut failures = Vec::new();
-    for saved_server in state.servers.values() {
-        match server::check_dependencies(saved_server) {
-            Ok(_) => writeln!(output, "server {}: ok", saved_server.id)?,
-            Err(error) => failures.push(format!("server {}: {error:#}", saved_server.id)),
-        }
-    }
     for profile in state.profiles.values() {
-        match profile.protocol {
-            model::Protocol::OpenVpn
-            | model::Protocol::WireGuard
-            | model::Protocol::AmneziaWg
-            | model::Protocol::Xray
-            | model::Protocol::Shadowsocks
-            | model::Protocol::Ikev2 => {
-                match runner::check_profile_dependencies(store, profile, &state.settings) {
-                    Ok(()) => writeln!(output, "profile {}: ok", profile.id)?,
-                    Err(error) => failures.push(format!("profile {}: {error:#}", profile.id)),
-                }
-            }
+        match transaction::check_profile_dependencies(store, profile, &state.settings) {
+            Ok(()) => writeln!(output, "profile {}: ok", profile.id)?,
+            Err(error) => failures.push(format!("profile {}: {error:#}", profile.id)),
         }
     }
     if !failures.is_empty() {
@@ -481,11 +417,4 @@ fn profile_mut<'a>(state: &'a mut State, id: &str) -> Result<&'a mut model::Prof
         .profiles
         .get_mut(id)
         .with_context(|| format!("unknown profile: {id}"))
-}
-
-fn server_ref<'a>(state: &'a State, id: &str) -> Result<&'a Server> {
-    state
-        .servers
-        .get(id)
-        .with_context(|| format!("unknown server: {id}"))
 }

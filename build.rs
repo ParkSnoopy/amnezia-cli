@@ -77,7 +77,6 @@ enum RecipeInput {
     Go,
     V2RayRules,
     XRayBindings,
-    LibSsh,
     OpenSsl,
     LibCapNg,
 }
@@ -91,7 +90,6 @@ impl RecipeInput {
             Self::Go => "go",
             Self::V2RayRules => "v2ray-rules-dat",
             Self::XRayBindings => "amnezia-xray-bindings",
-            Self::LibSsh => "libssh",
             Self::OpenSsl => "openssl",
             Self::LibCapNg => "libcap-ng",
         }
@@ -104,8 +102,7 @@ impl RecipeInput {
             Self::AmneziaWg => Some(Self::Go),
             Self::Go => Some(Self::V2RayRules),
             Self::V2RayRules => Some(Self::XRayBindings),
-            Self::XRayBindings => Some(Self::LibSsh),
-            Self::LibSsh => Some(Self::OpenSsl),
+            Self::XRayBindings => Some(Self::OpenSsl),
             Self::OpenSsl => Some(Self::LibCapNg),
             Self::LibCapNg => None,
         }
@@ -118,13 +115,11 @@ const AMNEZIA_REMOTE: &str =
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/core/amnezia_xray_runner.rs");
-    println!("cargo:rerun-if-changed=amnezia-client/conanfile.py");
     println!("cargo:rerun-if-changed=amnezia-client/recipes");
 
     let manifest = PathBuf::from(required_env("CARGO_MANIFEST_DIR"));
     let source = manifest.join("amnezia-client");
     let recipes = source.join("recipes");
-    require_file(&source.join("conanfile.py"));
     require_directory(&recipes);
     for recipe in std::iter::successors(Some(RecipeInput::OpenVpn), |recipe| recipe.next()) {
         require_file(&recipes.join(recipe.directory()).join("conanfile.py"));
@@ -166,10 +161,21 @@ fn main() {
     fs::create_dir_all(&conan_output).unwrap_or_else(|error| {
         panic!("create Conan output {}: {error}", conan_output.display());
     });
+    let client_conanfile = conan_output.join("conanfile.txt");
+    fs::write(
+        &client_conanfile,
+        "[requires]\nopenvpn/2.7.0\ntun2socks/2.6.0\nawg-go/3.1.20260814\namnezia-xray-bindings/1.3.0\nv2ray-rules-dat/202603162227\n",
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "write client-only Conan manifest {}: {error}",
+            client_conanfile.display()
+        )
+    });
 
     let install_arguments = vec![
         "install".into(),
-        source.as_os_str().to_owned(),
+        client_conanfile.as_os_str().to_owned(),
         format!("--output-folder={}", conan_output.display()).into(),
         "--build=missing".into(),
         "--deployer=full_deploy".into(),
@@ -250,21 +256,11 @@ fn main() {
 }
 
 fn export_recipes(conan: &Path, recipes: &Path) {
-    let mut recipe_directories = fs::read_dir(recipes)
-        .unwrap_or_else(|error| panic!("read recipes directory {}: {error}", recipes.display()))
-        .map(|entry| {
-            entry
-                .unwrap_or_else(|error| panic!("read recipe entry: {error}"))
-                .path()
-        })
-        .filter(|path| path.join("conanfile.py").is_file())
-        .collect::<Vec<_>>();
-    recipe_directories.sort();
-    if recipe_directories.is_empty() {
-        panic!("no Conan recipes found in {}", recipes.display());
-    }
-    for recipe in recipe_directories {
-        if recipe.file_name() == Some(OsStr::new("go")) {
+    for recipe_kind in
+        std::iter::successors(Some(RecipeInput::OpenVpn), |recipe| recipe.next())
+    {
+        let recipe = recipes.join(recipe_kind.directory());
+        if matches!(recipe_kind, RecipeInput::Go) {
             run_os(
                 conan,
                 &[

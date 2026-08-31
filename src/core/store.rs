@@ -44,6 +44,14 @@ pub struct Store {
 
 impl Store {
     pub fn discover(override_root: Option<PathBuf>) -> Result<Self> {
+        Self::discover_with_writes(override_root, true)
+    }
+
+    pub fn discover_read_only(override_root: Option<PathBuf>) -> Result<Self> {
+        Self::discover_with_writes(override_root, false)
+    }
+
+    fn discover_with_writes(override_root: Option<PathBuf>, writable: bool) -> Result<Self> {
         let root = match override_root {
             Some(path) => path,
             None => {
@@ -52,11 +60,21 @@ impl Store {
                     .join("amn")
             }
         };
-        fs::create_dir_all(&root)?;
-        let root = fs::canonicalize(root)?;
-        secure_directory(&root)?;
-        secure_directory(&root.join("profiles"))?;
-        secure_directory(&root.join("logs"))?;
+        if writable {
+            fs::create_dir_all(&root)?;
+            let root = fs::canonicalize(root)?;
+            secure_directory(&root)?;
+            secure_directory(&root.join("profiles"))?;
+            secure_directory(&root.join("logs"))?;
+            return Ok(Self { root });
+        }
+        let root = if root.exists() {
+            fs::canonicalize(root)?
+        } else if root.is_absolute() {
+            root
+        } else {
+            std::env::current_dir()?.join(root)
+        };
         Ok(Self { root })
     }
 
@@ -69,15 +87,32 @@ impl Store {
     }
 
     pub fn load(&self) -> Result<State> {
+        self.load_with_migration(true)
+    }
+
+    pub fn load_without_migration(&self) -> Result<State> {
+        self.load_with_migration(false)
+    }
+
+    fn load_with_migration(&self, persist_migration: bool) -> Result<State> {
         let path = self.state_path();
         if !path.exists() {
             return Ok(State::default());
         }
         let data = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        let state =
-            serde_json::from_slice(&data).with_context(|| format!("parse {}", path.display()))?;
+        let mut document: serde_json::Value = serde_json::from_slice(&data)
+            .with_context(|| format!("parse {}", path.display()))?;
+        let (migrated, removed_sources) = migrate_removed_features(&mut document);
+        let state: State = serde_json::from_value(document)
+            .with_context(|| format!("parse {}", path.display()))?;
         self.validate_state(&state)?;
         self.validate_profile_sources(&state)?;
+        if migrated && persist_migration {
+            self.save(&state).context("persist removed-feature state migration")?;
+            for source in removed_sources {
+                self.remove_managed_profile_source(&source)?;
+            }
+        }
         Ok(state)
     }
 
@@ -245,7 +280,15 @@ impl Store {
             bail!("backup exceeds the 64 MiB size limit");
         }
         let data = fs::read(source).with_context(|| format!("read backup {}", source.display()))?;
-        let backup: BackupFile = serde_json::from_slice(&data).context("invalid backup")?;
+        let mut document: serde_json::Value =
+            serde_json::from_slice(&data).context("invalid backup")?;
+        if let Some(state) = document.get_mut("state") {
+            migrate_removed_features(state);
+        }
+        let mut backup: BackupFile = serde_json::from_value(document).context("invalid backup")?;
+        backup
+            .profiles
+            .retain(|id, _| backup.state.profiles.contains_key(id));
         if backup.format_version != 1 {
             bail!(
                 "unsupported backup format version: {}",
@@ -338,21 +381,13 @@ impl Store {
         {
             bail!("default profile does not exist: {id}");
         }
-        if let Some(id) = &state.default_server
-            && !state.servers.contains_key(id)
-        {
-            bail!("default server does not exist: {id}");
-        }
+
         for (id, profile) in &state.profiles {
             if profile.id != *id {
                 bail!("profile ID does not match state key: {id}");
             }
         }
-        for (id, server) in &state.servers {
-            if server.id != *id {
-                bail!("server ID does not match state key: {id}");
-            }
-        }
+
         if let Some(connection) = &state.connection
             && !state.profiles.contains_key(&connection.profile_id)
         {
@@ -360,6 +395,21 @@ impl Store {
                 "connection references unknown profile: {}",
                 connection.profile_id
             );
+        }
+        Ok(())
+    }
+
+    fn remove_managed_profile_source(&self, source: &str) -> Result<()> {
+        let source = Path::new(source);
+        if !source.exists() {
+            return Ok(());
+        }
+        let profiles_root = fs::canonicalize(self.root.join("profiles"))?;
+        let source = fs::canonicalize(source)
+            .with_context(|| format!("inspect removed profile source: {}", source.display()))?;
+        if source.parent() == Some(profiles_root.as_path()) {
+            fs::remove_file(&source)
+                .with_context(|| format!("remove unsupported profile: {}", source.display()))?;
         }
         Ok(())
     }
@@ -388,10 +438,55 @@ impl Store {
     }
 }
 
+fn migrate_removed_features(document: &mut serde_json::Value) -> (bool, Vec<String>) {
+    let Some(root) = document.as_object_mut() else {
+        return (false, Vec::new());
+    };
+    let mut migrated = root.remove("servers").is_some();
+    migrated |= root.remove("default_server").is_some();
+
+    let mut removed_ids = BTreeSet::new();
+    let mut removed_sources = Vec::new();
+    if let Some(profiles) = root.get_mut("profiles").and_then(serde_json::Value::as_object_mut) {
+        profiles.retain(|id, profile| {
+            let removed = profile
+                .get("protocol")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|protocol| matches!(protocol, "ikev2" | "shadowsocks"));
+            if removed {
+                removed_ids.insert(id.clone());
+                if let Some(source) = profile.get("source").and_then(serde_json::Value::as_str) {
+                    removed_sources.push(source.to_owned());
+                }
+                migrated = true;
+            }
+            !removed
+        });
+    }
+    if root
+        .get("default_profile")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| removed_ids.contains(id))
+    {
+        root.insert("default_profile".into(), serde_json::Value::Null);
+        migrated = true;
+    }
+    if root
+        .get("connection")
+        .and_then(|connection| connection.get("profile_id"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|id| removed_ids.contains(id))
+    {
+        root.insert("connection".into(), serde_json::Value::Null);
+        migrated = true;
+    }
+    (migrated, removed_sources)
+}
+
 fn profile_extension(protocol: &Protocol) -> &'static str {
     match protocol {
         Protocol::OpenVpn => "ovpn",
-        Protocol::Xray | Protocol::Shadowsocks | Protocol::Ikev2 => "json",
+        Protocol::Xray => "json",
         Protocol::WireGuard | Protocol::AmneziaWg => "conf",
     }
 }
@@ -480,12 +575,7 @@ fn extract_amnezia_protocols(document: &serde_json::Value) -> Result<Vec<(String
                 Protocol::OpenVpn,
                 ["openvpn", "openvpn_config_data"].as_slice(),
             ))
-        } else if name.contains("ssxray") || name.contains("shadowsocks") {
-            Some((
-                Protocol::Shadowsocks,
-                ["ssxray", "shadowsocks", "ssxray_config_data"].as_slice(),
-            ))
-        } else if name.contains("xray") {
+        } else if name.contains("xray") && !name.contains("ssxray") {
             Some((Protocol::Xray, ["xray", "xray_config_data"].as_slice()))
         } else if name.contains("amnezia-awg") || name.ends_with("awg") {
             Some((
@@ -497,8 +587,6 @@ fn extract_amnezia_protocols(document: &serde_json::Value) -> Result<Vec<(String
                 Protocol::WireGuard,
                 ["wireguard", "wireguard_config_data"].as_slice(),
             ))
-        } else if name.contains("ipsec") || name.contains("ikev2") {
-            Some((Protocol::Ikev2, ["ikev2", "ikev2_config_data"].as_slice()))
         } else {
             None
         };
@@ -566,62 +654,17 @@ pub fn detect_protocol(text: &str, path: &Path) -> Result<Protocol> {
     {
         return Ok(Protocol::OpenVpn);
     }
-    if lower.trim_start().starts_with('{')
-        && serde_json::from_str::<serde_json::Value>(text)
-            .ok()
-            .is_some_and(|document| {
-                let configuration = document.get("ikev2_config_data").unwrap_or(&document);
-                let classic = ["cert", "certificate"]
-                    .iter()
-                    .any(|key| configuration.get(*key).is_some())
-                    && ["hostName", "host_name", "host"]
-                        .iter()
-                        .any(|key| configuration.get(*key).is_some());
-                let android = configuration
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("ikev2-cert")
-                    && configuration.pointer("/remote/addr").is_some()
-                    && configuration.pointer("/local/p12").is_some();
-                let nested = configuration
-                    .get("config")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
-                    .is_some_and(|value| {
-                        value.get("cert").is_some() && value.get("hostName").is_some()
-                    });
-                let encoded = document
-                    .get("ikev2_config_data")
-                    .is_some_and(serde_json::Value::is_string);
-                classic || android || nested || encoded
-            })
-    {
-        return Ok(Protocol::Ikev2);
-    }
+
     if lower.trim_start().starts_with('{')
         && (lower.contains("\"outbounds\"") || lower.contains("\"inbounds\""))
     {
-        if serde_json::from_str::<serde_json::Value>(text)
-            .ok()
-            .and_then(|document| {
-                document
-                    .get("outbounds")
-                    .and_then(serde_json::Value::as_array)
-                    .cloned()
-            })
-            .is_some_and(|outbounds| {
-                outbounds.iter().any(|outbound| {
-                    outbound.get("protocol").and_then(serde_json::Value::as_str)
-                        == Some("shadowsocks")
-                })
-            })
-        {
-            return Ok(Protocol::Shadowsocks);
-        }
         return Ok(Protocol::Xray);
     }
-    if lower.trim_start().starts_with("ss://") {
-        return Ok(Protocol::Shadowsocks);
+    if ["vless://", "vmess://", "trojan://"]
+        .iter()
+        .any(|prefix| lower.trim_start().starts_with(prefix))
+    {
+        return Ok(Protocol::Xray);
     }
 
     bail!("unsupported profile format")
@@ -800,53 +843,11 @@ fn reject_executable_directives(text: &str, protocol: &Protocol) -> Result<()> {
 }
 
 fn validate_protocol_configuration(text: &str, protocol: &Protocol) -> Result<()> {
-    match protocol {
-        Protocol::OpenVpn => {
-            crate::core::openvpn::prepare(text, &crate::core::model::Settings::default())?;
-        }
-        Protocol::Xray => {
-            crate::core::xray::RawConfiguration::parse(text)?;
-        }
-        Protocol::Shadowsocks => {
-            crate::core::shadowsocks::parse(text)?;
-        }
-        Protocol::Ikev2 => {
-            crate::core::ikev2::validate(text)?;
-        }
-        Protocol::WireGuard | Protocol::AmneziaWg => {
-            let has_private_key =
-                text.lines()
-                    .filter_map(|line| line.split_once('='))
-                    .any(|(key, value)| {
-                        key.trim().eq_ignore_ascii_case("PrivateKey")
-                            && !value
-                                .split('#')
-                                .next()
-                                .unwrap_or_default()
-                                .trim()
-                                .is_empty()
-                    });
-            if !has_private_key {
-                bail!("WireGuard profile has no private key");
-            }
-            let has_public_key =
-                text.lines()
-                    .filter_map(|line| line.split_once('='))
-                    .any(|(key, value)| {
-                        key.trim().eq_ignore_ascii_case("PublicKey")
-                            && !value
-                                .split('#')
-                                .next()
-                                .unwrap_or_default()
-                                .trim()
-                                .is_empty()
-                    });
-            if !has_public_key {
-                bail!("WireGuard profile has no peer public key");
-            }
-        }
-    }
-    Ok(())
+    crate::core::transaction::validate_protocol(
+        protocol,
+        text,
+        &crate::core::model::Settings::default(),
+    )
 }
 
 #[cfg(test)]
@@ -854,7 +855,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn detects_wireguard_amneziawg_and_raw_xray() {
+    fn detects_wireguard_amneziawg_and_xray() {
         assert_eq!(
             detect_protocol(
                 "[Interface]\nPrivateKey=x\n[Peer]\nPublicKey=y",
@@ -877,18 +878,46 @@ mod tests {
         );
         assert_eq!(
             detect_protocol(
-                "{\"hostName\":\"vpn.example\",\"cert\":\"AA==\"}",
-                Path::new("x.json")
+                "vless://00000000-0000-0000-0000-000000000000@vpn.example:443",
+                Path::new("x.txt")
             )
             .unwrap(),
-            Protocol::Ikev2
+            Protocol::Xray
         );
-        let shadowsocks = r#"{"outbounds":[{"protocol":"shadowsocks"}]}"#;
-        assert_eq!(
-            detect_protocol(shadowsocks, Path::new("x.json")).unwrap(),
-            Protocol::Shadowsocks
+    }
+
+    #[test]
+    fn migrates_removed_protocol_and_server_state() {
+        let mut document = serde_json::json!({
+            "profiles": {
+                "keep": {"id":"keep","name":"keep","protocol":"wire-guard","source":"/vpn/keep.conf","enabled":true},
+                "remove": {"id":"remove","name":"remove","protocol":"ikev2","source":"/vpn/remove.json","enabled":true}
+            },
+            "default_profile": "remove",
+            "settings": crate::core::model::Settings::default(),
+            "connection": {"profile_id":"remove","pid":null,"interface":null},
+            "servers": {"old": {}},
+            "default_server": "old"
+        });
+        let (migrated, removed_sources) = migrate_removed_features(&mut document);
+        assert!(migrated);
+        assert_eq!(removed_sources, vec!["/vpn/remove.json"]);
+        let state: State = serde_json::from_value(document).unwrap();
+        assert_eq!(state.profiles.len(), 1);
+        assert!(state.profiles.contains_key("keep"));
+        assert!(state.default_profile.is_none());
+        assert!(state.connection.is_none());
+    }
+
+    #[test]
+    fn rejects_removed_ikev2_profiles() {
+        assert!(
+            detect_protocol(
+                "{\"hostName\":\"vpn.example\",\"cert\":\"AA==\"}",
+                Path::new("x.json"),
+            )
+            .is_err()
         );
-        assert!(detect_protocol("vless://unsupported-share-link", Path::new("x.txt")).is_err());
     }
 
     #[test]
