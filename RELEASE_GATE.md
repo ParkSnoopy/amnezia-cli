@@ -7,6 +7,8 @@ A release is ready only when every applicable gate below passes against the curr
 - `Cargo.toml` and the `amn` entry in `Cargo.lock` contain the same approved version.
 - The default invocation remains the CLI and `--tui` remains the only TUI launcher.
 - CLI and TUI action coverage remains shared through `src/core`.
+- `init` refuses non-root execution and transactionally replaces `/usr/local/bin/amn` and `/usr/local/libexec/amn` from the running executable's adjacent bundle.
+- Invalid CLI commands show complete help, and wide plus narrow TUI captures retain readable actions, activity, errors, and command input.
 - Cargo `build.rs` owns client bundle construction.
 - New dependencies are documented; existing dependency version changes require explicit approval.
 

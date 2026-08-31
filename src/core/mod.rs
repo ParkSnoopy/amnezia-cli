@@ -3,6 +3,7 @@ mod app;
 mod command;
 mod connections;
 pub(crate) mod encoding;
+pub mod install;
 pub mod model;
 pub mod openvpn;
 pub(crate) mod routing;

@@ -26,6 +26,7 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{
+        Alignment,
         Constraint,
         Direction,
         Layout,
@@ -65,35 +66,42 @@ use crate::{
 
 #[derive(Clone, Copy)]
 struct Theme {
-    background: Color,
-    foreground: Color,
+    canvas: Color,
+    elevated: Color,
+    ink: Color,
+    body: Color,
     accent: Color,
-    accent_text: Color,
-    border: Color,
+    accent_soft: Color,
+    hairline: Color,
     muted: Color,
+    error: Color,
 }
 
 impl Theme {
     const fn active() -> Self {
         Self {
-            background: Color::Rgb(26, 27, 38),
-            foreground: Color::Rgb(192, 202, 245),
-            accent: Color::Rgb(122, 162, 247),
-            accent_text: Color::Rgb(26, 27, 38),
-            border: Color::Rgb(86, 95, 137),
-            muted: Color::Rgb(169, 177, 214),
+            canvas: Color::Rgb(250, 250, 250),
+            elevated: Color::Rgb(255, 255, 255),
+            ink: Color::Rgb(23, 23, 23),
+            body: Color::Rgb(77, 77, 77),
+            accent: Color::Rgb(0, 112, 243),
+            accent_soft: Color::Rgb(211, 229, 255),
+            hairline: Color::Rgb(235, 235, 235),
+            muted: Color::Rgb(143, 143, 143),
+            error: Color::Rgb(238, 0, 0),
         }
     }
 
-    fn block(self, title: &'static str) -> Block<'static> {
+    fn card(self, title: &'static str) -> Block<'static> {
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(self.border).bg(self.background))
+            .style(Style::default().fg(self.body).bg(self.elevated))
+            .border_style(Style::default().fg(self.hairline).bg(self.elevated))
             .title_style(
                 Style::default()
-                    .fg(self.accent)
-                    .bg(self.background)
+                    .fg(self.muted)
+                    .bg(self.elevated)
                     .add_modifier(Modifier::BOLD),
             )
     }
@@ -286,157 +294,247 @@ fn parse_action(action: FeatureAction, input: &str) -> Result<Command> {
 fn render(frame: &mut ratatui::Frame<'_>, state: &State, ui: &UiState) {
     let theme = Theme::active();
     frame.render_widget(
-        Block::default().style(Style::default().fg(theme.foreground).bg(theme.background)),
+        Block::default().style(Style::default().fg(theme.body).bg(theme.canvas)),
         frame.area(),
     );
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(5),
             Constraint::Min(10),
             Constraint::Length(3),
-            Constraint::Length(4),
+            Constraint::Length(2),
         ])
         .split(frame.area());
-    let mut areas = layout.iter().copied();
-    let title_area = areas.next().expect("title area");
-    let main_area = areas.next().expect("main area");
-    let action_area = areas.next().expect("action area");
-    let footer_area = areas.next().expect("footer area");
-    let title = Paragraph::new(Line::from(vec![
-        Span::styled(
-            " AmneziaVPN TUI ",
-            Style::default()
-                .fg(theme.accent_text)
-                .bg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            if state.connection.is_some() {
-                " CONNECTED"
-            } else {
-                " DISCONNECTED"
-            },
-            Style::default().fg(theme.foreground).bg(theme.background),
-        ),
-        Span::styled(
-            if ui.dry_run { "  PREVIEW" } else { "" },
-            Style::default().fg(theme.muted).bg(theme.background),
-        ),
-    ]))
-    .style(Style::default().fg(theme.foreground).bg(theme.background))
-    .block(theme.block(""));
-    frame.render_widget(title, title_area);
+    let header_area = layout[0];
+    let overview_area = layout[1];
+    let workspace_area = layout[2];
+    let command_area = layout[3];
+    let footer_area = layout[4];
 
-    let column_layout = Layout::default()
+    let header_columns = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
-        .split(main_area);
-    let mut columns = column_layout.iter().copied();
-    let features_area = columns.next().expect("features area");
-    let result_area = columns.next().expect("result area");
-    let actions = FeatureAction::iter()
-        .map(|action| {
-            let info = action.info();
-            ListItem::new(format!("{} / {}", info.category, info.label))
-        })
-        .collect::<Vec<_>>();
-    let selected = FeatureAction::iter().position(|action| action == ui.selected);
-    let mut list_state = ListState::default().with_selected(selected);
-    let list = List::new(actions)
-        .style(Style::default().fg(theme.foreground).bg(theme.background))
-        .block(theme.block("Actions"))
-        .highlight_style(
-            Style::default()
-                .bg(theme.accent)
-                .fg(theme.accent_text)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("> ");
-    frame.render_stateful_widget(list, features_area, &mut list_state);
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .split(header_area);
+    let header_block = Block::default()
+        .borders(Borders::BOTTOM)
+        .border_style(Style::default().fg(theme.hairline).bg(theme.canvas));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                " AmneziaVPN",
+                Style::default()
+                    .fg(theme.ink)
+                    .bg(theme.canvas)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Linux VPN client", Style::default().fg(theme.muted)),
+        ]))
+        .style(Style::default().bg(theme.canvas))
+        .block(header_block.clone()),
+        header_columns[0],
+    );
+    let connection_label = if state.connection.is_some() {
+        "● Connected"
+    } else {
+        "○ Disconnected"
+    };
+    let mode = if ui.dry_run { "  ·  Preview" } else { "" };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(connection_label, Style::default().fg(theme.accent)),
+            Span::styled(mode, Style::default().fg(theme.muted)),
+            Span::raw(" "),
+        ]))
+        .alignment(Alignment::Right)
+        .style(Style::default().bg(theme.canvas))
+        .block(header_block),
+        header_columns[1],
+    );
 
     let active_profile = state
         .connection
         .as_ref()
         .and_then(|connection| state.profiles.get(&connection.profile_id))
         .map(|profile| sanitize_terminal(&profile.name))
-        .unwrap_or_else(|| "—".into());
-    let connection = if state.connection.is_some() {
-        "Connected"
-    } else {
-        "Disconnected"
-    };
-    let label_style = Style::default()
-        .fg(theme.muted)
-        .bg(theme.background)
-        .add_modifier(Modifier::BOLD);
-    let value_style = Style::default().fg(theme.foreground).bg(theme.background);
-    let mut result_lines = vec![
-        Line::from(vec![
-            Span::styled("Connection  ", label_style),
-            Span::styled(connection, value_style),
-        ]),
-        Line::from(vec![
-            Span::styled("Active      ", label_style),
-            Span::styled(active_profile, value_style),
-        ]),
-        Line::from(vec![
-            Span::styled("Profiles    ", label_style),
-            Span::styled(state.profiles.len().to_string(), value_style),
-        ]),
+        .unwrap_or_else(|| "None".into());
+    let overview = [
+        ("CONNECTION", if state.connection.is_some() { "Connected".to_owned() } else { "Disconnected".to_owned() }),
+        ("ACTIVE PROFILE", active_profile),
+        ("PROFILES", state.profiles.len().to_string()),
+        ("MODE", if ui.dry_run { "Preview".to_owned() } else { "Live".to_owned() }),
     ];
-    let output = sanitize_terminal(&ui.output);
-    if !output.trim().is_empty() {
-        result_lines.push(Line::default());
-        result_lines.push(Line::styled("Output", label_style));
-        result_lines.push(Line::default());
-        result_lines.extend(output.lines().map(|line| Line::raw(line.to_owned())));
+    let overview_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 4); 4])
+        .split(overview_area);
+    for ((label, value), area) in overview.into_iter().zip(overview_columns.iter()) {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    format!(" {label}"),
+                    Style::default()
+                        .fg(theme.muted)
+                        .bg(theme.elevated)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Line::styled(
+                    format!(" {value}"),
+                    Style::default()
+                        .fg(theme.ink)
+                        .bg(theme.elevated)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])
+            .block(theme.card("")),
+            *area,
+        );
     }
-    frame.render_widget(
-        Paragraph::new(Text::from(result_lines))
-            .style(Style::default().fg(theme.foreground).bg(theme.background))
-            .scroll((ui.output_scroll, 0))
-            .wrap(Wrap { trim: false })
-            .block(theme.block("Details")),
-        result_area,
+
+    let action_width = if workspace_area.width >= 100 { 34 } else { 28 };
+    let workspace = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(action_width), Constraint::Min(36)])
+        .split(workspace_area);
+    let mut previous_category = "";
+    let actions = FeatureAction::iter()
+        .map(|action| {
+            let info = action.info();
+            let mut lines = Vec::new();
+            if previous_category != info.category {
+                previous_category = info.category;
+                lines.push(Line::styled(
+                    format!(" {}", info.category.to_ascii_uppercase()),
+                    Style::default()
+                        .fg(theme.muted)
+                        .bg(theme.elevated)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            lines.push(Line::styled(
+                format!("   {}", info.label),
+                Style::default().fg(theme.body).bg(theme.elevated),
+            ));
+            ListItem::new(lines)
+        })
+        .collect::<Vec<_>>();
+    let selected = FeatureAction::iter().position(|action| action == ui.selected);
+    let mut list_state = ListState::default().with_selected(selected);
+    frame.render_stateful_widget(
+        List::new(actions)
+            .style(Style::default().fg(theme.body).bg(theme.elevated))
+            .block(theme.card(" ACTIONS "))
+            .highlight_style(
+                Style::default()
+                    .bg(theme.accent_soft)
+                    .fg(theme.ink)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        workspace[0],
+        &mut list_state,
     );
 
     let info = ui.selected.info();
-    let input = match &ui.input {
-        Some(value) => format!("{} {}: {value}_", info.command, info.prompt),
-        None => format!("Enter: {} / {}  {}", info.category, info.label, info.prompt),
+    let eyebrow = Style::default()
+        .fg(theme.muted)
+        .bg(theme.elevated)
+        .add_modifier(Modifier::BOLD);
+    let mut result_lines = vec![
+        Line::styled("SELECTED ACTION", eyebrow),
+        Line::styled(
+            info.label,
+            Style::default()
+                .fg(theme.ink)
+                .bg(theme.elevated)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::from(vec![
+            Span::styled("Command  ", eyebrow),
+            Span::styled(
+                format!("{} {}", info.command, info.prompt).trim().to_owned(),
+                Style::default().fg(theme.body).bg(theme.elevated),
+            ),
+        ]),
+        Line::default(),
+        Line::styled("ACTIVITY", eyebrow),
+        Line::default(),
+    ];
+    let output = sanitize_terminal(&ui.output);
+    if output.trim().is_empty() {
+        result_lines.push(Line::styled(
+            "Run an action to see its result here.",
+            Style::default().fg(theme.muted).bg(theme.elevated),
+        ));
+    } else {
+        result_lines.extend(output.lines().enumerate().map(|(index, line)| {
+            if index == 0 && line.eq_ignore_ascii_case("error") {
+                Line::styled(
+                    line.to_owned(),
+                    Style::default()
+                        .fg(theme.error)
+                        .bg(theme.elevated)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Line::styled(
+                    line.to_owned(),
+                    Style::default().fg(theme.body).bg(theme.elevated),
+                )
+            }
+        }));
+    }
+    frame.render_widget(
+        Paragraph::new(Text::from(result_lines))
+            .scroll((ui.output_scroll, 0))
+            .wrap(Wrap { trim: false })
+            .block(theme.card(" DETAILS ")),
+        workspace[1],
+    );
+
+    let command = match &ui.input {
+        Some(value) => format!("{} {}  {value}_", info.command, info.prompt),
+        None if info.prompt.is_empty() => format!("Press Enter to run {}.", info.label.to_lowercase()),
+        None => format!("Press Enter to run {}  ·  {}", info.label.to_lowercase(), info.prompt),
     };
-    let input_width = action_area.width.saturating_sub(2) as usize;
+    let input_width = command_area.width.saturating_sub(2) as usize;
     let input_scroll = ui
         .input
         .as_ref()
-        .map(|_| Line::raw(input.as_str()).width().saturating_sub(input_width) as u16)
+        .map(|_| Line::raw(command.as_str()).width().saturating_sub(input_width) as u16)
         .unwrap_or(0);
     frame.render_widget(
-        Paragraph::new(input)
-            .style(Style::default().fg(theme.foreground).bg(theme.background))
+        Paragraph::new(command)
+            .style(Style::default().fg(theme.ink).bg(theme.elevated))
             .scroll((0, input_scroll))
-            .block(theme.block("Action")),
-        action_area,
+            .block(theme.card(" COMMAND ")),
+        command_area,
     );
 
     let shortcuts = if footer_area.width >= 120 {
-        "↑/↓ select  PgUp/PgDn details  p preview  Enter run  c connect  d disconnect  r reload  q quit"
+        " ↑↓ Navigate   PgUp PgDn Scroll   P Preview   Enter Run   C Connect   D Disconnect   R Reload   Q Quit"
     } else {
-        "↑/↓ select  Enter run  p preview  q quit"
+        " ↑↓ Navigate   Enter Run   P Preview   Q Quit"
     };
-    let footer = Text::from(vec![
-        Line::raw(shortcuts),
-        Line::styled(
-            sanitize_terminal(&ui.message),
-            Style::default().fg(theme.foreground),
-        ),
-    ]);
+    let footer_columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(footer_area);
+    let footer_block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(theme.hairline).bg(theme.canvas));
     frame.render_widget(
-        Paragraph::new(footer)
-            .style(Style::default().fg(theme.muted).bg(theme.background))
-            .block(theme.block("")),
-        footer_area,
+        Paragraph::new(shortcuts)
+            .style(Style::default().fg(theme.muted).bg(theme.canvas))
+            .block(footer_block.clone()),
+        footer_columns[0],
+    );
+    frame.render_widget(
+        Paragraph::new(sanitize_terminal(&ui.message))
+            .alignment(Alignment::Right)
+            .style(Style::default().fg(theme.body).bg(theme.canvas))
+            .block(footer_block),
+        footer_columns[1],
     );
 }
 
@@ -473,12 +571,13 @@ mod tests {
 
     #[test]
     fn dashboard_exposes_all_feature_groups() {
-        let snapshot = render_snapshot(&State::default(), 120, 40).unwrap();
-        assert!(snapshot.contains("AmneziaVPN TUI"));
-        assert!(snapshot.contains("Connection / Status"));
-        assert!(snapshot.contains("Profiles / List"));
-        assert!(snapshot.contains("Settings / Show"));
-        assert!(snapshot.contains("Split tunnel / List"));
+        let snapshot = render_snapshot(&State::default(), 120, 60).unwrap();
+        assert!(snapshot.contains("AmneziaVPN"));
+        assert!(snapshot.contains("CONNECTION"));
+        assert!(snapshot.contains("PROFILES"));
+        assert!(snapshot.contains("SETTINGS"));
+        assert!(snapshot.contains("SPLIT TUNNEL"));
+        assert!(!snapshot.contains("Connection / Status"));
     }
 
     #[test]
@@ -491,13 +590,23 @@ mod tests {
             .draw(|frame| render(frame, &State::default(), &UiState::default()))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        assert!(buffer.content().iter().any(|cell| cell.fg == theme.accent));
-        assert!(
-            buffer
-                .content()
-                .iter()
-                .any(|cell| cell.bg == theme.background)
-        );
+        for color in [
+            theme.canvas,
+            theme.elevated,
+            theme.ink,
+            theme.body,
+            theme.accent,
+            theme.hairline,
+            theme.muted,
+        ] {
+            assert!(
+                buffer
+                    .content()
+                    .iter()
+                    .any(|cell| cell.fg == color || cell.bg == color),
+                "missing configured color {color:?}"
+            );
+        }
     }
 
     #[test]
@@ -530,8 +639,9 @@ mod tests {
 
         let snapshot = render_snapshot_with_ui(&state, &ui, 160, 40).unwrap();
 
-        assert!(snapshot.contains("Connection  Disconnected"));
-        assert!(snapshot.contains("Active      —"));
+        assert!(snapshot.contains("Disconnected"));
+        assert!(snapshot.contains("ACTIVE PROFILE"));
+        assert!(snapshot.contains("None"));
         assert!(snapshot.contains("1. XRay        KR 027"));
         assert!(snapshot.contains("2. AmneziaWG   JP 005"));
         assert!(!snapshot.contains("internal-a"));

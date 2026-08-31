@@ -25,6 +25,9 @@
 - OpenVPN owns a fixed `amnovpn0` interface and an isolated process group; accepted profiles are self-contained and non-interactive.
 - `XRay`: the Linux-relevant XRay formats, protocols, transports, and security combinations supported by the configured upstream Amnezia client branch; support is not limited to VLESS Reality or the `raw` transport. Imported inbounds, bypass outbounds, and routing rules are not trusted: normalization retains one supported proxy outbound, installs the loopback inbound owned by the Linux runner, and forces that inbound through the retained outbound. Rejecting malformed links and unknown transport or security values that upstream may pass through is an intentional Linux safety deviation.
 - Bundled artifacts: source-built `wg`, `wg-quick`, `wireguard-go`, `awg`, `awg-quick`, `openvpn`, `tun2socks`, `amneziawg-go`, and `amnezia-xray-runner`, plus validated `geoip.dat` and `geosite.dat` data.
+- Installation: `amn init` requires root, reads only the complete bundle relative to the running executable, and installs the command under `/usr/local/bin` with its programs under `/usr/local/libexec/amn`.
+- Interface: the TUI uses a near-white canvas, near-black text, hairline cards, restrained blue focus, grouped human-readable actions, and responsive wide and narrow layouts.
+- CLI errors: an invalid command prints both the parser error and the complete command help.
 - Build inputs: branch-tracked GitHub source submodules under `thirdparty/`, upstream Conan recipes under `thirdparty/amnezia-client/recipes`, and an already configured Amnezia Conan remote; executable packages are rebuilt from source rather than deployed from remote binaries.
 - Build tools: Rust with the musl target, Go, Conan 2, a C compiler, musl tools, CMake, Ninja, and Make.
 - Runtime trust boundary: real interface changes require root, trusted root-owned executables, a controlled dependency `PATH`, and a root-owned mode-0700 runtime directory.

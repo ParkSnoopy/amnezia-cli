@@ -13,6 +13,8 @@ use strum::EnumIter;
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Install amn and its bundled programs under /usr/local (requires root)
+    Init,
     Status,
     Connect {
         profile: Option<usize>,
@@ -152,6 +154,7 @@ pub enum FeatureAction {
     LogsExport,
     LogsClear,
     Doctor,
+    Init,
 }
 
 impl TuiAction for FeatureAction {
@@ -224,6 +227,7 @@ impl TuiAction for FeatureAction {
             Self::LogsExport => ActionInfo::new("Logs", "Export", "logs export", "<DESTINATION>"),
             Self::LogsClear => ActionInfo::new("Logs", "Clear", "logs clear", ""),
             Self::Doctor => ActionInfo::new("Diagnostics", "Doctor", "doctor", ""),
+            Self::Init => ActionInfo::new("System", "Install", "init", ""),
         }
     }
 
