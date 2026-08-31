@@ -325,7 +325,7 @@ fn backup_command(store: &Store, state: &mut State, command: BackupCommand) -> R
             if state.connection.is_some() {
                 bail!("disconnect VPN before restoring a backup");
             }
-            *state = store.restore(&source)?;
+            *state = store.restore(state, &source)?;
             Ok(())
         }
     }

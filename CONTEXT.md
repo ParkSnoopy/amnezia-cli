@@ -37,5 +37,6 @@
 - Fail fast when required build tools, recipes, Conan configuration, artifacts, runtime dependencies, or backends are missing.
 - Reject executable profile hooks and mutable `SaveConfig` behavior before privileged execution.
 - Persist private state, profiles, backups, logs, and staged configurations with owner-only permissions where supported.
+- Treat backup restore as an interoperable partial update: accept upstream AmneziaVPN settings keys without an `amn` envelope, apply only supplied settings, and preserve unrelated local state.
 - Never import a profile as connectable unless its protocol-specific configuration validates; never report an incomplete connection as connected or protected.
 - Keep README.md end-user focused. Maintain project vocabulary in `CONTEXT.md` and release criteria in `RELEASE_GATE.md`; do not add `CHANGELOG.md`.

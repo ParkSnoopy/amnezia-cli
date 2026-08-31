@@ -84,4 +84,6 @@ amn logs export ~/amnezia-connection.log
 amn logs clear
 ```
 
+Restore accepts both `amn` backups and partial AmneziaVPN settings backups. Supplied server lists and supported settings are imported into the current configuration; unrelated settings and existing profiles are preserved.
+
 Run `amn doctor` to check the runtime tools required by every imported profile.

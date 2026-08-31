@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::core::model::{
     Profile,
     Protocol,
+    RouteMode,
     State,
 };
 
@@ -33,9 +34,15 @@ const MAX_BACKUP_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct BackupFile {
+    #[serde(default = "backup_format_version")]
     format_version: u32,
     state: State,
+    #[serde(default)]
     profiles: BTreeMap<String, String>,
+}
+
+const fn backup_format_version() -> u32 {
+    1
 }
 
 pub struct Store {
@@ -271,7 +278,7 @@ impl Store {
             .with_context(|| format!("write backup {}", destination.display()))
     }
 
-    pub fn restore(&self, source: &Path) -> Result<State> {
+    pub fn restore(&self, current: &State, source: &Path) -> Result<State> {
         if fs::metadata(source)
             .with_context(|| format!("inspect backup {}", source.display()))?
             .len()
@@ -282,6 +289,9 @@ impl Store {
         let data = fs::read(source).with_context(|| format!("read backup {}", source.display()))?;
         let mut document: serde_json::Value =
             serde_json::from_slice(&data).context("invalid backup")?;
+        if is_amnezia_settings_backup(&document) {
+            return self.restore_amnezia_settings(current, &document);
+        }
         if let Some(state) = document.get_mut("state") {
             migrate_removed_features(state);
         }
@@ -375,6 +385,101 @@ impl Store {
         Ok(state)
     }
 
+    fn restore_amnezia_settings(
+        &self,
+        current: &State,
+        document: &serde_json::Value,
+    ) -> Result<State> {
+        let object = document
+            .as_object()
+            .context("Amnezia backup must be a JSON object")?;
+        let mut updated = current.clone();
+        update_amnezia_settings(&mut updated, object)?;
+
+        let mut configurations = Vec::new();
+        let mut default_configuration = None;
+        if let Some(value) = object.get("Servers/serversList") {
+            let servers = amnezia_server_list(value)?;
+            let default_server = object
+                .get("Servers/defaultServerIndex")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok());
+            for (server_index, server) in servers.iter().enumerate() {
+                let name = server
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("VPN");
+                let Ok(extracted) = extract_amnezia_protocols(server) else {
+                    continue;
+                };
+                let multiple = extracted.len() > 1;
+                for (text, protocol) in extracted {
+                    reject_executable_directives(&text, &protocol)
+                        .and_then(|_| validate_protocol_configuration(&text, &protocol))
+                        .with_context(|| format!("{protocol} configuration is unusable"))?;
+                    if text.len() > MAX_PROFILE_BYTES {
+                        bail!("backup profile exceeds the 16 MiB size limit");
+                    }
+                    let profile_name = if multiple {
+                        format!("{name} {protocol}")
+                    } else {
+                        name.to_owned()
+                    };
+                    if default_server == Some(server_index) && default_configuration.is_none() {
+                        default_configuration = Some(configurations.len());
+                    }
+                    configurations.push((profile_name, text, protocol));
+                }
+            }
+            if !servers.is_empty() && configurations.is_empty() {
+                bail!("Amnezia backup contains no supported VPN protocol configuration");
+            }
+        }
+
+        let mut written = Vec::new();
+        for (name, text, protocol) in configurations {
+            let id = Uuid::new_v4().simple().to_string();
+            let file_stem = if matches!(protocol, Protocol::WireGuard | Protocol::AmneziaWg) {
+                format!("amn{}", id.chars().take(11).collect::<String>())
+            } else {
+                id.clone()
+            };
+            let destination = self
+                .root
+                .join("profiles")
+                .join(format!("{file_stem}.{}", profile_extension(&protocol)));
+            if let Err(error) = write_private(&destination, text.as_bytes()) {
+                for path in written {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(error).context("backup import rolled back");
+            }
+            written.push(destination.clone());
+            updated.profiles.insert(
+                id.clone(),
+                Profile {
+                    id: id.clone(),
+                    name,
+                    protocol,
+                    source: destination.to_string_lossy().into_owned(),
+                    enabled: true,
+                },
+            );
+            if default_configuration == Some(written.len() - 1) {
+                updated.default_profile = Some(id);
+            }
+        }
+        updated.connection = None;
+        if let Err(error) = self.validate_state(&updated).and_then(|_| self.save(&updated)) {
+            for path in written {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error).context("backup import rolled back");
+        }
+        Ok(updated)
+    }
+
     fn validate_state(&self, state: &State) -> Result<()> {
         if let Some(id) = &state.default_profile
             && !state.profiles.contains_key(id)
@@ -436,6 +541,129 @@ impl Store {
         }
         Ok(())
     }
+}
+
+fn is_amnezia_settings_backup(document: &serde_json::Value) -> bool {
+    document.as_object().is_some_and(|object| {
+        object
+            .keys()
+            .any(|key| key.starts_with("Servers/") || key.starts_with("Conf/"))
+    })
+}
+
+fn amnezia_server_list(value: &serde_json::Value) -> Result<Vec<serde_json::Value>> {
+    let parsed;
+    let value = if let Some(text) = value.as_str() {
+        parsed = serde_json::from_str::<serde_json::Value>(text)
+            .context("Servers/serversList is not valid JSON")?;
+        &parsed
+    } else {
+        value
+    };
+    value
+        .as_array()
+        .cloned()
+        .context("Servers/serversList must be an array or a JSON-encoded array")
+}
+
+fn backup_bool(value: &serde_json::Value) -> Option<bool> {
+    value.as_bool().or_else(|| {
+        value
+            .as_str()
+            .and_then(|value| value.parse::<bool>().ok())
+    })
+}
+
+fn backup_routes(value: &serde_json::Value) -> Result<Vec<String>> {
+    let values = match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>(),
+        serde_json::Value::Object(values) => values
+            .iter()
+            .filter_map(|(key, value)| {
+                let value = value.as_str().unwrap_or_default();
+                crate::core::routing::Network::parse(key)
+                    .is_ok()
+                    .then(|| key.clone())
+                    .or_else(|| {
+                        crate::core::routing::Network::parse(value)
+                            .is_ok()
+                            .then(|| value.to_owned())
+                    })
+            })
+            .collect::<Vec<_>>(),
+        _ => bail!("split-tunnel backup setting must be an object or array"),
+    };
+    for route in &values {
+        crate::core::routing::Network::parse(route)
+            .with_context(|| format!("invalid split-tunnel route in backup: {route}"))?;
+    }
+    Ok(values)
+}
+
+fn update_amnezia_settings(
+    state: &mut State,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<()> {
+    if let Some(value) = object.get("Conf/saveLogs") {
+        state.settings.logging = backup_bool(value).context("Conf/saveLogs must be true or false")?;
+    }
+    if let Some(value) = object.get("Conf/routeMode") {
+        state.settings.route_mode = match value.as_u64() {
+            Some(0) => RouteMode::All,
+            Some(1) => RouteMode::OnlyListed,
+            Some(2) => RouteMode::ExceptListed,
+            _ => bail!("Conf/routeMode must be 0, 1, or 2"),
+        };
+    }
+    if object
+        .get("Conf/sitesSplitTunnelingEnabled")
+        .and_then(backup_bool)
+        == Some(false)
+    {
+        state.settings.route_mode = RouteMode::All;
+    }
+    let routes_key = match state.settings.route_mode {
+        RouteMode::OnlyListed => Some("Conf/ForwardSites"),
+        RouteMode::ExceptListed => Some("Conf/ExceptSites"),
+        RouteMode::All => None,
+    };
+    if let Some(value) = routes_key.and_then(|key| object.get(key)) {
+        state.settings.split_routes = backup_routes(value)?;
+    }
+
+    let primary = object.get("Conf/primaryDns");
+    let secondary = object.get("Conf/secondaryDns");
+    if primary.is_some() || secondary.is_some() {
+        let mut servers = state.settings.dns_servers.clone();
+        servers.resize(2, String::new());
+        if let Some(value) = primary {
+            servers[0] = value
+                .as_str()
+                .context("Conf/primaryDns must be an IP address")?
+                .to_owned();
+        }
+        if let Some(value) = secondary {
+            servers[1] = value
+                .as_str()
+                .context("Conf/secondaryDns must be an IP address")?
+                .to_owned();
+        }
+        servers.retain(|value| !value.is_empty());
+        for server in &servers {
+            server
+                .parse::<std::net::IpAddr>()
+                .with_context(|| format!("invalid DNS server in backup: {server}"))?;
+        }
+        if servers.is_empty() {
+            bail!("backup DNS settings contain no IP address");
+        }
+        state.settings.dns_servers = servers;
+    }
+    Ok(())
 }
 
 fn migrate_removed_features(document: &mut serde_json::Value) -> (bool, Vec<String>) {
@@ -949,6 +1177,60 @@ mod tests {
         assert_eq!(configurations.len(), 2);
         assert_eq!(configurations[0].1, Protocol::AmneziaWg);
         assert_eq!(configurations[1].1, Protocol::OpenVpn);
+    }
+
+    #[test]
+    fn restores_server_list_without_native_backup_envelope() {
+        let root = std::env::temp_dir().join(format!(
+            "amn-backup-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        create_private_directory(&root).unwrap();
+        create_private_directory(&root.join("profiles")).unwrap();
+        let source = root.join("external.backup");
+        let servers = serde_json::json!([{
+            "description": "Imported",
+            "defaultContainer": "amnezia-openvpn",
+            "containers": [{
+                "container": "amnezia-openvpn",
+                "openvpn": {
+                    "last_config": "{\"config\":\"client\\nremote vpn.example 1194\"}"
+                }
+            }]
+        }]);
+        let document = serde_json::json!({
+            "Servers/serversList": servers.to_string()
+        });
+        fs::write(&source, serde_json::to_vec(&document).unwrap()).unwrap();
+        let store = Store { root: root.clone() };
+        let mut current = State::default();
+        current.settings.logging = false;
+
+        let restored = store.restore(&current, &source).unwrap();
+
+        assert_eq!(restored.profiles.len(), 1);
+        assert_eq!(restored.profiles.values().next().unwrap().name, "Imported");
+        assert!(!restored.settings.logging);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_amnezia_settings_update_only_supplied_fields() {
+        let mut state = State::default();
+        state.settings.route_mode = RouteMode::ExceptListed;
+        state.settings.split_routes = vec!["10.0.0.0/8".into()];
+        state.settings.dns_servers = vec!["9.9.9.9".into(), "149.112.112.112".into()];
+        let document = serde_json::json!({"Conf/saveLogs": false});
+
+        update_amnezia_settings(&mut state, document.as_object().unwrap()).unwrap();
+
+        assert!(!state.settings.logging);
+        assert_eq!(state.settings.route_mode, RouteMode::ExceptListed);
+        assert_eq!(state.settings.split_routes, ["10.0.0.0/8"]);
+        assert_eq!(
+            state.settings.dns_servers,
+            ["9.9.9.9", "149.112.112.112"]
+        );
     }
 
     #[test]
