@@ -3,6 +3,7 @@ use std::{
     ffi::OsStr,
     fs,
     io::Read,
+    os::unix::{ffi::OsStrExt, fs::PermissionsExt},
     path::{
         Path,
         PathBuf,
@@ -111,6 +112,19 @@ impl RecipeInput {
 
 const AMNEZIA_REMOTE: &str =
     "https://artifactory.amnezia.org/artifactory/api/conan/client-prebuilts";
+const BUNDLE_ARTIFACTS: &[&str] = &[
+    "wg",
+    "wg-quick",
+    "wireguard-go",
+    "awg",
+    "awg-quick",
+    "openvpn",
+    "tun2socks",
+    "amneziawg-go",
+    "amnezia-xray-runner",
+    "geoip.dat",
+    "geosite.dat",
+];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -135,6 +149,15 @@ fn main() {
     {
         panic!("recipe bundle currently supports only native Linux x86_64 builds");
     }
+    let profile = profile_directory();
+    let bundle = profile.join("libexec").join("amn");
+    let cache = profile.join(".amn-bundle-cache");
+    let source_fingerprint = source_fingerprint(&manifest);
+    if cached_bundle_is_current(&bundle, &cache, source_fingerprint) {
+        return;
+    }
+    let _ = fs::remove_file(&cache);
+
     let conan = require_program("conan", "Conan 2");
     let _compiler = require_program("cc", "C compiler");
     let _cmake = require_program("cmake", "CMake");
@@ -195,7 +218,6 @@ fn main() {
     ];
     run_os(&conan, &install_arguments, &manifest);
 
-    let bundle = profile_directory().join("libexec").join("amn");
     if bundle.exists() {
         fs::remove_dir_all(&bundle).unwrap_or_else(|error| {
             panic!("remove stale bundle {}: {error}", bundle.display());
@@ -287,6 +309,7 @@ fn main() {
         &conan_output.join("wireguard-go"),
         &bundle,
     );
+    write_bundle_cache(&bundle, &cache, source_fingerprint);
 }
 
 fn build_wireguard_go(go: &Path, source: &Path, build: &Path, bundle: &Path) {
@@ -539,6 +562,127 @@ fn validate_artifact(path: &Path, executable: bool) {
                 path.display()
             );
         }
+    }
+}
+
+fn source_fingerprint(manifest: &Path) -> u64 {
+    let mut fingerprint = Fingerprint::new();
+    fingerprint.update(required_env("TARGET").as_bytes());
+    fingerprint.update(required_env("HOST").as_bytes());
+    for input in [
+        "build.rs",
+        "src/core/amnezia_xray_runner.rs",
+        "thirdparty/amnezia-client/recipes",
+        "thirdparty/wireguard-tools/src",
+        "thirdparty/amneziawg-tools/src",
+        "thirdparty/wireguard-go",
+    ] {
+        fingerprint.update(input.as_bytes());
+        fingerprint_path(&manifest.join(input), &manifest.join(input), &mut fingerprint);
+    }
+    fingerprint.finish()
+}
+
+fn cached_bundle_is_current(bundle: &Path, cache: &Path, source_fingerprint: u64) -> bool {
+    if !BUNDLE_ARTIFACTS.iter().all(|artifact| {
+        fs::symlink_metadata(bundle.join(artifact))
+            .map(|metadata| metadata.is_file() && metadata.len() > 0)
+            .unwrap_or(false)
+    }) {
+        return false;
+    }
+    let cache = match fs::read_to_string(cache) {
+        Ok(cache) => cache,
+        Err(_) => return false,
+    };
+    let expected = format!(
+        "source={source_fingerprint:016x}\nbundle={:016x}\n",
+        bundle_fingerprint(bundle)
+    );
+    cache == expected
+}
+
+fn write_bundle_cache(bundle: &Path, cache: &Path, source_fingerprint: u64) {
+    let contents = format!(
+        "source={source_fingerprint:016x}\nbundle={:016x}\n",
+        bundle_fingerprint(bundle)
+    );
+    fs::write(cache, contents)
+        .unwrap_or_else(|error| panic!("write bundle cache {}: {error}", cache.display()));
+}
+
+fn bundle_fingerprint(bundle: &Path) -> u64 {
+    let mut fingerprint = Fingerprint::new();
+    fingerprint_path(bundle, bundle, &mut fingerprint);
+    fingerprint.finish()
+}
+
+fn fingerprint_path(root: &Path, path: &Path, fingerprint: &mut Fingerprint) {
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or_else(|_| panic!("fingerprint path is outside its root: {}", path.display()));
+    fingerprint.update(relative.as_os_str().as_bytes());
+    let metadata = fs::symlink_metadata(path)
+        .unwrap_or_else(|error| panic!("inspect build input {}: {error}", path.display()));
+    fingerprint.update(&metadata.permissions().mode().to_le_bytes());
+    if metadata.is_dir() {
+        fingerprint.update(b"directory");
+        let mut entries = fs::read_dir(path)
+            .unwrap_or_else(|error| panic!("read build input {}: {error}", path.display()))
+            .map(|entry| {
+                entry.unwrap_or_else(|error| panic!("read {} entry: {error}", path.display()))
+            })
+            .filter(|entry| entry.file_name() != OsStr::new(".git"))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            fingerprint_path(root, &entry.path(), fingerprint);
+        }
+    } else if metadata.is_file() {
+        fingerprint.update(b"file");
+        let mut file = fs::File::open(path)
+            .unwrap_or_else(|error| panic!("open build input {}: {error}", path.display()));
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .unwrap_or_else(|error| panic!("read build input {}: {error}", path.display()));
+            if read == 0 {
+                break;
+            }
+            fingerprint.update(&buffer[..read]);
+        }
+    } else if metadata.file_type().is_symlink() {
+        fingerprint.update(b"symlink");
+        let target = fs::read_link(path)
+            .unwrap_or_else(|error| panic!("read build input link {}: {error}", path.display()));
+        fingerprint.update(target.as_os_str().as_bytes());
+    } else {
+        panic!("unsupported build input type: {}", path.display());
+    }
+}
+
+struct Fingerprint(u64);
+
+impl Fingerprint {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+
+    fn new() -> Self {
+        Self(Self::OFFSET)
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+        self.0 ^= 0xff;
+        self.0 = self.0.wrapping_mul(Self::PRIME);
+    }
+
+    fn finish(self) -> u64 {
+        self.0
     }
 }
 

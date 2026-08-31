@@ -10,6 +10,7 @@ A release is ready only when every applicable gate below passes against the curr
 - `init` refuses non-root execution and transactionally replaces `/usr/local/bin/amn` and `/usr/local/libexec/amn` from the running executable's adjacent bundle.
 - Invalid CLI commands show complete help, and wide plus narrow TUI captures retain readable actions, activity, errors, and command input.
 - Cargo `build.rs` owns client bundle construction.
+- An unchanged complete helper bundle is reused; source changes and missing, added, or modified cached artifacts invalidate it and require a source rebuild.
 - New dependencies are documented; existing dependency version changes require explicit approval.
 
 ## Build prerequisites
