@@ -28,7 +28,7 @@
 - DNS lifecycle: XRay, WireGuard, and AmneziaWG use the bundled `amn-dns` helper. It records the exact resolver target, mode, previous contents, and applied contents under protected runtime state, atomically applies DNS, restores only when ownership still matches, and retains recovery state instead of overwriting an external resolver change.
 - Bundle cache: Cargo `build.rs` reuses the complete locally built helper bundle only when both its source inputs and every cached artifact still match their recorded content fingerprints; changed, missing, or partial bundles are rebuilt from source.
 - Installation: `amn init` requires root, reads only the complete bundle relative to the running executable, and installs the command under `/usr/local/bin` with its programs under `/usr/local/libexec/amn`.
-- Interface: the TUI uses a dark canvas, light text, hairline cards, restrained blue focus, grouped human-readable actions, and responsive wide and narrow layouts.
+- Interface: the TUI uses a dark canvas, light text, hairline cards, restrained blue focus, grouped human-readable actions, and responsive wide and narrow layouts. Actions that need values use typed popups or selectable lists rather than command-text entry; structured output is rendered as hierarchical entries.
 - CLI errors: an invalid command prints both the parser error and the complete command help.
 - Build inputs: branch-tracked GitHub source submodules under `thirdparty/`, upstream Conan recipes under `thirdparty/amnezia-client/recipes`, and an already configured Amnezia Conan remote; executable packages are rebuilt from source rather than deployed from remote binaries.
 - Build tools: Rust with the musl target, Go, Conan 2, a C compiler, musl tools, CMake, Ninja, and Make.

@@ -601,24 +601,13 @@ fn cleanup_xray_routes(
     Ok(())
 }
 
-fn retain_xray_recovery(
-    store: &Store,
-    state: &mut State,
+fn partial_xray_recovery(
+    state: &State,
     profile_id: &str,
     prepared: &PreparedXray,
     pid: u32,
     interface: &str,
-) -> Result<()> {
-    let owner = uuid::Uuid::new_v4().to_string();
-    let status = Command::new(&prepared.ip)
-        .args(["link", "set", "dev", interface, "alias", &owner])
-        .env("PATH", &prepared.path)
-        .status()
-        .context("mark XRay recovery interface ownership")?;
-    if !status.success() {
-        bail!("mark XRay recovery interface ownership exited with {status}");
-    }
-    let index = interface_index(interface)?;
+) -> State {
     let mut recovery = state.clone();
     recovery.connection = Some(Connection {
         profile_id: profile_id.to_owned(),
@@ -626,20 +615,16 @@ fn retain_xray_recovery(
         pid: Some(pid),
         process_start_ticks: process_start_ticks(pid),
         interface: Some(interface.to_owned()),
-        interface_index: Some(index),
-        interface_owner: Some(owner),
+        interface_index: None,
+        interface_owner: None,
         runtime_directory: None,
         xray_route: Some(XrayRouteIdentity {
-            endpoint: prepared.endpoint.to_string(),
+            endpoint: prepared.endpoint.clone(),
             gateway: prepared.gateway.clone(),
             uplink: prepared.uplink.clone(),
         }),
     });
-    *state = recovery.clone();
-    store
-        .save(&recovery)
-        .context("persist XRay recovery ownership")?;
-    Ok(())
+    recovery
 }
 
 fn rollback_or_retain_xray(
@@ -654,20 +639,24 @@ fn rollback_or_retain_xray(
     match rollback_xray_connect(prepared, pid, interface, rollback, None) {
         Ok(()) => Ok(()),
         Err(rollback_error) => {
-            if let Err(retain_error) = retain_xray_recovery(
-                store,
-                state,
-                profile_id,
-                prepared,
-                pid,
-                interface,
-            ) {
-                return Err(retain_error).context(format!(
-                    "XRay rollback failed and exact recovery ownership could not be persisted; it remains available in memory: {rollback_error:#}"
-                ));
+            let interface_disappeared = rollback.is_empty()
+                && Command::new(&prepared.ip)
+                    .args(["link", "show", "dev", interface])
+                    .env("PATH", &prepared.path)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .is_ok_and(|status| !status.success())
+                && !Path::new("/sys/class/net").join(interface).exists();
+            if interface_disappeared && stop_xray_worker(prepared, pid).is_ok() {
+                return Ok(());
             }
+            *state = partial_xray_recovery(state, profile_id, prepared, pid, interface);
+            store.save(state).context(format!(
+                "persist partial XRay recovery facts after rollback failed; recovery remains available in memory: {rollback_error:#}"
+            ))?;
             Err(anyhow!(
-                "XRay rollback failed; recovery ownership was retained: {rollback_error:#}"
+                "XRay rollback failed; known recovery facts were retained without claiming interface ownership: {rollback_error:#}"
             ))
         }
     }

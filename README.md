@@ -54,15 +54,16 @@ Before changing the network, `amn` validates the managed profile, root privilege
 
 ## AmneziaVPN TUI
 
-Use `↑` and `↓` to select connection, profile, settings, split-tunnel, backup, log, or diagnostic actions. Press `Enter`, provide the requested values inside the TUI, then press `Enter` again to run the action.
+Use `↑` and `↓` to select connection, profile, settings, split-tunnel, backup, log, or diagnostic actions. Press `Enter` to open the action's popup or selectable list. Profile choices use the displayed profile number and settings use value-specific editors; DNS servers are entered one address per line and validated before saving.
 
 - `PgUp` or `PgDn`: scroll action results
+- `Ins` or `Del`: add or remove a row in a multi-value editor
 - `c`: connect the default profile
 - `d`: disconnect
 - `r`: reload saved state
 - `q` or `Esc`: quit
 
-The TUI exposes the same operations as the command-line interface.
+The TUI exposes the same operations as the command-line interface. Structured results are shown as indented entries instead of raw JSON.
 
 ## Routing
 

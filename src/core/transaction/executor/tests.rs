@@ -144,6 +144,48 @@ mod tests {
     }
 
     #[test]
+    fn failed_pre_identity_xray_rollback_retains_known_recovery_facts() {
+        let prepared = PreparedXray {
+            configuration: String::new(),
+            endpoint: "192.0.2.1".into(),
+            endpoint_port: 443,
+            requires_tcp_endpoint: true,
+            gateway: "192.0.2.254".into(),
+            uplink: "eth0".into(),
+            executable: "/bundle/xray".into(),
+            tun2socks: "/bundle/tun2socks".into(),
+            setsid: "/usr/bin/setsid".into(),
+            kill: "/usr/bin/kill".into(),
+            ip: "/usr/bin/ip".into(),
+            dns_helper: "/bundle/amn-dns".into(),
+            path: "/usr/bin".into(),
+            route_mode: crate::core::model::RouteMode::All,
+            split_routes: Vec::new(),
+            dns_servers: vec!["1.1.1.1".parse().unwrap()],
+        };
+
+        let retained = partial_xray_recovery(
+            &State::default(),
+            "profile-a",
+            &prepared,
+            u32::MAX,
+            "amnxray0",
+        );
+        let connection = retained.connection.unwrap();
+
+        assert!(connection.recovery_required);
+        assert_eq!(connection.profile_id, "profile-a");
+        assert_eq!(connection.pid, Some(u32::MAX));
+        assert_eq!(connection.interface.as_deref(), Some("amnxray0"));
+        assert!(connection.interface_index.is_none());
+        assert!(connection.interface_owner.is_none());
+        assert_eq!(
+            connection.xray_route.as_ref().map(|route| route.endpoint.as_str()),
+            Some("192.0.2.1")
+        );
+    }
+
+    #[test]
     fn process_identity_uses_kernel_start_ticks() {
         let pid = std::process::id();
         let ticks = process_start_ticks(pid).expect("current process has start ticks");
