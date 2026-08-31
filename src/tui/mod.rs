@@ -80,15 +80,15 @@ struct Theme {
 impl Theme {
     const fn active() -> Self {
         Self {
-            canvas: Color::Rgb(250, 250, 250),
-            elevated: Color::Rgb(255, 255, 255),
-            ink: Color::Rgb(23, 23, 23),
-            body: Color::Rgb(77, 77, 77),
+            canvas: Color::Rgb(0, 0, 0),
+            elevated: Color::Rgb(17, 17, 17),
+            ink: Color::Rgb(237, 237, 237),
+            body: Color::Rgb(161, 161, 161),
             accent: Color::Rgb(0, 112, 243),
-            accent_soft: Color::Rgb(211, 229, 255),
-            hairline: Color::Rgb(235, 235, 235),
-            muted: Color::Rgb(143, 143, 143),
-            error: Color::Rgb(238, 0, 0),
+            accent_soft: Color::Rgb(16, 42, 67),
+            hairline: Color::Rgb(51, 51, 51),
+            muted: Color::Rgb(102, 102, 102),
+            error: Color::Rgb(255, 26, 26),
         }
     }
 
@@ -581,9 +581,14 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_applies_configured_colors() {
+    fn dashboard_uses_configured_dark_colors() {
         use ratatui::backend::TestBackend;
         let theme = Theme::active();
+        let brightness = |color| match color {
+            Color::Rgb(red, green, blue) => u16::from(red) + u16::from(green) + u16::from(blue),
+            _ => panic!("theme color is not RGB"),
+        };
+        assert!(brightness(theme.canvas) < brightness(theme.ink));
         let backend = TestBackend::new(120, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
