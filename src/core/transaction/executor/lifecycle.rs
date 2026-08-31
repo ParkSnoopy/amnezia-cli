@@ -873,6 +873,11 @@ fn create_private_log(path: &Path) -> Result<std::fs::File> {
 fn resolve_network_program(program: &str) -> Result<PathBuf> {
     let candidates = if Path::new(program).is_absolute() {
         vec![PathBuf::from(program)]
+    } else if is_bundled_network_program(program) {
+        bundled_program_directories()
+            .into_iter()
+            .map(|directory| directory.join(program))
+            .collect()
     } else {
         network_program_directories()
             .into_iter()
@@ -884,14 +889,44 @@ fn resolve_network_program(program: &str) -> Result<PathBuf> {
     })
 }
 
+fn is_bundled_network_program(program: &str) -> bool {
+    matches!(
+        program,
+        "wg"
+            | "wg-quick"
+            | "wireguard-go"
+            | "awg"
+            | "awg-quick"
+            | "amneziawg-go"
+            | "openvpn"
+            | "tun2socks"
+            | "amnezia-xray-runner"
+    )
+}
+
+fn bundled_program_directories() -> Vec<PathBuf> {
+    let Ok(executable) = std::env::current_exe() else {
+        return Vec::new();
+    };
+    executable_relative_program_directories(&executable)
+        .into_iter()
+        .filter_map(|directory| fs::canonicalize(directory).ok())
+        .filter(|directory| is_trusted_network_path(directory))
+        .collect()
+}
+
+fn executable_relative_program_directories(executable: &Path) -> Vec<PathBuf> {
+    let Some(directory) = executable.parent() else {
+        return Vec::new();
+    };
+    vec![
+        directory.join("libexec").join("amn"),
+        directory.join("..").join("libexec").join("amn"),
+    ]
+}
+
 fn network_program_directories() -> Vec<PathBuf> {
-    let mut directories = Vec::new();
-    if let Ok(executable) = std::env::current_exe()
-        && let Some(directory) = executable.parent()
-    {
-        directories.push(directory.join("libexec").join("amn"));
-        directories.push(directory.join("..").join("libexec").join("amn"));
-    }
+    let mut directories = bundled_program_directories();
     directories.extend(
         [
             "/usr/local/sbin",

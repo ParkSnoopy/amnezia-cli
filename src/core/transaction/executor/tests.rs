@@ -213,4 +213,18 @@ mod tests {
         assert_eq!(arguments.first().map(String::as_str), Some("up"));
         assert_eq!(arguments.last().map(String::as_str), Some("/vpn/amn0.conf"));
     }
+
+    #[test]
+    fn bundled_programs_are_resolved_relative_to_the_running_binary() {
+        assert_eq!(
+            executable_relative_program_directories(Path::new("/opt/amn/amn")),
+            vec![
+                PathBuf::from("/opt/amn/libexec/amn"),
+                PathBuf::from("/opt/amn/../libexec/amn"),
+            ]
+        );
+        assert!(is_bundled_network_program("wireguard-go"));
+        assert!(is_bundled_network_program("amnezia-xray-runner"));
+        assert!(!is_bundled_network_program("ip"));
+    }
 }
