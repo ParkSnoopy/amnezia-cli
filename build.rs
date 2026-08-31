@@ -461,12 +461,21 @@ fn build_quick_tools(
     let quick = build.join("wg-quick/linux.bash");
     require_file(&quick);
     let destination = bundle.join(quick_program);
-    stage_quick_dns_helper(&quick, &destination);
+    stage_quick_dns_helper(&quick, &destination, quick_program == "awg-quick");
     make_executable(&destination);
 }
 
-fn stage_quick_dns_helper(source: &Path, destination: &Path) {
+fn stage_quick_dns_helper(source: &Path, destination: &Path, allow_forced_userspace: bool) {
     const INSERTION: &str = "# ~~ function override insertion point ~~";
+    const ADD_IF_START: &str = "add_if() {\n\tlocal ret\n";
+    const FORCED_ADD_IF_START: &str = r#"add_if() {
+	local ret
+	if [[ ${AMN_QUICK_FORCE_USERSPACE:-0} == 1 ]]; then
+		[[ -n ${WG_QUICK_USERSPACE_IMPLEMENTATION:-} ]] || die "userspace backend is not configured"
+		cmd "$WG_QUICK_USERSPACE_IMPLEMENTATION" "$INTERFACE"
+		return
+	fi
+"#;
     const OVERRIDES: &str = r#"set_dns() {
     [[ ${#DNS[@]} -gt 0 || ${#DNS_SEARCH[@]} -gt 0 ]] || return 0
     cmd amn-dns set "$INTERFACE" "${DNS[@]}" --search "${DNS_SEARCH[@]}"
@@ -480,12 +489,18 @@ unset_dns() {
 "#;
     let script = fs::read_to_string(source)
         .unwrap_or_else(|error| panic!("read quick tool {}: {error}", source.display()));
-    if script.matches(INSERTION).count() != 1 || script.matches("unset_dns || true").count() != 1 {
+    if script.matches(INSERTION).count() != 1
+        || (allow_forced_userspace && script.matches(ADD_IF_START).count() != 1)
+        || script.matches("unset_dns || true").count() != 1
+    {
         panic!("quick tool DNS integration point changed: {}", source.display());
     }
-    let script = script
+    let mut script = script
         .replace(INSERTION, OVERRIDES)
         .replace("unset_dns || true", "unset_dns");
+    if allow_forced_userspace {
+        script = script.replace(ADD_IF_START, FORCED_ADD_IF_START);
+    }
     fs::write(destination, script).unwrap_or_else(|error| {
         panic!(
             "write DNS-integrated quick tool {}: {error}",

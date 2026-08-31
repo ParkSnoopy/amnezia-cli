@@ -48,7 +48,7 @@ amn --dry-run connect
 
 OpenVPN profiles must be self-contained. Inline certificates and credentials are accepted; executable hooks, external credential files, background process directives, and interactive challenges are rejected.
 
-XRay profiles are normalized to a loopback-only SOCKS inbound. AmneziaWG and WireGuard require their matching quick-script and control tools. All connections require trusted `ip`, `setsid`, and process-control tools where applicable.
+XRay profiles are normalized to a loopback-only SOCKS inbound. AmneziaWG and WireGuard require their matching quick-script and control tools. GUI-exported AmneziaWG 2 profiles automatically use the bundled compatible userspace backend instead of an installed kernel module with unknown feature compatibility. All connections require trusted `ip`, `setsid`, and process-control tools where applicable.
 
 Before changing the network, `amn` validates the managed profile, root privileges, protocol programs, its bundled DNS helper, conditional firewall helpers, and kernel or userspace backends. Private profiles, state, backups, runtime configurations, and logs use owner-only permissions where supported.
 

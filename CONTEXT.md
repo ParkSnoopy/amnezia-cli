@@ -16,7 +16,7 @@
 - `rollback`: the opposite action attached to every supported network mutation plan. AmneziaWG/WireGuard use interface ownership evidence; XRay records and reverses each route, address, link, and worker-process mutation; OpenVPN owns an isolated process group and private runtime material.
 - `Amnezia bundle`: a `vpn://` connection key or JSON full-access bundle. Import selects the preferred supported container and stores only its normalized native protocol profile; it is not retained as a fake protocol.
 - `ownership`: exact equality between the selected profile's peer public-key set and the live interface peer set; interface-name existence alone is not ownership.
-- `dependency preflight`: resolution and validation of all command-line tools, conditional DNS/firewall helpers, privilege requirements, and kernel or userspace backend requirements before a network mutation begins.
+- `dependency preflight`: resolution and validation of all command-line tools, conditional DNS/firewall helpers, privilege requirements, and kernel or userspace backend requirements before a network mutation begins. AmneziaWG 2 fields select the bundled source-matched userspace backend because the presence of an installed `amneziawg` module does not prove support for that configuration generation.
 - `static frontend`: the `x86_64-unknown-linux-musl` `amn` executable; the DNS helper is also a static musl executable and the native Go XRay runner is a static Linux executable, while other bundled upstream helpers retain their audited linkage requirements.
 
 ## Project Concepts

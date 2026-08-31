@@ -89,6 +89,14 @@ mod tests {
     }
 
     #[test]
+    fn amneziawg_v3_profiles_require_bundled_userspace_backend() {
+        let awg_v3 = include_str!("../../../../test/amneziawg-v3.conf");
+        assert!(requires_amneziawg_userspace(awg_v3));
+        let awg_legacy = include_str!("../../../../test/amneziawg-legacy.conf");
+        assert!(!requires_amneziawg_userspace(awg_legacy));
+    }
+
+    #[test]
     fn exited_processes_do_not_keep_process_groups_alive() {
         let stat = fs::read_to_string(format!("/proc/{}/stat", std::process::id())).unwrap();
         let (state, group, start_ticks) = process_stat_identity(&stat).unwrap();
@@ -301,6 +309,7 @@ mod tests {
                 "WG_QUICK_USERSPACE_IMPLEMENTATION".into(),
                 "/tools/wireguard-go".into(),
             )),
+            force_userspace_backend: true,
         };
         let command = network_command(
             &prepared.program,
@@ -329,6 +338,12 @@ mod tests {
                 .get("WG_QUICK_USERSPACE_IMPLEMENTATION")
                 .and_then(Option::as_deref),
             Some("/tools/wireguard-go")
+        );
+        assert_eq!(
+            environment
+                .get("AMN_QUICK_FORCE_USERSPACE")
+                .and_then(Option::as_deref),
+            Some("1")
         );
         assert_eq!(arguments.first().map(String::as_str), Some("up"));
         assert_eq!(arguments.last().map(String::as_str), Some("/vpn/amn0.conf"));

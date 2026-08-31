@@ -105,6 +105,7 @@ struct PreparedPlan {
     runtime_directory: Option<PathBuf>,
     quick_base_created: bool,
     backend_environment: Option<(String, PathBuf)>,
+    force_userspace_backend: bool,
 }
 
 impl Drop for PreparedPlan {
@@ -187,12 +188,24 @@ fn prepare_network_plan(
     let path =
         std::env::join_paths(network_program_directories()).context("construct dependency PATH")?;
 
-    let backend_environment = kernel_backend
-        .map(|(module, fallback_variable, default_fallback)| {
-            require_kernel_backend(module, fallback_variable, default_fallback, &path)
-        })
-        .transpose()?
-        .flatten();
+    let force_userspace_backend = profile.protocol == Protocol::AmneziaWg
+        && requires_amneziawg_userspace(&configuration);
+    let backend_environment = if force_userspace_backend {
+        Some((
+            spec.backend_variable.to_owned(),
+            resolve_network_program(spec.userspace_backend)?,
+        ))
+    } else {
+        kernel_backend
+            .map(|(module, fallback_variable, default_fallback)| {
+                require_kernel_backend(module, fallback_variable, default_fallback, &path)
+            })
+            .transpose()?
+            .flatten()
+    };
+    if backend_environment.is_some() {
+        require_userspace_tun()?;
+    }
     let interface = plan
         .interface
         .clone()
@@ -249,7 +262,41 @@ fn prepare_network_plan(
         runtime_directory,
         quick_base_created,
         backend_environment,
+        force_userspace_backend,
     })
+}
+
+fn requires_amneziawg_userspace(configuration: &str) -> bool {
+    [
+        "HeaderProtectionKey",
+        "ContentPaddingAddition",
+        "RekeyAfterTime",
+        "RekeyTimeout",
+        "RejectAfterTime",
+        "KeepaliveTimeout",
+        "MaxHandshakeAttempts",
+        "RandomTrailers",
+        "DisableCookies",
+    ]
+    .into_iter()
+    .any(|key| configuration_has_key(configuration, key))
+}
+
+#[cfg(unix)]
+fn require_userspace_tun() -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let metadata = fs::symlink_metadata("/dev/net/tun")
+        .context("userspace VPN backend requires /dev/net/tun")?;
+    if !metadata.file_type().is_char_device() {
+        bail!("userspace VPN backend requires /dev/net/tun to be a character device");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_userspace_tun() -> Result<()> {
+    bail!("userspace VPN backend requires Linux /dev/net/tun")
 }
 
 pub fn check_profile_dependencies(
@@ -557,8 +604,12 @@ fn network_command(program: &Path, arguments: &[String], prepared: &PreparedPlan
     for variable in BACKEND_VARIABLES {
         command.env_remove(variable);
     }
+    command.env_remove("AMN_QUICK_FORCE_USERSPACE");
     if let Some((variable, executable)) = &prepared.backend_environment {
         command.env(variable, executable);
+    }
+    if prepared.force_userspace_backend {
+        command.env("AMN_QUICK_FORCE_USERSPACE", "1");
     }
     command.args(arguments);
     command
