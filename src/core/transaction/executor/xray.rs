@@ -302,6 +302,16 @@ fn retain_unstarted_xray_runtime(
         .context("persist unstarted XRay runtime cleanup ownership")
 }
 
+fn is_runtime_only_xray_recovery(connection: &Connection) -> bool {
+    connection.recovery_required
+        && connection.pid.is_none()
+        && connection.process_start_ticks.is_none()
+        && connection.interface_index.is_none()
+        && connection.interface_owner.is_none()
+        && connection.xray_route.is_none()
+        && connection.runtime_directory.is_some()
+}
+
 fn fail_unstarted_xray<T>(
     store: &Store,
     state: &mut State,
@@ -410,7 +420,7 @@ fn start_xray_worker(
 
 fn wait_xray_interface(prepared: &PreparedXray, pid: u32, interface: &str) -> Result<()> {
     for _ in 0..50 {
-        if process_start_ticks(pid).is_none() {
+        if !process_is_running(pid) {
             bail!("XRay worker exited before creating its TUN interface");
         }
         let exists = Command::new(&prepared.ip)
@@ -430,7 +440,11 @@ fn wait_xray_interface(prepared: &PreparedXray, pid: u32, interface: &str) -> Re
 }
 
 fn stop_xray_worker(prepared: &PreparedXray, pid: u32) -> Result<()> {
-    stop_process_group(&prepared.kill, &prepared.path, pid, "XRay worker")
+    if stop_process_group(&prepared.kill, &prepared.path, pid, "XRay worker").is_ok() {
+        return Ok(());
+    }
+    force_stop_process_group(&prepared.kill, &prepared.path, pid, "XRay worker")
+        .context("force-stop XRay worker process group")
 }
 
 fn traffic_route_pairs(
@@ -1009,12 +1023,7 @@ fn xray_process_info(pid: u32) -> Result<XrayProcessInfo> {
 
 fn process_start_ticks(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let fields = stat
-        .rsplit_once(')')?
-        .1
-        .split_whitespace()
-        .collect::<Vec<_>>();
-    fields.get(19)?.parse().ok()
+    process_stat_identity(&stat).map(|(_, _, ticks)| ticks)
 }
 
 fn verify_connection_process(connection: &Connection) -> Result<u32> {
@@ -1032,9 +1041,7 @@ fn process_is_running(pid: u32) -> bool {
     let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
     };
-    stat.rsplit_once(") ")
-        .and_then(|(_, suffix)| suffix.chars().next())
-        .is_some_and(|state| state != 'Z')
+    process_stat_identity(&stat).is_some_and(|(state, _, _)| state != 'Z')
 }
 
 fn reverse_ip_action(mut arguments: Vec<String>) -> Vec<String> {
@@ -1312,6 +1319,30 @@ fn disconnect_xray(
     connection: &Connection,
     dry_run: bool,
 ) -> Result<String> {
+    if is_runtime_only_xray_recovery(connection) {
+        if dry_run {
+            return Ok("remove retained XRay runtime files".into());
+        }
+        let retained = state.clone();
+        let mut disconnected = retained.clone();
+        disconnected.connection = None;
+        store
+            .save(&disconnected)
+            .context("persist pending XRay runtime cleanup")?;
+        if let Err(cleanup_error) =
+            remove_openvpn_runtime(connection.runtime_directory.as_deref())
+        {
+            *state = retained;
+            if let Err(persist_error) = store.save(state) {
+                return Err(cleanup_error).context(format!(
+                    "remove retained XRay runtime files and restore recovery state failed: {persist_error:#}"
+                ));
+            }
+            return Err(cleanup_error).context("remove retained XRay runtime files");
+        }
+        *state = disconnected;
+        return Ok("disconnected".into());
+    }
     let live = connection
         .pid
         .and_then(|pid| {

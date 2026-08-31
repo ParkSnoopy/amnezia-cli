@@ -655,7 +655,7 @@ fn action_dialog_or_command(action: FeatureAction, state: &State) -> Result<Opti
         )),
         FeatureAction::LogsClear => DialogResolution::Command(Command::Logs(LogsCommand::Clear)),
         FeatureAction::Doctor => DialogResolution::Command(Command::Doctor),
-        FeatureAction::Init => DialogResolution::Command(Command::Init),
+        FeatureAction::Install => DialogResolution::Command(Command::Install),
     };
     Ok(Some(result))
 }

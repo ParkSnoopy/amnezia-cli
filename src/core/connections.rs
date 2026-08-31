@@ -64,6 +64,8 @@ impl<'a> Connections<'a> {
     }
 
     pub fn connect(&mut self, profile: Option<&str>) -> Result<String> {
+        self.status(true)
+            .context("reconcile existing connection before connect")?;
         transaction::connect(self.store, self.state, profile, false)
     }
 

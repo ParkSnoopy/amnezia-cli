@@ -25,9 +25,9 @@ fn run() -> Result<()> {
     if arguments.tui && arguments.command.is_some() {
         bail!("--tui cannot be combined with a CLI command");
     }
-    if matches!(arguments.command.as_ref(), Some(Command::Init)) {
+    if matches!(arguments.command.as_ref(), Some(Command::Install)) {
         if arguments.dry_run {
-            bail!("--dry-run is not supported for init");
+            bail!("--dry-run is not supported for install");
         }
         println!("{}", amn::core::install::install()?);
         return Ok(());

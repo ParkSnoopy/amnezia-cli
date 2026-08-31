@@ -7,10 +7,10 @@ AmneziaVPN TUI manages and connects VPN profiles from an interactive terminal da
 Install `amn` and its bundled programs under `/usr/local`:
 
 ```text
-sudo ./amn init
+sudo ./amn install
 ```
 
-This installs the command at `/usr/local/bin/amn` and its bundled programs at `/usr/local/libexec/amn`. Run `init` from the portable bundle so `amn` can find the bundled programs beside the running binary.
+This installs the command at `/usr/local/bin/amn` and its bundled programs at `/usr/local/libexec/amn`. Run `install` from the portable bundle so `amn` can find the bundled programs beside the running binary.
 
 Open the interactive dashboard:
 

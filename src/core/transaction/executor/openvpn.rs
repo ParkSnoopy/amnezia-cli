@@ -315,13 +315,15 @@ fn start_openvpn(
 
 fn stop_process_group(kill: &Path, path: &std::ffi::OsStr, pid: u32, name: &str) -> Result<()> {
     let group_alive = || {
-        Command::new(kill)
-            .args(["-0", "--", &format!("-{pid}")])
-            .env("PATH", path)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+        process_group_has_live_members(pid).unwrap_or_else(|| {
+            Command::new(kill)
+                .args(["-0", "--", &format!("-{pid}")])
+                .env("PATH", path)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success())
+        })
     };
     if !group_alive() {
         return Ok(());
@@ -358,10 +360,50 @@ fn force_stop_process_group(
         .stderr(Stdio::null())
         .status()
         .with_context(|| format!("force-stop {name} process group"))?;
-    if !status.success() && process_is_running(pid) {
+    if !status.success() && process_group_has_live_members(pid).unwrap_or(true) {
         bail!("force-stop {name} process exited with {status}");
     }
-    Ok(())
+    for _ in 0..20 {
+        if !process_group_has_live_members(pid).unwrap_or(true) {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    bail!("{name} process group remained live after force-stop")
+}
+
+fn process_stat_identity(stat: &str) -> Option<(char, u32, u64)> {
+    let fields = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    Some((
+        fields.first()?.chars().next()?,
+        fields.get(2)?.parse().ok()?,
+        fields.get(19)?.parse().ok()?,
+    ))
+}
+
+fn process_stat_is_live_group_member(stat: &str, group: u32) -> bool {
+    process_stat_identity(stat)
+        .is_some_and(|(state, process_group, _)| process_group == group && state != 'Z')
+}
+
+fn process_group_has_live_members(group: u32) -> Option<bool> {
+    let entries = fs::read_dir("/proc").ok()?;
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let Some(pid) = entry.file_name().to_str().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if process_stat_is_live_group_member(&stat, group) {
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 fn owned_runtime_file(path: PathBuf, expected_name: &str) -> Result<PathBuf> {

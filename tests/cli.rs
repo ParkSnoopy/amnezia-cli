@@ -16,6 +16,7 @@ fn invalid_command_prints_complete_help() {
     assert!(text.contains("unrecognized subcommand 'invalid-command'"));
     assert!(text.contains("Usage: amn [OPTIONS] [COMMAND]"));
     assert!(text.contains("Commands:"));
-    assert!(text.contains("init"));
+    assert!(text.contains("install"));
+    assert!(!text.contains("  init"));
     assert!(text.contains("doctor"));
 }

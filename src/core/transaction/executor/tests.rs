@@ -49,6 +49,42 @@ mod tests {
     }
 
     #[test]
+    fn exited_processes_do_not_keep_process_groups_alive() {
+        let stat = fs::read_to_string(format!("/proc/{}/stat", std::process::id())).unwrap();
+        let (state, group, start_ticks) = process_stat_identity(&stat).unwrap();
+        assert_ne!(state, 'Z');
+        assert!(start_ticks > 0);
+        assert!(process_stat_is_live_group_member(&stat, group));
+
+        let zombie = stat.replacen(&format!(") {state} "), ") Z ", 1);
+        assert!(!process_stat_is_live_group_member(&zombie, group));
+    }
+
+    #[test]
+    fn runtime_only_xray_recovery_has_no_network_ownership() {
+        let connection = Connection {
+            profile_id: "profile-a".into(),
+            recovery_required: true,
+            pid: None,
+            process_start_ticks: None,
+            interface: Some("amnxray0".into()),
+            interface_index: None,
+            interface_owner: None,
+            runtime_directory: Some("/run/amn/example".into()),
+            xray_route: None,
+        };
+        assert!(is_runtime_only_xray_recovery(&connection));
+
+        let mut network_owned = connection;
+        network_owned.xray_route = Some(XrayRouteIdentity {
+            endpoint: "192.0.2.1".into(),
+            gateway: "192.0.2.254".into(),
+            uplink: "eth0".into(),
+        });
+        assert!(!is_runtime_only_xray_recovery(&network_owned));
+    }
+
+    #[test]
     fn rollback_only_restores_changed_interface_ownership_state() {
         assert_eq!(rollback_strategy(false, false), RollbackStrategy::None);
         assert_eq!(rollback_strategy(false, true), RollbackStrategy::Opposite);

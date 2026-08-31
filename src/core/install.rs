@@ -22,7 +22,7 @@ const DATA_FILES: &[&str] = &["geoip.dat", "geosite.dat"];
 
 pub fn install() -> Result<String> {
     if effective_user_id() != Some(0) {
-        bail!("init requires root permission; run `sudo ./amn init`");
+        bail!("install requires root permission; run `sudo ./amn install`");
     }
     let executable = std::env::current_exe().context("locate running amn binary")?;
     install_from(&executable, Path::new("/usr/local"))?;
