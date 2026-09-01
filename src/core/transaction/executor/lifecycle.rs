@@ -392,33 +392,45 @@ pub fn connect(
     }
     let mut command = network_command(&prepared.program, &prepared.args, &prepared);
     command.stdin(Stdio::null());
-    if state.settings.logging {
+    let mut log = if state.settings.logging {
         let log_path = store
             .root()
             .join("logs")
             .join(format!("connection-{}.log", uuid::Uuid::new_v4().simple()));
-        let stdout = create_private_log(&log_path)?;
-        let stderr = stdout.try_clone()?;
-        command.stdout(stdout).stderr(stderr);
+        Some(create_private_log(&log_path)?)
     } else {
-        command.stdout(Stdio::null()).stderr(Stdio::null());
-    }
+        None
+    };
 
-    let status = match command
-        .status()
+    let output = match command
+        .output()
         .with_context(|| format!("run {}", plan.program()))
     {
-        Ok(status) => status,
+        Ok(output) => output,
         Err(error) => return fail_with_rollback(store, state, &profile.id, &plan, &prepared, error),
     };
-    if !status.success() {
+    if let Some(log) = log.as_mut() {
+        let logged = std::io::Write::write_all(log, &output.stdout)
+            .and_then(|()| std::io::Write::write_all(log, &output.stderr));
+        if let Err(error) = logged {
+            return fail_with_rollback(
+                store,
+                state,
+                &profile.id,
+                &plan,
+                &prepared,
+                error.into(),
+            );
+        }
+    }
+    if !output.status.success() {
         return fail_with_rollback(
             store,
             state,
             &profile.id,
             &plan,
             &prepared,
-            anyhow!("{} exited with {status}", plan.program()),
+            network_command_failure(plan.program(), &output),
         );
     }
     let interface_index = match interface_index(&prepared.interface) {
@@ -552,13 +564,13 @@ pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<Str
     verify_openvpn_interface_identity(&prepared.interface, &connection)
         .context("WireGuard-family interface ownership changed before disconnect")?;
     let operation = network_command(&prepared.program, &prepared.args, &prepared)
-        .status()
+        .output()
         .with_context(|| format!("run {}", plan.program()))
-        .and_then(|status| {
-            if status.success() {
+        .and_then(|output| {
+            if output.status.success() {
                 Ok(())
             } else {
-                Err(anyhow!("{} exited with {status}", plan.program()))
+                Err(network_command_failure(plan.program(), &output))
             }
         });
     if let Err(error) = operation {
@@ -610,27 +622,29 @@ pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<Str
             }
             *state = disconnected.clone();
             let cleanup = network_command(&prepared.program, &prepared.args, &prepared)
-                .status()
-                .context("restore disconnected network state after persistence failure");
+                .output()
+                .context("restore disconnected network state after persistence failure")
+                .and_then(|output| {
+                    if output.status.success() {
+                        Ok(())
+                    } else {
+                        Err(network_command_failure(plan.program(), &output))
+                    }
+                });
             return match cleanup {
-                Ok(status) if status.success() => Err(error).context(format!(
+                Ok(()) => Err(error).context(format!(
                     "disconnect rolled back, but connected state restoration failed: {persist_error:#}; network returned to persisted disconnected state"
                 )),
-                cleanup_result => {
+                Err(cleanup_error) => {
                     *state = recovery.clone();
                     if store.save(&recovery).is_ok() {
                         return Err(error).context(format!(
-                            "disconnect rolled back and disconnected cleanup failed, but ownership metadata was retained: {persist_error:#}; cleanup: {cleanup_result:?}"
+                            "disconnect rolled back and disconnected cleanup failed, but ownership metadata was retained: {persist_error:#}; cleanup: {cleanup_error:#}"
                         ));
                     }
-                    match cleanup_result {
-                        Ok(status) => Err(error).context(format!(
-                            "disconnect rolled back, connected state restoration failed, cleanup exited with {status}, and ownership persistence retry failed; recovery remains in memory: {persist_error:#}"
-                        )),
-                        Err(cleanup_error) => Err(error).context(format!(
-                            "disconnect rolled back, connected state restoration failed, cleanup failed, and ownership persistence retry failed; recovery remains in memory: {persist_error:#}; {cleanup_error:#}"
-                        )),
-                    }
+                    Err(error).context(format!(
+                        "disconnect rolled back, connected state restoration failed, cleanup failed, and ownership persistence retry failed; recovery remains in memory: {persist_error:#}; {cleanup_error:#}"
+                    ))
                 }
             };
         }
@@ -843,16 +857,6 @@ fn cleanup_owned_openvpn_artifacts(
     remove_openvpn_runtime(connection.runtime_directory.as_deref())
 }
 
-fn interface_name(source: &str) -> String {
-    Path::new(source)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("amnezia")
-        .chars()
-        .take(15)
-        .collect()
-}
-
 fn create_private_log(path: &Path) -> Result<std::fs::File> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
@@ -986,4 +990,3 @@ fn is_executable(path: &Path) -> bool {
         true
     }
 }
-

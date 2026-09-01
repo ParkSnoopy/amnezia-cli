@@ -398,6 +398,18 @@ mod tests {
     }
 
     #[test]
+    fn quick_interface_identity_does_not_depend_on_imported_filename() {
+        let mut imported = profile(Protocol::AmneziaWg);
+        imported.id = "12345678-1234-1234-1234-123456789abc".into();
+        imported.source = "/vpn/a GUI profile name that cannot be an interface.conf".into();
+
+        let plan = quick_connection_plan(&imported).unwrap();
+
+        assert_eq!(plan.interface.as_deref(), Some("amn12345678123"));
+        assert!(plan.interface.as_ref().unwrap().len() <= 15);
+    }
+
+    #[test]
     fn root_network_command_uses_validated_dependency_environment() {
         let prepared = PreparedPlan {
             program: "/tools/wg-quick".into(),
@@ -454,6 +466,19 @@ mod tests {
         );
         assert_eq!(arguments.first().map(String::as_str), Some("up"));
         assert_eq!(arguments.last().map(String::as_str), Some("/vpn/amn0.conf"));
+
+        use std::os::unix::process::ExitStatusExt;
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: b"\x1b[31muserspace backend failed\x1b[0m\nLine unrecognized: PrivateKey = secret".to_vec(),
+        };
+        let failure = network_command_failure("awg-quick", &output).to_string();
+        assert!(failure.contains("awg-quick exited"));
+        assert!(failure.contains("userspace backend failed"));
+        assert!(failure.contains("\\u{1b}"));
+        assert!(failure.contains("PrivateKey=[REDACTED]"));
+        assert!(!failure.contains("secret"));
     }
 
     #[test]

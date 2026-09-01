@@ -236,7 +236,9 @@ fn preflight_xray_routes(prepared: &PreparedXray, interface: &str) -> Result<()>
         if !is_xray_bypass_route(prepared, &route)? {
             continue;
         }
-        if inspect_xray_route(prepared, &route)? == XrayRouteDisposition::Collision {
+        if inspect_xray_route(prepared, &route)? == XrayRouteDisposition::Collision
+            && !xray_route_exists(prepared, &route)?
+        {
             let (destination, _) = xray_route_destination(&route)?;
             bail!(
                 "XRay route already exists with an incompatible path or ownership: {destination}"
@@ -246,24 +248,23 @@ fn preflight_xray_routes(prepared: &PreparedXray, interface: &str) -> Result<()>
     Ok(())
 }
 
-fn verify_xray_bypass_routes(
+fn verify_xray_routes(
     prepared: &PreparedXray,
     interface: &str,
     rollback: &[XrayRollback],
 ) -> Result<()> {
     for (route, reverse) in traffic_route_pairs(prepared, interface) {
-        if !is_xray_bypass_route(prepared, &route)? {
-            continue;
-        }
         let owned = xray_rollback_owns_route(rollback, &reverse);
         let satisfied = if owned {
             xray_route_exists(prepared, &reverse)?
-        } else {
+        } else if is_xray_bypass_route(prepared, &route)? {
             inspect_xray_route(prepared, &route)? == XrayRouteDisposition::SatisfiedExternally
+        } else {
+            false
         };
         if !satisfied {
             let (destination, _) = xray_route_destination(&route)?;
-            bail!("XRay bypass route changed during connection setup: {destination}");
+            bail!("XRay route changed during connection setup: {destination}");
         }
     }
     Ok(())
@@ -346,6 +347,10 @@ fn apply_xray_route_mutation(
     reverse: Vec<String>,
     rollback: &mut Vec<XrayRollback>,
 ) -> Result<()> {
+    if xray_route_exists(prepared, &forward)? {
+        rollback.push(XrayRollback::Ip(reverse));
+        return Ok(());
+    }
     if !is_xray_bypass_route(prepared, &forward)? {
         return apply_xray_mutation(prepared, forward, reverse, rollback);
     }
@@ -1144,7 +1149,7 @@ fn connect_xray(
         }),
     });
     let configure_result = configure_xray_interface(&prepared, interface, &mut rollback)
-        .and_then(|()| verify_xray_bypass_routes(&prepared, interface, &rollback));
+        .and_then(|()| verify_xray_routes(&prepared, interface, &rollback));
     if let Err(error) = configure_result {
         return match rollback_xray_connect(
             &prepared,

@@ -74,6 +74,7 @@ fn quote_argument(value: &str) -> String {
 
 fn quick_connection_plan(profile: &Profile) -> Result<CommandPlan> {
     let source = profile.source.clone();
+    let interface = quick_interface_name(profile)?;
     let plan = match profile.protocol {
         Protocol::WireGuard | Protocol::AmneziaWg => {
             CommandPlan {
@@ -82,13 +83,26 @@ fn quick_connection_plan(profile: &Profile) -> Result<CommandPlan> {
                     QuickDirection::Up,
                     source,
                 ),
-                interface: Some(interface_name(&profile.source)),
+                interface: Some(interface),
             }
         }
         _ => bail!("protocol does not use a quick-script backend"),
     };
 
     Ok(plan)
+}
+
+fn quick_interface_name(profile: &Profile) -> Result<String> {
+    let suffix = profile
+        .id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .take(11)
+        .collect::<String>();
+    if suffix.is_empty() {
+        bail!("VPN profile has no usable interface identity");
+    }
+    Ok(format!("amn{suffix}"))
 }
 
 struct PreparedPlan {
@@ -226,10 +240,7 @@ fn prepare_network_plan(
             bail!("VPN interface changes require running amn as root");
         }
         let (directory, quick_base_created) = create_quick_runtime_directory()?;
-        let file_name = Path::new(&profile.source)
-            .file_name()
-            .context("profile source has no filename")?;
-        let staged = directory.join(file_name);
+        let staged = directory.join(format!("{interface}.conf"));
         if let Err(error) = crate::core::store::write_private(&staged, configuration.as_bytes()) {
             let _ = fs::remove_dir_all(&directory);
             if quick_base_created {
@@ -570,15 +581,16 @@ fn rollback(
         verify_openvpn_interface_identity(&prepared.interface, identity)
             .context("WireGuard-family interface ownership changed immediately before rollback")?;
     }
-    let status = network_command(
+    let output = network_command(
         &prepared.rollback_program,
         &prepared.rollback_args,
         prepared,
     )
-    .status()
+    .output()
     .with_context(|| format!("run rollback {}", plan.rollback_program()))?;
-    if !status.success() {
-        bail!("rollback {} exited with {status}", plan.rollback_program());
+    if !output.status.success() {
+        return Err(network_command_failure(plan.rollback_program(), &output))
+            .context("WireGuard-family rollback failed");
     }
     Ok(())
 }
@@ -613,6 +625,49 @@ fn network_command(program: &Path, arguments: &[String], prepared: &PreparedPlan
     }
     command.args(arguments);
     command
+}
+
+fn network_command_failure(
+    program: &str,
+    output: &std::process::Output,
+) -> anyhow::Error {
+    const MAX_DETAIL_CHARS: usize = 8_192;
+    let detail = [&output.stderr[..], &output.stdout[..]]
+        .into_iter()
+        .filter(|bytes| !bytes.is_empty())
+        .map(|bytes| String::from_utf8_lossy(bytes))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let detail = redact_network_output(&crate::sanitize_terminal(detail.trim()))
+        .chars()
+        .take(MAX_DETAIL_CHARS)
+        .collect::<String>();
+    if detail.is_empty() {
+        anyhow!("{program} exited with {}", output.status)
+    } else {
+        anyhow!("{program} exited with {}: {detail}", output.status)
+    }
+}
+
+fn redact_network_output(detail: &str) -> String {
+    const SENSITIVE_KEYS: [&str; 4] = ["privatekey", "presharedkey", "password", "token"];
+    detail
+        .lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            SENSITIVE_KEYS
+                .iter()
+                .find_map(|key| {
+                    let key_start = lower.find(key)?;
+                    let separator = line[key_start + key.len()..].find(['=', ':'])?
+                        + key_start
+                        + key.len();
+                    Some(format!("{}=[REDACTED]", line[..separator].trim_end()))
+                })
+                .unwrap_or_else(|| line.to_owned())
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn interface_exists(probe: &Path, interface: &str, path: &std::ffi::OsStr) -> Result<bool> {
