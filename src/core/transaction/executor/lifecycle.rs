@@ -79,13 +79,16 @@ fn connect_openvpn(
     let mut connection = Connection {
         profile_id: id,
         recovery_required: true,
+        disconnecting: false,
         pid: Some(pid),
         process_start_ticks: process_start_ticks(pid),
         interface: Some(prepared.interface.clone()),
         interface_index: None,
         interface_owner: None,
         runtime_directory: Some(runtime_directory.to_string_lossy().into_owned()),
+        quick_root_owned: false,
         xray_route: None,
+        xray_owned_routes: Vec::new(),
     };
     let interface_owner = uuid::Uuid::new_v4().to_string();
     let owner_result = Command::new(&prepared.ip)
@@ -179,7 +182,24 @@ fn disconnect_openvpn(
     dry_run: bool,
 ) -> Result<String> {
     let prepared = prepare_openvpn(store, profile, &state.settings)?;
-    let pid = match verify_connection_process(connection) {
+    let mut connection = connection.clone();
+    if connection.process_start_ticks.is_none()
+        && let Some(pid) = connection.pid
+        && let Some(runtime_directory) = connection.runtime_directory.as_deref()
+        && openvpn_process_configuration(pid, Some(&prepared.executable)).is_ok_and(|path| {
+            path == Path::new(runtime_directory).join("openvpn.conf")
+        })
+        && connection
+            .interface
+            .as_deref()
+            .is_some_and(|interface| verify_openvpn_interface_identity(interface, &connection).is_ok())
+    {
+        connection.process_start_ticks = process_start_ticks(pid);
+        if !dry_run && let Some(current) = state.connection.as_mut() {
+            current.process_start_ticks = connection.process_start_ticks;
+        }
+    }
+    let pid = match verify_connection_process(&connection) {
         Ok(pid) => pid,
         Err(_identity_error) => {
             let interface_exists = Command::new(&prepared.ip)
@@ -190,8 +210,15 @@ fn disconnect_openvpn(
                 .status()?
                 .success();
             if interface_exists {
-                verify_openvpn_interface_identity(&prepared.interface, connection)
+                verify_openvpn_interface_identity(&prepared.interface, &connection)
                     .context("OpenVPN process is stale and interface ownership changed")?;
+            }
+            if connection.pid.is_some_and(|pid| {
+                openvpn_process_configuration(pid, Some(&prepared.executable)).is_ok()
+            }) {
+                bail!(
+                    "legacy OpenVPN process has no complete start-time and interface ownership identity"
+                );
             }
             if dry_run {
                 return Ok(if interface_exists {
@@ -200,14 +227,15 @@ fn disconnect_openvpn(
                     "remove the stale OpenVPN private runtime directory and clear its ownership record\nrollback: restore the ownership record".into()
                 });
             }
-            let mut disconnected = state.clone();
-            disconnected.connection = None;
+            let disconnected = disconnected_state(state);
+            let pending = pending_disconnect_state(state)?;
             store
-                .save(&disconnected)
+                .save(&pending)
                 .context("persist pending stale OpenVPN cleanup")?;
-            if let Err(error) = cleanup_owned_openvpn_artifacts(&prepared, connection) {
+            if let Err(error) = cleanup_owned_openvpn_artifacts(&prepared, &connection) {
                 if let Some(connection) = state.connection.as_mut() {
                     connection.recovery_required = true;
+                    connection.disconnecting = true;
                 }
                 if let Err(persist_error) = store.save(state) {
                     return Err(error).context(format!(
@@ -216,6 +244,9 @@ fn disconnect_openvpn(
                 }
                 return Err(error).context("clean stale OpenVPN resources");
             }
+            store
+                .save(&disconnected)
+                .context("persist completed stale OpenVPN cleanup")?;
             *state = disconnected;
             return Ok("disconnected".into());
         }
@@ -237,10 +268,13 @@ fn disconnect_openvpn(
         ),
         None => None,
     };
-    if let (Some(saved), Some(actual)) = (
-        connection.runtime_directory.as_deref(),
-        runtime_directory.as_deref(),
-    ) && Path::new(saved) != actual
+    let saved_runtime = connection
+        .runtime_directory
+        .as_deref()
+        .context("OpenVPN connection has no saved runtime ownership path")?;
+    if runtime_directory
+        .as_deref()
+        .is_none_or(|actual| Path::new(saved_runtime) != actual)
     {
         bail!("saved OpenVPN runtime directory does not match the owned process configuration");
     }
@@ -249,29 +283,22 @@ fn disconnect_openvpn(
             "terminate owned OpenVPN process group {pid}\nrollback: restart the validated OpenVPN profile"
         ));
     }
-    let mut disconnected = state.clone();
-    disconnected.connection = None;
+    let disconnected = disconnected_state(state);
+    let pending = pending_disconnect_state(state)?;
     store
-        .save(&disconnected)
+        .save(&pending)
         .context("persist pending OpenVPN disconnect")?;
     if let Err(error) = stop_process_group(&prepared.kill, &prepared.path, pid, "OpenVPN") {
         if let Some(connection) = state.connection.as_mut() {
             connection.recovery_required = true;
         }
         if let Err(persist_error) = store.save(state) {
-            let cleanup = force_stop_process_group(&prepared.kill, &prepared.path, pid, "OpenVPN")
-                .and_then(|()| cleanup_owned_openvpn_artifacts(&prepared, connection));
-            return match cleanup {
-                Ok(()) => {
-                    *state = disconnected;
-                    Err(error).context(format!(
-                        "OpenVPN disconnect failed and connection state could not be restored: {persist_error:#}; owned artifacts were removed"
-                    ))
-                }
-                Err(cleanup_error) => Err(error).context(format!(
-                    "OpenVPN disconnect, state restoration, and final cleanup failed; recovery remains in memory: {persist_error:#}; {cleanup_error:#}"
-                )),
-            };
+            if let Some(connection) = state.connection.as_mut() {
+                connection.disconnecting = true;
+            }
+            return Err(error).context(format!(
+                "OpenVPN disconnect failed and ordinary state restoration failed; pending ownership remains durable and recovery remains in memory: {persist_error:#}"
+            ));
         }
         return Err(error).context("OpenVPN disconnect failed; connection state restored");
     }
@@ -314,11 +341,12 @@ fn disconnect_openvpn(
         Ok(())
     })();
     if let Err(error) = cleanup {
-        let mut orphaned = disconnected.clone();
+        let mut orphaned = pending.clone();
         let mut orphan_connection = connection.clone();
         orphan_connection.pid = None;
         orphan_connection.process_start_ticks = None;
         orphan_connection.recovery_required = true;
+        orphan_connection.disconnecting = true;
         orphan_connection.interface_index = Some(expected_interface_index);
         orphan_connection.interface_owner = Some(expected_interface_owner);
         orphan_connection.runtime_directory = runtime_directory_text.map(str::to_owned);
@@ -327,6 +355,9 @@ fn disconnect_openvpn(
         if let Err(persist_error) = store.save(&orphaned) {
             return match cleanup_owned_openvpn_artifacts(&prepared, &orphan_connection) {
                 Ok(()) => {
+                    store
+                        .save(&disconnected)
+                        .context("persist completed OpenVPN cleanup")?;
                     *state = disconnected;
                     Err(error).context(format!(
                         "OpenVPN disconnect cleanup failed and orphan ownership metadata could not be persisted: {persist_error:#}; remaining owned artifacts were removed"
@@ -342,6 +373,9 @@ fn disconnect_openvpn(
             "OpenVPN disconnect cleanup failed; orphan ownership metadata was retained for retry",
         );
     }
+    store
+        .save(&disconnected)
+        .context("persist completed OpenVPN disconnect")?;
     *state = disconnected;
     Ok("disconnected".into())
 }
@@ -383,10 +417,61 @@ pub fn connect(
         return Ok(plan.display());
     }
 
-    let prepared = prepare_network_plan(store, &profile, &plan, &state.settings, true)?;
-    if prepared.interface_existed {
+    let preflight = prepare_network_plan(
+        store,
+        &profile,
+        &plan,
+        &state.settings,
+        false,
+        None,
+    )?;
+    if preflight.interface_existed {
         bail!(
             "refusing to connect because interface already exists: {}",
+            preflight.interface
+        );
+    }
+    drop(preflight);
+    let planned_runtime = Path::new("/etc/wireguard")
+        .join(uuid::Uuid::new_v4().simple().to_string());
+    let mut staging = state.clone();
+    staging.connection = Some(Connection {
+        profile_id: profile.id.clone(),
+        recovery_required: true,
+        disconnecting: false,
+        pid: None,
+        process_start_ticks: None,
+        interface: plan.interface.clone(),
+        interface_index: None,
+        interface_owner: None,
+        runtime_directory: Some(planned_runtime.to_string_lossy().into_owned()),
+        quick_root_owned: false,
+        xray_route: None,
+        xray_owned_routes: Vec::new(),
+    });
+    store
+        .save(&staging)
+        .context("persist WireGuard-family connect staging ownership before filesystem mutation")?;
+    *state = staging;
+    let mut prepared = prepare_network_plan(
+        store,
+        &profile,
+        &plan,
+        &state.settings,
+        true,
+        Some(&planned_runtime),
+    )?;
+    if prepared.interface_existed {
+        prepared.cleanup_runtime().context(
+            "clean WireGuard-family staging after an interface appeared during connect preflight",
+        )?;
+        let disconnected = disconnected_state(state);
+        store
+            .save(&disconnected)
+            .context("clear WireGuard-family staging ownership after connect preflight changed")?;
+        *state = disconnected;
+        bail!(
+            "refusing to connect because interface appeared during preflight: {}",
             prepared.interface
         );
     }
@@ -472,16 +557,61 @@ pub fn connect(
             );
         }
     }
+    if let Err(error) = prepared.cleanup_runtime() {
+        let (runtime_directory, quick_root_owned) = prepared.retained_runtime();
+        let rollback_material_exists = prepared
+            .rollback_args
+            .last()
+            .is_some_and(|argument| Path::new(argument).is_file());
+        if rollback_material_exists {
+            return fail_with_rollback(
+                store,
+                state,
+                &profile.id,
+                &plan,
+                &prepared,
+                error.context("clean connected WireGuard-family staged runtime"),
+            );
+        }
+        let mut retained = state.clone();
+        retained.connection = Some(Connection {
+            profile_id: profile.id.clone(),
+            recovery_required: true,
+            disconnecting: false,
+            pid: None,
+            process_start_ticks: None,
+            interface: plan.interface.clone(),
+            interface_index: Some(interface_index),
+            interface_owner: Some(interface_owner),
+            runtime_directory: runtime_directory
+                .map(|path| path.to_string_lossy().into_owned()),
+            quick_root_owned,
+            xray_route: None,
+            xray_owned_routes: Vec::new(),
+        });
+        *state = retained.clone();
+        return match store.save(&retained) {
+            Ok(()) => Err(error).context(
+                "WireGuard-family interface connected, but runtime-root cleanup requires a disconnect retry",
+            ),
+            Err(persist_error) => Err(error).context(format!(
+                "WireGuard-family interface connected, but runtime-root cleanup and recovery persistence failed; exact ownership remains in memory: {persist_error:#}"
+            )),
+        };
+    }
     let connection = Connection {
         profile_id: profile.id.clone(),
         recovery_required: false,
+        disconnecting: false,
         pid: None,
         process_start_ticks: None,
         interface: plan.interface.clone(),
         interface_index: Some(interface_index),
         interface_owner: Some(interface_owner),
         runtime_directory: None,
+        quick_root_owned: false,
         xray_route: None,
+        xray_owned_routes: Vec::new(),
     };
     let mut updated = state.clone();
     updated.connection = Some(connection);
@@ -514,6 +644,22 @@ pub fn connect(
     Ok("connected".into())
 }
 
+fn pending_disconnect_state(state: &State) -> Result<State> {
+    let mut pending = state.clone();
+    let connection = pending
+        .connection
+        .as_mut()
+        .context("disconnect ownership record is missing")?;
+    connection.disconnecting = true;
+    Ok(pending)
+}
+
+fn disconnected_state(state: &State) -> State {
+    let mut disconnected = state.clone();
+    disconnected.connection = None;
+    disconnected
+}
+
 pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<String> {
     let connection = state.connection.clone().context("VPN is not connected")?;
     let profile = state
@@ -544,22 +690,101 @@ pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<Str
     if dry_run {
         return Ok(plan.display());
     }
-    let prepared = prepare_network_plan(store, &profile, &plan, &state.settings, true)?;
+    if connection.runtime_directory.is_some() || connection.quick_root_owned {
+        let pending = pending_disconnect_state(state)?;
+        store
+            .save(&pending)
+            .context("persist pending retained WireGuard-family runtime cleanup")?;
+        if let Err(error) = cleanup_retained_quick_runtime(
+            connection.runtime_directory.as_deref().map(Path::new),
+            connection.quick_root_owned,
+        ) {
+            if let Some(connection) = state.connection.as_mut() {
+                connection.recovery_required = true;
+                connection.disconnecting = true;
+            }
+            let _ = store.save(state);
+            return Err(error).context("clean retained WireGuard-family runtime");
+        }
+        if let Some(saved) = state.connection.as_mut() {
+            saved.runtime_directory = None;
+            saved.quick_root_owned = false;
+        }
+        store
+            .save(state)
+            .context("persist completed retained WireGuard-family runtime cleanup")?;
+    }
+    let planned_runtime = Path::new("/etc/wireguard")
+        .join(uuid::Uuid::new_v4().simple().to_string());
+    let mut staging = pending_disconnect_state(state)?;
+    if let Some(connection) = staging.connection.as_mut() {
+        connection.runtime_directory = Some(planned_runtime.to_string_lossy().into_owned());
+        connection.quick_root_owned = false;
+    }
+    store
+        .save(&staging)
+        .context("persist WireGuard-family staging ownership before filesystem mutation")?;
+    *state = staging;
+    let mut prepared = prepare_network_plan(
+        store,
+        &profile,
+        &plan,
+        &state.settings,
+        true,
+        Some(&planned_runtime),
+    )?;
     if !prepared.interface_existed {
-        let mut disconnected = state.clone();
-        disconnected.connection = None;
+        let disconnected = disconnected_state(state);
+        let mut pending = pending_disconnect_state(state)?;
+        let (runtime_directory, quick_root_owned) = prepared.retained_runtime();
+        if let Some(connection) = pending.connection.as_mut() {
+            connection.runtime_directory =
+                runtime_directory.map(|path| path.to_string_lossy().into_owned());
+            connection.quick_root_owned = quick_root_owned;
+        }
+        store
+            .save(&pending)
+            .context("persist pending stale WireGuard-family cleanup")?;
+        if let Err(error) = (|| -> Result<()> {
+            revert_quick_dns(&prepared)?;
+            prepared.cleanup_runtime()?;
+            if stale_quick_policy_artifacts_exist(&prepared)? {
+                bail!(
+                    "stale WireGuard-family firewall or policy state remains without exact deletion ownership"
+                );
+            }
+            Ok(())
+        })()
+        {
+            let (runtime_directory, quick_root_owned) = prepared.retained_runtime();
+            if let Some(connection) = state.connection.as_mut() {
+                connection.recovery_required = true;
+                connection.disconnecting = true;
+                connection.runtime_directory =
+                    runtime_directory.map(|path| path.to_string_lossy().into_owned());
+                connection.quick_root_owned = quick_root_owned;
+            }
+            let _ = store.save(state);
+            return Err(error).context("clean stale WireGuard-family resources");
+        }
         store
             .save(&disconnected)
-            .context("clear stale WireGuard-family connection")?;
+            .context("persist completed stale WireGuard-family cleanup")?;
         *state = disconnected;
         return Ok("disconnected".into());
     }
     verify_openvpn_interface_identity(&prepared.interface, &connection)
         .context("refusing to disconnect WireGuard-family interface without exact ownership")?;
-    let mut disconnected = state.clone();
-    disconnected.connection = None;
+    let disconnected = disconnected_state(state);
+    let mut pending = pending_disconnect_state(state)?;
+    let (runtime_directory, quick_root_owned) = prepared.retained_runtime();
+    if let Some(connection) = pending.connection.as_mut() {
+        connection.runtime_directory =
+            runtime_directory.map(|path| path.to_string_lossy().into_owned());
+        connection.quick_root_owned = quick_root_owned;
+    }
     store
-        .save(&disconnected)
+        .save(&pending)
         .context("persist pending WireGuard-family disconnect")?;
     verify_openvpn_interface_identity(&prepared.interface, &connection)
         .context("WireGuard-family interface ownership changed before disconnect")?;
@@ -572,8 +797,15 @@ pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<Str
             } else {
                 Err(network_command_failure(plan.program(), &output))
             }
-        });
+        })
+        .and_then(|()| verify_quick_disconnected(&prepared));
     if let Err(error) = operation {
+        let (runtime_directory, quick_root_owned) = prepared.retained_runtime();
+        if let Some(connection) = state.connection.as_mut() {
+            connection.runtime_directory =
+                runtime_directory.map(|path| path.to_string_lossy().into_owned());
+            connection.quick_root_owned = quick_root_owned;
+        }
         if let Err(rollback_error) = rollback(&plan, &prepared, Some(&connection)) {
             if let Some(connection) = state.connection.as_mut() {
                 connection.recovery_required = true;
@@ -600,56 +832,48 @@ pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<Str
                 )),
             };
         }
+        if let Some(connection) = state.connection.as_mut() {
+            connection.disconnecting = false;
+        }
         if let Err(persist_error) = store.save(state) {
-            let mut recovery = disconnected.clone();
-            let mut recovery_connection = connection.clone();
-            recovery_connection.recovery_required = true;
-            recovery.connection = Some(recovery_connection);
-            let Some(identity) = recovery.connection.as_ref() else {
-                *state = disconnected.clone();
-                return Err(error).context(format!(
-                    "disconnect rollback restored no ownership identity and connected state restoration failed: {persist_error:#}"
-                ));
-            };
-            if let Err(identity_error) =
-                verify_openvpn_interface_identity(&prepared.interface, identity)
-            {
-                *state = recovery.clone();
-                let _ = store.save(&recovery);
-                return Err(error).context(format!(
-                    "refusing disconnected cleanup after ownership changed: {identity_error:#}; connected state restoration failed: {persist_error:#}"
-                ));
+            let mut recovery = state.clone();
+            if let Some(connection) = recovery.connection.as_mut() {
+                connection.disconnecting = true;
+                connection.recovery_required = true;
             }
-            *state = disconnected.clone();
-            let cleanup = network_command(&prepared.program, &prepared.args, &prepared)
-                .output()
-                .context("restore disconnected network state after persistence failure")
-                .and_then(|output| {
-                    if output.status.success() {
-                        Ok(())
-                    } else {
-                        Err(network_command_failure(plan.program(), &output))
-                    }
-                });
-            return match cleanup {
+            *state = recovery.clone();
+            return match store.save(&recovery) {
                 Ok(()) => Err(error).context(format!(
-                    "disconnect rolled back, but connected state restoration failed: {persist_error:#}; network returned to persisted disconnected state"
+                    "disconnect rollback restored the connection, but ordinary state restoration failed; pending ownership was retained: {persist_error:#}"
                 )),
-                Err(cleanup_error) => {
-                    *state = recovery.clone();
-                    if store.save(&recovery).is_ok() {
-                        return Err(error).context(format!(
-                            "disconnect rolled back and disconnected cleanup failed, but ownership metadata was retained: {persist_error:#}; cleanup: {cleanup_error:#}"
-                        ));
-                    }
-                    Err(error).context(format!(
-                        "disconnect rolled back, connected state restoration failed, cleanup failed, and ownership persistence retry failed; recovery remains in memory: {persist_error:#}; {cleanup_error:#}"
-                    ))
-                }
+                Err(recovery_error) => Err(error).context(format!(
+                    "disconnect rollback restored the connection, but state restoration and pending-ownership persistence failed; recovery remains in memory: {persist_error:#}; {recovery_error:#}"
+                )),
             };
         }
         return Err(error).context("WireGuard-family disconnect failed; connection restored");
     }
+    if let Err(error) = prepared.cleanup_runtime() {
+        let (runtime_directory, quick_root_owned) = prepared.retained_runtime();
+        if let Some(connection) = state.connection.as_mut() {
+            connection.disconnecting = true;
+            connection.recovery_required = true;
+            connection.runtime_directory =
+                runtime_directory.map(|path| path.to_string_lossy().into_owned());
+            connection.quick_root_owned = quick_root_owned;
+        }
+        return match store.save(state) {
+            Ok(()) => Err(error).context(
+                "WireGuard-family network teardown completed; staged runtime cleanup requires retry",
+            ),
+            Err(persist_error) => Err(error).context(format!(
+                "WireGuard-family network teardown completed, but runtime cleanup and recovery persistence failed; recovery remains in memory: {persist_error:#}"
+            )),
+        };
+    }
+    store
+        .save(&disconnected)
+        .context("persist completed WireGuard-family disconnect")?;
     *state = disconnected;
     Ok("disconnected".into())
 }
@@ -701,11 +925,38 @@ fn restore_quick_interface_identity(
 }
 
 pub fn refresh_connection(store: &Store, state: &mut State) -> Result<()> {
-    if let Some(connection) = state.connection.as_mut()
-        && connection.process_start_ticks.is_none()
-        && let Some(pid) = connection.pid
+    let inferred_start_ticks = state.connection.as_ref().and_then(|connection| {
+        let pid = connection.pid?;
+        if connection.process_start_ticks.is_some() {
+            return None;
+        }
+        let profile = state.profiles.get(&connection.profile_id)?;
+        let owned = match profile.protocol {
+            Protocol::Xray => xray_process_info(pid).is_ok_and(|worker| {
+                connection.interface.as_deref() == Some(&worker.interface)
+                    && connection.xray_route.as_ref().is_some_and(|route| {
+                        route.endpoint == worker.endpoint
+                            && route.gateway == worker.gateway
+                            && route.uplink == worker.uplink
+                    })
+                    && verify_openvpn_interface_identity(&worker.interface, connection).is_ok()
+            }),
+            Protocol::OpenVpn => connection.runtime_directory.as_deref().is_some_and(|runtime| {
+                openvpn_process_configuration(pid, None).is_ok_and(|configuration| {
+                    configuration == Path::new(runtime).join("openvpn.conf")
+                        && connection.interface.as_deref().is_some_and(|interface| {
+                            verify_openvpn_interface_identity(interface, connection).is_ok()
+                        })
+                })
+            }),
+            _ => process_belongs_to_profile(pid, profile),
+        };
+        owned.then(|| process_start_ticks(pid)).flatten()
+    });
+    if let Some(ticks) = inferred_start_ticks
+        && let Some(connection) = state.connection.as_mut()
     {
-        connection.process_start_ticks = process_start_ticks(pid);
+        connection.process_start_ticks = Some(ticks);
     }
     let stale = state.connection.as_ref().is_some_and(|connection| {
         if connection.recovery_required {
@@ -819,11 +1070,27 @@ fn remove_openvpn_runtime(directory: Option<&str>) -> Result<()> {
         return Ok(());
     };
     let directory = Path::new(directory);
-    if directory.parent() != Some(Path::new("/run/amn")) {
+    let root = Path::new("/run/amn");
+    if directory.parent() != Some(root)
+        || directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_none_or(|name| name.len() != 32 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    {
         bail!("saved OpenVPN runtime directory is outside /run/amn");
     }
     match fs::symlink_metadata(directory) {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            if fs::canonicalize(root).context("inspect OpenVPN runtime root")? != root {
+                bail!("saved OpenVPN runtime root resolves outside /run/amn");
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                if metadata.uid() != 0 || metadata.permissions().mode() & 0o777 != 0o700 {
+                    bail!("saved OpenVPN runtime directory ownership or permissions changed");
+                }
+            }
             fs::remove_dir_all(directory).context("remove staged OpenVPN configuration")
         }
         Ok(_) => bail!("saved OpenVPN runtime path is not an owned directory"),

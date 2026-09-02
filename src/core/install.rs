@@ -25,9 +25,40 @@ pub fn install() -> Result<String> {
         bail!("install requires root permission; run `sudo ./amn install`");
     }
     let executable = std::env::current_exe().context("locate running amn binary")?;
+    ensure_quick_runtime_root(Path::new("/etc/wireguard"))?;
     install_from(&executable, Path::new("/usr/local"))?;
     Ok("Installed amn in /usr/local/bin and bundled programs in /usr/local/libexec/amn"
         .to_owned())
+}
+
+fn ensure_quick_runtime_root(path: &Path) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).context("create WireGuard runtime root"),
+    }
+    let canonical = fs::canonicalize(path).context("inspect WireGuard runtime root")?;
+    if canonical != path {
+        bail!("WireGuard runtime root resolves outside its expected path");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::metadata(path)?;
+        if !metadata.is_dir()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o777 != 0o700
+        {
+            bail!("WireGuard runtime root must be root-owned with mode 0700");
+        }
+    }
+    Ok(())
 }
 
 fn install_from(executable: &Path, prefix: &Path) -> Result<()> {
@@ -178,6 +209,19 @@ fn effective_user_id() -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn creates_private_persistent_quick_runtime_root() {
+        let root = std::env::temp_dir().join(format!("amn-quick-root-test-{}", Uuid::new_v4().simple()));
+        ensure_quick_runtime_root(&root).unwrap();
+        ensure_quick_runtime_root(&root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn installs_binary_and_bundle_in_usr_local_layout() {

@@ -142,7 +142,9 @@ fn xray_route_path_matches(arguments: &[String], line: &str) -> Result<bool> {
     let fields = line.split_whitespace().collect::<Vec<_>>();
     let destination_matches = match route_type {
         Some(kind) => {
-            fields.first().copied() == Some(kind)
+            fields
+                .first()
+                .is_some_and(|rendered| xray_route_type_matches(kind, rendered))
                 && fields
                     .get(1)
                     .is_some_and(|value| xray_route_destination_matches(destination, value))
@@ -151,8 +153,13 @@ fn xray_route_path_matches(arguments: &[String], line: &str) -> Result<bool> {
             .first()
             .is_some_and(|value| xray_route_destination_matches(destination, value)),
     };
+    let path_fields = if route_type.is_some() {
+        &["via"][..]
+    } else {
+        &["via", "dev"][..]
+    };
     Ok(destination_matches
-        && ["via", "dev"].into_iter().all(|field| {
+        && path_fields.iter().copied().all(|field| {
             route_field(&fields, field)
                 == arguments
                     .iter()
@@ -160,6 +167,10 @@ fn xray_route_path_matches(arguments: &[String], line: &str) -> Result<bool> {
                     .and_then(|index| arguments.get(index + 1))
                     .map(String::as_str)
         }))
+}
+
+fn xray_route_type_matches(expected: &str, rendered: &str) -> bool {
+    expected == rendered || expected == "unreachable" && rendered == "7"
 }
 
 fn classify_xray_route(arguments: &[String], output: &str) -> Result<XrayRouteDisposition> {
@@ -232,17 +243,20 @@ fn is_xray_bypass_route(prepared: &PreparedXray, arguments: &[String]) -> Result
 }
 
 fn preflight_xray_routes(prepared: &PreparedXray, interface: &str) -> Result<()> {
-    for (route, _) in traffic_route_pairs(prepared, interface) {
-        if !is_xray_bypass_route(prepared, &route)? {
-            continue;
-        }
-        if inspect_xray_route(prepared, &route)? == XrayRouteDisposition::Collision
-            && !xray_route_exists(prepared, &route)?
-        {
+    let mut routes = vec![endpoint_route_arguments(prepared, "add")];
+    routes.extend(traffic_route_pairs(prepared, interface).into_iter().map(|(route, _)| route));
+    for route in routes {
+        let disposition = inspect_xray_route(prepared, &route)?;
+        if is_xray_bypass_route(prepared, &route)? {
+            if disposition == XrayRouteDisposition::Collision {
+                let (destination, _) = xray_route_destination(&route)?;
+                bail!(
+                    "XRay route already exists with an incompatible path or ownership: {destination}"
+                );
+            }
+        } else if disposition != XrayRouteDisposition::Missing {
             let (destination, _) = xray_route_destination(&route)?;
-            bail!(
-                "XRay route already exists with an incompatible path or ownership: {destination}"
-            );
+            bail!("XRay route already exists without current transaction ownership: {destination}");
         }
     }
     Ok(())
@@ -281,6 +295,90 @@ fn xray_rollback_owns_route(rollback: &[XrayRollback], route: &[String]) -> bool
     rollback
         .iter()
         .any(|action| matches!(action, XrayRollback::Ip(arguments) if arguments == route))
+}
+
+fn xray_owned_routes(rollback: &[XrayRollback]) -> Vec<Vec<String>> {
+    rollback
+        .iter()
+        .filter_map(|action| match action {
+            XrayRollback::Ip(arguments)
+                if arguments.iter().any(|argument| argument == "route") =>
+            {
+                Some(arguments.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn validate_xray_owned_routes(connection: &Connection) -> Result<()> {
+    let interface = connection
+        .interface
+        .as_deref()
+        .context("XRay route ownership has no interface")?;
+    let route_identity = connection
+        .xray_route
+        .as_ref()
+        .context("XRay route ownership has no endpoint identity")?;
+    for arguments in &connection.xray_owned_routes {
+        let action = arguments
+            .iter()
+            .position(|argument| argument == "delete")
+            .context("persisted XRay route has no delete action")?;
+        if !arguments.iter().any(|argument| argument == "route")
+            || arguments.iter().any(|argument| argument == "add")
+            || route_field(
+                &arguments.iter().map(String::as_str).collect::<Vec<_>>(),
+                "proto",
+            ) != Some("66")
+        {
+            bail!("persisted XRay route ownership is invalid");
+        }
+        let (_, route_type) = xray_route_destination(arguments)?;
+        let fields = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        let device = route_field(&fields, "dev");
+        let gateway = route_field(&fields, "via");
+        let metric = route_field(&fields, "metric");
+        let valid_path = if route_type == Some("unreachable") {
+            device.is_none() && gateway.is_none() && metric == Some("42760")
+        } else if device == Some(interface) {
+            gateway.is_none() && metric == Some("5")
+        } else if device == Some(route_identity.uplink.as_str()) {
+            gateway == (route_identity.gateway != "-").then_some(route_identity.gateway.as_str())
+                && (metric == Some("5") || metric.is_none())
+        } else {
+            false
+        };
+        if action == 0 || !valid_path {
+            bail!("persisted XRay route ownership has an invalid path");
+        }
+    }
+    Ok(())
+}
+
+fn validate_xray_owned_route_set(
+    prepared: &PreparedXray,
+    connection: &Connection,
+) -> Result<()> {
+    validate_xray_owned_routes(connection)?;
+    let interface = connection
+        .interface
+        .as_deref()
+        .context("XRay route ownership has no interface")?;
+    let mut generated = vec![endpoint_route_arguments(prepared, "delete")];
+    generated.extend(
+        traffic_route_pairs(prepared, interface)
+            .into_iter()
+            .map(|(_, reverse)| reverse),
+    );
+    if connection
+        .xray_owned_routes
+        .iter()
+        .any(|owned| !generated.contains(owned))
+    {
+        bail!("persisted XRay route ownership is outside the generated connection route set");
+    }
+    Ok(())
 }
 
 fn xray_dns_set(prepared: &PreparedXray, interface: &str) -> Result<()> {
@@ -347,11 +445,11 @@ fn apply_xray_route_mutation(
     reverse: Vec<String>,
     rollback: &mut Vec<XrayRollback>,
 ) -> Result<()> {
-    if xray_route_exists(prepared, &forward)? {
-        rollback.push(XrayRollback::Ip(reverse));
-        return Ok(());
-    }
     if !is_xray_bypass_route(prepared, &forward)? {
+        if xray_route_exists(prepared, &forward)? {
+            let (destination, _) = xray_route_destination(&forward)?;
+            bail!("XRay route already exists without current transaction ownership: {destination}");
+        }
         return apply_xray_mutation(prepared, forward, reverse, rollback);
     }
     match inspect_xray_route(prepared, &forward)? {
@@ -402,7 +500,9 @@ fn xray_route_line_matches(arguments: &[String], line: &str) -> Result<bool> {
     let fields = line.split_whitespace().collect::<Vec<_>>();
     let destination_matches = match route_type {
         Some(kind) => {
-            fields.first().copied() == Some(kind)
+            fields
+                .first()
+                .is_some_and(|rendered| xray_route_type_matches(kind, rendered))
                 && fields
                     .get(1)
                     .is_some_and(|value| xray_route_destination_matches(destination, value))
@@ -411,8 +511,13 @@ fn xray_route_line_matches(arguments: &[String], line: &str) -> Result<bool> {
             .first()
             .is_some_and(|value| xray_route_destination_matches(destination, value)),
     };
+    let identity_fields = if route_type.is_some() {
+        &["via", "proto", "metric"][..]
+    } else {
+        &["via", "dev", "proto", "metric"][..]
+    };
     Ok(destination_matches
-        && ["via", "dev", "proto", "metric"].into_iter().all(|field| {
+        && identity_fields.iter().copied().all(|field| {
             route_field(&fields, field)
                 == arguments
                     .iter()
@@ -486,13 +591,16 @@ fn retain_unstarted_xray_runtime(
     retained.connection = Some(Connection {
         profile_id: profile_id.to_owned(),
         recovery_required: true,
+        disconnecting: false,
         pid: None,
         process_start_ticks: None,
         interface: Some(interface.to_owned()),
         interface_index: None,
         interface_owner: None,
         runtime_directory: Some(directory.to_string_lossy().into_owned()),
+        quick_root_owned: false,
         xray_route: None,
+        xray_owned_routes: Vec::new(),
     });
     *state = retained.clone();
     store
@@ -658,6 +766,44 @@ fn wait_xray_interface(
     bail!("XRay worker did not create its TUN interface")
 }
 
+fn xray_process_group_has_owned_tun2socks(
+    prepared: &PreparedXray,
+    group: u32,
+    interface: &str,
+) -> Result<bool> {
+    let expected_device = format!("tun://{interface}");
+    for entry in fs::read_dir("/proc").context("inspect XRay process group")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if !process_stat_is_live_group_member(&stat, group) {
+            continue;
+        }
+        let Ok(executable) = fs::canonicalize(format!("/proc/{pid}/exe")) else {
+            continue;
+        };
+        if executable != prepared.tun2socks {
+            continue;
+        }
+        let command_line = fs::read(format!("/proc/{pid}/cmdline"))?;
+        if command_line
+            .split(|byte| *byte == 0)
+            .any(|argument| argument == expected_device.as_bytes())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn stop_xray_worker(prepared: &PreparedXray, pid: u32) -> Result<()> {
     if stop_process_group(&prepared.kill, &prepared.path, pid, "XRay worker").is_ok() {
         return Ok(());
@@ -817,19 +963,52 @@ fn cleanup_xray_routes(
     prepared: &PreparedXray,
     interface: &str,
     identity: &Connection,
+    owned_routes: &[Vec<String>],
 ) -> Result<()> {
-    for (_, reverse) in traffic_route_pairs(prepared, interface).into_iter().rev() {
-        if xray_route_exists(prepared, &reverse)? {
+    for reverse in owned_routes.iter().rev() {
+        if xray_route_exists(prepared, reverse)? {
             verify_openvpn_interface_identity(interface, identity)
                 .context("refusing XRay route rollback after interface ownership changed")?;
-            xray_ip_command(prepared, &reverse).context("remove owned XRay traffic route")?;
+            xray_ip_command(prepared, reverse).context("remove owned XRay route")?;
         }
     }
-    if endpoint_route_exists(prepared)? {
-        verify_openvpn_interface_identity(interface, identity)
-            .context("refusing XRay endpoint-route rollback after interface ownership changed")?;
-        xray_ip_command(prepared, &endpoint_route_arguments(prepared, "delete"))
-            .context("remove owned XRay endpoint route")?;
+    Ok(())
+}
+
+fn xray_interface_exists(prepared: &PreparedXray, interface: &str) -> Result<bool> {
+    Ok(Command::new(&prepared.ip)
+        .args(["link", "show", "dev", interface])
+        .env("PATH", &prepared.path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("inspect XRay interface cleanup state")?
+        .success())
+}
+
+fn require_xray_interface_absent(prepared: &PreparedXray, interface: &str) -> Result<()> {
+    if xray_interface_exists(prepared, interface)? {
+        bail!("XRay interface remained or reappeared during cleanup: {interface}");
+    }
+    Ok(())
+}
+
+fn verify_xray_disconnected(
+    prepared: &PreparedXray,
+    interface: &str,
+    connection: &Connection,
+) -> Result<()> {
+    require_xray_interface_absent(prepared, interface)?;
+    for reverse in &connection.xray_owned_routes {
+        if xray_route_exists(prepared, reverse)? {
+            let (destination, _) = xray_route_destination(reverse)?;
+            bail!("owned XRay route remained after disconnect: {destination}");
+        }
+    }
+    if let Some(directory) = connection.runtime_directory.as_deref()
+        && Path::new(directory).exists()
+    {
+        bail!("XRay runtime files remained after disconnect");
     }
     Ok(())
 }
@@ -840,22 +1019,26 @@ fn partial_xray_recovery(
     prepared: &PreparedXray,
     pid: u32,
     interface: &str,
+    owned_routes: Vec<Vec<String>>,
 ) -> State {
     let mut recovery = state.clone();
     recovery.connection = Some(Connection {
         profile_id: profile_id.to_owned(),
         recovery_required: true,
+        disconnecting: false,
         pid: Some(pid),
         process_start_ticks: process_start_ticks(pid),
         interface: Some(interface.to_owned()),
         interface_index: None,
         interface_owner: None,
         runtime_directory: None,
+        quick_root_owned: false,
         xray_route: Some(XrayRouteIdentity {
             endpoint: prepared.endpoint.clone(),
             gateway: prepared.gateway.clone(),
             uplink: prepared.uplink.clone(),
         }),
+        xray_owned_routes: owned_routes,
     });
     recovery
 }
@@ -869,6 +1052,7 @@ fn rollback_or_retain_xray(
     interface: &str,
     rollback: &mut Vec<XrayRollback>,
 ) -> Result<()> {
+    let owned_routes = xray_owned_routes(rollback);
     match rollback_xray_connect(prepared, pid, interface, rollback, None) {
         Ok(()) => Ok(()),
         Err(rollback_error) => {
@@ -884,7 +1068,14 @@ fn rollback_or_retain_xray(
             if interface_disappeared && stop_xray_worker(prepared, pid).is_ok() {
                 return Ok(());
             }
-            *state = partial_xray_recovery(state, profile_id, prepared, pid, interface);
+            *state = partial_xray_recovery(
+                state,
+                profile_id,
+                prepared,
+                pid,
+                interface,
+                owned_routes,
+            );
             store.save(state).context(format!(
                 "persist partial XRay recovery facts after rollback failed; recovery remains available in memory: {rollback_error:#}"
             ))?;
@@ -916,6 +1107,7 @@ fn rollback_xray_connect(
     rollback: &mut Vec<XrayRollback>,
     identity: Option<&Connection>,
 ) -> Result<()> {
+    let owned_routes = xray_owned_routes(rollback);
     let initial_interface_exists = Command::new(&prepared.ip)
         .args(["link", "show", "dev", interface])
         .env("PATH", &prepared.path)
@@ -957,7 +1149,7 @@ fn rollback_xray_connect(
             failures.push(format!("{error:#}"));
         }
     }
-    if let Err(error) = cleanup_xray_routes(prepared, interface, identity) {
+    if let Err(error) = cleanup_xray_routes(prepared, interface, identity, &owned_routes) {
         failures.push(format!("{error:#}"));
     }
     if let Err(error) = stop_xray_worker(prepared, pid) {
@@ -1136,20 +1328,26 @@ fn connect_xray(
     updated.connection = Some(Connection {
         profile_id: id,
         recovery_required: false,
+        disconnecting: false,
         pid: Some(pid),
         process_start_ticks: Some(start_ticks),
         interface: Some(interface.into()),
         interface_index: Some(interface_index),
         interface_owner: Some(interface_owner),
         runtime_directory: None,
+        quick_root_owned: false,
         xray_route: Some(XrayRouteIdentity {
             endpoint: prepared.endpoint.clone(),
             gateway: prepared.gateway.clone(),
             uplink: prepared.uplink.clone(),
         }),
+        xray_owned_routes: Vec::new(),
     });
     let configure_result = configure_xray_interface(&prepared, interface, &mut rollback)
         .and_then(|()| verify_xray_routes(&prepared, interface, &rollback));
+    if let Some(connection) = updated.connection.as_mut() {
+        connection.xray_owned_routes = xray_owned_routes(&rollback);
+    }
     if let Err(error) = configure_result {
         return match rollback_xray_connect(
             &prepared,
@@ -1482,6 +1680,7 @@ fn restore_xray_disconnect(
                 )),
             };
         }
+        restored.xray_owned_routes = xray_owned_routes(&disconnect_again);
     }
     let Some(start_ticks) = process_start_ticks(pid) else {
         if let Err(rollback_error) = rollback_xray_connect(
@@ -1509,28 +1708,18 @@ fn restore_xray_disconnect(
     let mut recovered = state.clone();
     recovered.connection = Some(restored);
     if let Err(error) = store.save(&recovered) {
-        let rollback = rollback_xray_connect(
-            prepared,
-            pid,
-            interface,
-            &mut disconnect_again,
-            recovered.connection.as_ref(),
-        );
-        return match rollback {
-            Ok(()) => {
-                Err(error).context(
-                    "restore XRay connection state failed; disconnected network state retained",
-                )
-            }
-            Err(rollback_error) => {
-                if let Some(connection) = recovered.connection.as_mut() {
-                    connection.recovery_required = true;
-                }
-                *state = recovered;
-                Err(error).context(format!(
-                    "restore XRay connection state and cleanup failed; recovery ownership remains in memory: {rollback_error:#}"
-                ))
-            }
+        if let Some(connection) = recovered.connection.as_mut() {
+            connection.recovery_required = true;
+            connection.disconnecting = true;
+        }
+        *state = recovered.clone();
+        return match store.save(&recovered) {
+            Ok(()) => Err(error).context(
+                "restore XRay connection state failed; pending recovery ownership was retained",
+            ),
+            Err(recovery_error) => Err(error).context(format!(
+                "restore XRay connection state and recovery persistence failed; exact ownership remains in memory: {recovery_error:#}"
+            )),
         };
     }
     *state = recovered;
@@ -1550,10 +1739,10 @@ fn disconnect_xray(
             return Ok("remove retained XRay runtime files".into());
         }
         let retained = state.clone();
-        let mut disconnected = retained.clone();
-        disconnected.connection = None;
+        let disconnected = disconnected_state(&retained);
+        let pending = pending_disconnect_state(&retained)?;
         store
-            .save(&disconnected)
+            .save(&pending)
             .context("persist pending XRay runtime cleanup")?;
         if let Err(cleanup_error) =
             remove_openvpn_runtime(connection.runtime_directory.as_deref())
@@ -1566,17 +1755,39 @@ fn disconnect_xray(
             }
             return Err(cleanup_error).context("remove retained XRay runtime files");
         }
+        store
+            .save(&disconnected)
+            .context("persist completed XRay runtime cleanup")?;
         *state = disconnected;
         return Ok("disconnected".into());
     }
-    let live = connection
-        .pid
-        .and_then(|pid| {
-            (verify_connection_process(connection).ok() == Some(pid))
-                .then(|| xray_process_info(pid).ok())
-                .flatten()
-                .map(|info| (pid, info))
-        });
+    let mut inferred_process_start_ticks = None;
+    let mut live_process_identity_conflict = false;
+    let live = connection.pid.and_then(|pid| {
+        let info = xray_process_info(pid).ok()?;
+        let exact_identity = connection.interface.as_deref() == Some(&info.interface)
+            && connection.xray_route.as_ref().is_some_and(|route| {
+                route.endpoint == info.endpoint
+                    && route.gateway == info.gateway
+                    && route.uplink == info.uplink
+            })
+            && verify_openvpn_interface_identity(&info.interface, connection).is_ok();
+        if !exact_identity {
+            live_process_identity_conflict = true;
+            return None;
+        }
+        if verify_connection_process(connection).ok() == Some(pid) {
+            Some((pid, info))
+        } else if connection.process_start_ticks.is_none() {
+            inferred_process_start_ticks = process_start_ticks(pid);
+            inferred_process_start_ticks.map(|_| (pid, info))
+        } else {
+            None
+        }
+    });
+    if live_process_identity_conflict {
+        bail!("live XRay worker identity no longer matches persisted connection ownership");
+    }
     let (pid, info, process_alive) = if let Some((pid, info)) = live {
         (pid, info, true)
     } else {
@@ -1632,44 +1843,64 @@ fn disconnect_xray(
         verify_openvpn_interface_identity(&info.interface, connection)
             .context("refusing XRay cleanup without exact interface ownership")?;
     }
+    if connection.process_start_ticks.is_none()
+        && inferred_process_start_ticks.is_none()
+        && pid != 0
+    {
+        bail!("legacy XRay process group has no complete start-time and interface ownership identity");
+    }
 
-    let mut disconnected = state.clone();
-    disconnected.connection = None;
+    let mut ownership = connection.clone();
+    if let Some(ticks) = inferred_process_start_ticks {
+        ownership.process_start_ticks = Some(ticks);
+        state
+            .connection
+            .as_mut()
+            .context("XRay connection disappeared during process identity migration")?
+            .process_start_ticks = Some(ticks);
+    }
+    if ownership.xray_owned_routes.is_empty() {
+        bail!(
+            "legacy XRay connection has no persisted exact route ownership; refusing destructive migration"
+        );
+    }
+    validate_xray_owned_route_set(&prepared, &ownership)?;
+    let connection = &ownership;
+
+    let disconnected = disconnected_state(state);
+    let pending = pending_disconnect_state(state)?;
     store
-        .save(&disconnected)
+        .save(&pending)
         .context("persist pending XRay disconnect")?;
 
     if !process_alive && !interface_exists {
         let stale_cleanup = (|| -> Result<()> {
-            for (_, reverse) in traffic_route_pairs(&prepared, &info.interface)
-                .into_iter()
-                .rev()
-                .filter(|(_, reverse)| !reverse.iter().any(|argument| argument == &info.interface))
+            xray_dns_revert(&prepared, &info.interface)
+                .context("revert stale XRay DNS")?;
+            if pid != 0
+                && xray_process_group_has_owned_tun2socks(&prepared, pid, &info.interface)?
             {
-                if xray_route_exists(&prepared, &reverse)? {
-                    xray_ip_command(&prepared, &reverse)
+                stop_xray_worker(&prepared, pid)
+                    .context("stop stale owned XRay tun2socks process group")?;
+            }
+            for reverse in connection
+                .xray_owned_routes
+                .iter()
+                .rev()
+                .filter(|reverse| !reverse.iter().any(|argument| argument == &info.interface))
+            {
+                if xray_route_exists(&prepared, reverse)? {
+                    require_xray_interface_absent(&prepared, &info.interface).context(
+                        "refusing stale XRay route cleanup after an interface reappeared",
+                    )?;
+                    xray_ip_command(&prepared, reverse)
                         .context("remove interface-independent stale XRay route")?;
                 }
             }
-            if endpoint_route_exists(&prepared)? {
-                let interface_reappeared = Command::new(&prepared.ip)
-                    .args(["link", "show", "dev", &info.interface])
-                    .env("PATH", &prepared.path)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()?
-                    .success();
-                if interface_reappeared {
-                    bail!("refusing stale XRay endpoint-route cleanup after an interface reappeared");
-                }
-                xray_ip_command(
-                    &prepared,
-                    &endpoint_route_arguments(&prepared, "delete"),
-                )
-                .context("remove stale XRay endpoint route")?;
-            }
             remove_openvpn_runtime(connection.runtime_directory.as_deref())
                 .context("remove stale XRay runtime files")?;
+            verify_xray_disconnected(&prepared, &info.interface, connection)
+                .context("verify stale XRay cleanup")?;
             Ok(())
         })();
         if let Err(error) = stale_cleanup {
@@ -1683,6 +1914,9 @@ fn disconnect_xray(
             }
             return Err(error).context("clean stale XRay routes");
         }
+        store
+            .save(&disconnected)
+            .context("persist completed stale XRay disconnect")?;
         *state = disconnected;
         return Ok("disconnected".into());
     }
@@ -1693,26 +1927,25 @@ fn disconnect_xray(
         route_rollback.push(XrayRollback::DnsSet {
             interface: info.interface.clone(),
         });
-        for (forward, reverse) in traffic_route_pairs(&prepared, &info.interface)
-            .into_iter()
-            .rev()
-        {
-            if xray_route_exists(&prepared, &reverse)? {
-                apply_xray_mutation(&prepared, reverse, forward, &mut route_rollback)?;
+        for reverse in connection.xray_owned_routes.iter().rev() {
+            if xray_route_exists(&prepared, reverse)? {
+                verify_openvpn_interface_identity(&info.interface, connection)
+                    .context("refusing XRay route disconnect after ownership changed")?;
+                apply_xray_mutation(
+                    &prepared,
+                    reverse.clone(),
+                    reverse_ip_action(reverse.clone()),
+                    &mut route_rollback,
+                )?;
             }
-        }
-        if endpoint_route_exists(&prepared)? {
-            verify_openvpn_interface_identity(&info.interface, connection)
-                .context("refusing XRay endpoint-route disconnect after ownership changed")?;
-            apply_xray_mutation(
-                &prepared,
-                endpoint_route_arguments(&prepared, "delete"),
-                endpoint_route_arguments(&prepared, "add"),
-                &mut route_rollback,
-            )?;
         }
         if process_alive {
             stop_xray_worker(&prepared, pid)?;
+        } else if pid != 0
+            && xray_process_group_has_owned_tun2socks(&prepared, pid, &info.interface)?
+        {
+            stop_xray_worker(&prepared, pid)
+                .context("stop stale owned XRay tun2socks process group")?;
         }
         let exists = Command::new(&prepared.ip)
             .args(["link", "show", "dev", &info.interface])
@@ -1736,6 +1969,8 @@ fn disconnect_xray(
         }
         remove_openvpn_runtime(connection.runtime_directory.as_deref())
             .context("remove XRay runtime files")?;
+        verify_xray_disconnected(&prepared, &info.interface, connection)
+            .context("verify XRay disconnect cleanup")?;
         Ok(())
     })();
     if let Err(error) = operation {
@@ -1766,6 +2001,9 @@ fn disconnect_xray(
             }
         };
     }
+    store
+        .save(&disconnected)
+        .context("persist completed XRay disconnect")?;
     *state = disconnected;
     Ok("disconnected".into())
 }

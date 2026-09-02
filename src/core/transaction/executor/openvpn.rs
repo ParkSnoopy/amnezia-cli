@@ -222,13 +222,16 @@ fn start_openvpn(
             Ok(Some(Connection {
                 profile_id: profile_id.to_owned(),
                 recovery_required: true,
+                disconnecting: false,
                 pid: Some(child.id()),
                 process_start_ticks: process_start_ticks(child.id()),
                 interface: Some(prepared.interface.clone()),
                 interface_index: Some(interface_index(&prepared.interface)?),
                 interface_owner: Some(owner),
                 runtime_directory: Some(directory.to_string_lossy().into_owned()),
+                quick_root_owned: false,
                 xray_route: None,
+                xray_owned_routes: Vec::new(),
             }))
         })();
         let identity_error = recovery_result.as_ref().err().map(|error| format!("{error:#}"));
@@ -236,13 +239,16 @@ fn start_openvpn(
         let fallback_recovery = Connection {
             profile_id: profile_id.to_owned(),
             recovery_required: true,
+            disconnecting: false,
             pid: Some(child.id()),
             process_start_ticks: process_start_ticks(child.id()),
             interface: Some(prepared.interface.clone()),
             interface_index: None,
             interface_owner: None,
             runtime_directory: Some(directory.to_string_lossy().into_owned()),
+            quick_root_owned: false,
             xray_route: None,
+            xray_owned_routes: Vec::new(),
         };
         let stopped = stop_process_group(&prepared.kill, &prepared.path, child.id(), "OpenVPN")
             .or_else(|_| {

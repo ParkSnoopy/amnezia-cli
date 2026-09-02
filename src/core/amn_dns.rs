@@ -103,6 +103,9 @@ fn set_dns(
         if record.target == target && record.applied == applied && current == applied {
             return Ok(());
         }
+        if record.target == target && record.applied == applied && current == record.original {
+            return atomic_write(&target, &record.applied, record.mode);
+        }
         return Err(format!(
             "DNS ownership state already exists for interface {interface}"
         ));
@@ -360,6 +363,23 @@ mod tests {
         let error = unset_dns(&paths, "amnawg0").unwrap_err();
         assert!(error.contains("changed outside amn"));
         assert!(paths.state_root.join("amnawg0").is_dir());
+        fs::remove_dir_all(paths.resolver.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn existing_ownership_can_reapply_after_partial_unset() {
+        let paths = paths("reapply");
+        let servers = ["1.1.1.1".into()];
+        set_dns(&paths, "amnxray0", &servers, &[]).unwrap();
+        fs::write(&paths.resolver, b"nameserver 192.0.2.1\n").unwrap();
+
+        set_dns(&paths, "amnxray0", &servers, &[]).unwrap();
+
+        assert_eq!(
+            fs::read(&paths.resolver).unwrap(),
+            b"nameserver 1.1.1.1\n"
+        );
+        assert!(paths.state_root.join("amnxray0").is_dir());
         fs::remove_dir_all(paths.resolver.parent().unwrap()).unwrap();
     }
 

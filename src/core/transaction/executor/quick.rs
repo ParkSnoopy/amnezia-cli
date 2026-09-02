@@ -118,18 +118,32 @@ struct PreparedPlan {
     expected_peer_keys: Vec<String>,
     runtime_directory: Option<PathBuf>,
     quick_base_created: bool,
+    uses_default_route: bool,
     backend_environment: Option<(String, PathBuf)>,
     force_userspace_backend: bool,
 }
 
+const QUICK_CHILD_OWNER_FILE: &str = ".amn-owner";
+
 impl Drop for PreparedPlan {
     fn drop(&mut self) {
-        if let Some(directory) = &self.runtime_directory {
-            let _ = fs::remove_dir_all(directory);
-        }
-        if self.quick_base_created {
-            let _ = fs::remove_dir(Path::new("/etc/wireguard"));
-        }
+        let _ = self.cleanup_runtime();
+    }
+}
+
+impl PreparedPlan {
+    fn retained_runtime(&self) -> (Option<&Path>, bool) {
+        (self.runtime_directory.as_deref(), self.quick_base_created)
+    }
+
+    fn cleanup_runtime(&mut self) -> Result<()> {
+        cleanup_retained_quick_runtime(
+            self.runtime_directory.as_deref(),
+            self.quick_base_created,
+        )?;
+        self.runtime_directory = None;
+        self.quick_base_created = false;
+        Ok(())
     }
 }
 
@@ -139,6 +153,7 @@ fn prepare_network_plan(
     plan: &CommandPlan,
     settings: &Settings,
     stage_profile: bool,
+    staged_runtime_directory: Option<&Path>,
 ) -> Result<PreparedPlan> {
     let configuration = effective_quick_configuration(
         &store.validated_profile_text(profile)?,
@@ -180,7 +195,8 @@ fn prepare_network_plan(
         validate_quick_dns(&configuration)?;
         resolve_network_program("amn-dns")?;
     }
-    if configuration_has_default_route(&configuration) {
+    let uses_default_route = configuration_has_default_route(&configuration);
+    if uses_default_route {
         resolve_network_program("sysctl")?;
         let nft_available = resolve_network_program("nft").is_ok();
         let iptables_available = resolve_network_program("iptables").is_ok();
@@ -239,7 +255,8 @@ fn prepare_network_plan(
         if effective_user_id() != Some(0) {
             bail!("VPN interface changes require running amn as root");
         }
-        let (directory, quick_base_created) = create_quick_runtime_directory()?;
+        let (directory, quick_base_created) =
+            create_quick_runtime_directory(staged_runtime_directory)?;
         let staged = directory.join(format!("{interface}.conf"));
         if let Err(error) = crate::core::store::write_private(&staged, configuration.as_bytes()) {
             let _ = fs::remove_dir_all(&directory);
@@ -272,6 +289,7 @@ fn prepare_network_plan(
         expected_peer_keys: peer_keys,
         runtime_directory,
         quick_base_created,
+        uses_default_route,
         backend_environment,
         force_userspace_backend,
     })
@@ -324,7 +342,7 @@ pub fn check_profile_dependencies(
         return Ok(());
     }
     let plan = quick_connection_plan(profile)?;
-    prepare_network_plan(store, profile, &plan, settings, false)?;
+    prepare_network_plan(store, profile, &plan, settings, false, None)?;
     Ok(())
 }
 
@@ -681,6 +699,96 @@ fn interface_exists(probe: &Path, interface: &str, path: &std::ffi::OsStr) -> Re
     Ok(status.success())
 }
 
+fn verify_quick_disconnected(prepared: &PreparedPlan) -> Result<()> {
+    let remained = Command::new(&prepared.ip)
+        .args(["link", "show", "dev", &prepared.interface])
+        .env("PATH", &prepared.path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("verify WireGuard-family interface cleanup")?
+        .success();
+    if remained {
+        bail!(
+            "WireGuard-family interface remained after disconnect: {}",
+            prepared.interface
+        );
+    }
+    Ok(())
+}
+
+fn stale_quick_policy_artifacts_exist(prepared: &PreparedPlan) -> Result<bool> {
+    if !prepared.uses_default_route {
+        return Ok(false);
+    }
+    for family in ["-4", "-6"] {
+        let output = Command::new(&prepared.ip)
+            .args([family, "rule", "show"])
+            .env("PATH", &prepared.path)
+            .output()
+            .context("inspect stale WireGuard-family policy rules")?;
+        if !output.status.success() {
+            bail!("inspect stale WireGuard-family policy rules exited with {}", output.status);
+        }
+        let output = String::from_utf8(output.stdout)
+            .context("WireGuard-family policy-rule output is not UTF-8")?;
+        if output.lines().any(|line| {
+            line.contains("suppress_prefixlength 0") || line.contains("fwmark")
+        }) {
+            return Ok(true);
+        }
+    }
+    if let Ok(nft) = resolve_network_program("nft") {
+        let output = Command::new(nft)
+            .args(["list", "tables"])
+            .env("PATH", &prepared.path)
+            .output()
+            .context("inspect stale WireGuard-family nftables state")?;
+        if !output.status.success() {
+            bail!("inspect stale WireGuard-family nftables state exited with {}", output.status);
+        }
+        let output = String::from_utf8(output.stdout)
+            .context("WireGuard-family nftables output is not UTF-8")?;
+        if output.contains(&format!("wg-quick-{}", prepared.interface)) {
+            return Ok(true);
+        }
+    }
+    let markers = [
+        format!("wg-quick(8) rule for {}", prepared.interface),
+        format!("awg-quick(8) rule for {}", prepared.interface),
+    ];
+    for program in ["iptables-save", "ip6tables-save"] {
+        if let Ok(program) = resolve_network_program(program) {
+            let output = Command::new(program)
+                .env("PATH", &prepared.path)
+                .output()
+                .context("inspect stale WireGuard-family iptables state")?;
+            if !output.status.success() {
+                bail!("inspect stale WireGuard-family iptables state exited with {}", output.status);
+            }
+            let output = String::from_utf8(output.stdout)
+                .context("WireGuard-family iptables output is not UTF-8")?;
+            if markers.iter().any(|marker| output.contains(marker)) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn revert_quick_dns(prepared: &PreparedPlan) -> Result<()> {
+    let dns_helper = resolve_network_program("amn-dns")?;
+    let status = Command::new(dns_helper)
+        .args(["unset", &prepared.interface])
+        .env("PATH", &prepared.path)
+        .status()
+        .context("revert stale WireGuard-family DNS")?;
+    if !status.success() {
+        bail!("bundled DNS helper rollback exited with {status}");
+    }
+    Ok(())
+}
+
 fn interface_matches_profile(
     probe: &Path,
     interface: &str,
@@ -786,19 +894,13 @@ fn create_root_runtime_directory() -> Result<PathBuf> {
     create_owned_runtime_directory(Path::new("/run/amn"), "root VPN runtime")
 }
 
-fn create_quick_runtime_directory() -> Result<(PathBuf, bool)> {
+fn create_quick_runtime_directory(planned: Option<&Path>) -> Result<(PathBuf, bool)> {
     let base = Path::new("/etc/wireguard");
-    let base_created = match fs::create_dir(base) {
-        Ok(()) => true,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-        Err(error) => return Err(error).context("create WireGuard runtime directory"),
-    };
+    if !base.exists() {
+        bail!("WireGuard runtime root is not installed; run `sudo ./amn install`");
+    }
+    let mut child_created = None;
     let result = (|| -> Result<PathBuf> {
-        #[cfg(unix)]
-        if base_created {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(base, fs::Permissions::from_mode(0o700))?;
-        }
         let canonical = fs::canonicalize(base).context("inspect WireGuard runtime directory")?;
         if canonical != base {
             bail!("WireGuard runtime directory resolves outside its expected path");
@@ -817,8 +919,21 @@ fn create_quick_runtime_directory() -> Result<(PathBuf, bool)> {
                 bail!("WireGuard runtime directory must be root-owned with mode 0700");
             }
         }
-        let directory = base.join(uuid::Uuid::new_v4().simple().to_string());
+        let directory = planned
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| base.join(uuid::Uuid::new_v4().simple().to_string()));
+        if directory.parent() != Some(base)
+            || directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| {
+                    name.len() != 32 || !name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        {
+            bail!("planned WireGuard-family runtime path is invalid");
+        }
         fs::create_dir(&directory)?;
+        child_created = Some(directory.clone());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -834,19 +949,85 @@ fn create_quick_runtime_directory() -> Result<(PathBuf, bool)> {
                 };
             }
         }
+        let owner = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("planned WireGuard-family runtime path has no owner token")?;
+        crate::core::store::write_private(
+            &directory.join(QUICK_CHILD_OWNER_FILE),
+            format!("{owner}\n").as_bytes(),
+        )?;
         Ok(directory)
     })();
     match result {
-        Ok(directory) => Ok((directory, base_created)),
+        Ok(directory) => Ok((directory, false)),
         Err(error) => {
-            if base_created && let Err(cleanup_error) = fs::remove_dir(base) {
-                return Err(anyhow!(
-                    "{error:#}; WireGuard runtime rollback failed: {cleanup_error}"
-                ));
+            if let Some(directory) = child_created.as_deref() {
+                let _ = fs::remove_dir_all(directory);
             }
             Err(error)
         }
     }
+}
+
+fn cleanup_retained_quick_runtime(
+    directory: Option<&Path>,
+    quick_root_owned: bool,
+) -> Result<()> {
+    let base = Path::new("/etc/wireguard");
+    if let Some(directory) = directory {
+        if directory.parent() != Some(base)
+            || directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| name.len() != 32 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            bail!("retained WireGuard-family runtime path is not application-owned");
+        }
+        if directory.exists() {
+            let canonical_base =
+                fs::canonicalize(base).context("inspect retained WireGuard runtime root")?;
+            if canonical_base != base {
+                bail!("retained WireGuard runtime root resolves outside its expected path");
+            }
+            let metadata = fs::symlink_metadata(directory)
+                .context("inspect retained WireGuard-family runtime directory")?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                if !metadata.is_dir()
+                    || metadata.file_type().is_symlink()
+                    || metadata.uid() != 0
+                    || metadata.permissions().mode() & 0o777 != 0o700
+                {
+                    bail!("retained WireGuard-family runtime directory ownership changed");
+                }
+            }
+            let owner = directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("retained WireGuard-family runtime path has no owner token")?;
+            let marker = fs::read_to_string(directory.join(QUICK_CHILD_OWNER_FILE))
+                .context("verify retained WireGuard-family runtime ownership marker")?;
+            if marker.trim() != owner {
+                bail!("retained WireGuard-family runtime ownership marker changed");
+            }
+            fs::remove_dir_all(directory)
+                .context("remove retained WireGuard-family runtime directory")?;
+        }
+    }
+    if quick_root_owned {
+        match fs::remove_dir(base) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => return Err(error).context("remove retained WireGuard runtime root"),
+        }
+    }
+    Ok(())
 }
 
 fn fail_with_rollback<T>(
@@ -857,6 +1038,25 @@ fn fail_with_rollback<T>(
     prepared: &PreparedPlan,
     failure: anyhow::Error,
 ) -> Result<T> {
+    let (runtime_directory, quick_root_owned) = prepared.retained_runtime();
+    let retained_runtime = runtime_directory
+        .filter(|directory| directory.exists())
+        .map(|directory| directory.to_string_lossy().into_owned());
+    let retained_cleanup = retained_runtime.is_some() || quick_root_owned;
+    let runtime_recovery = || Connection {
+        profile_id: profile_id.to_owned(),
+        recovery_required: true,
+        disconnecting: false,
+        pid: None,
+        process_start_ticks: None,
+        interface: Some(prepared.interface.clone()),
+        interface_index: None,
+        interface_owner: None,
+        runtime_directory: retained_runtime.clone(),
+        quick_root_owned,
+        xray_route: None,
+        xray_owned_routes: Vec::new(),
+    };
     let exists = Command::new(&prepared.ip)
         .args(["link", "show", "dev", &prepared.interface])
         .env("PATH", &prepared.path)
@@ -885,26 +1085,32 @@ fn fail_with_rollback<T>(
             recovery = Some(Connection {
                 profile_id: profile_id.to_owned(),
                 recovery_required: true,
+                disconnecting: false,
                 pid: None,
                 process_start_ticks: None,
                 interface: Some(prepared.interface.clone()),
                 interface_index: Some(index),
                 interface_owner: Some(owner),
-                runtime_directory: None,
+                runtime_directory: retained_runtime.clone(),
+                quick_root_owned,
                 xray_route: None,
+                xray_owned_routes: Vec::new(),
             });
         } else {
             let mut fallback = state.clone();
             fallback.connection = Some(Connection {
                 profile_id: profile_id.to_owned(),
                 recovery_required: true,
+                disconnecting: false,
                 pid: None,
                 process_start_ticks: None,
                 interface: Some(prepared.interface.clone()),
                 interface_index: None,
                 interface_owner: None,
-                runtime_directory: None,
+                runtime_directory: retained_runtime.clone(),
+                quick_root_owned,
                 xray_route: None,
+                xray_owned_routes: Vec::new(),
             });
             *state = fallback.clone();
             let _ = store.save(&fallback);
@@ -914,6 +1120,17 @@ fn fail_with_rollback<T>(
         }
     }
     if !exists {
+        if retained_cleanup {
+            let mut retained = state.clone();
+            retained.connection = Some(runtime_recovery());
+            *state = retained.clone();
+            store
+                .save(&retained)
+                .context("persist retained WireGuard-family runtime cleanup ownership")?;
+            return Err(failure).context(
+                "network action failed; no interface remained and staged runtime cleanup requires retry",
+            );
+        }
         return Err(failure).context("network action failed; no interface remained to roll back");
     }
     if let Some(identity) = recovery.as_ref() {
@@ -921,6 +1138,17 @@ fn fail_with_rollback<T>(
             .context("refusing failed-connect rollback without exact interface ownership")?;
     }
     match rollback(plan, prepared, recovery.as_ref()) {
+        Ok(()) if retained_cleanup => {
+            let mut retained = state.clone();
+            retained.connection = Some(runtime_recovery());
+            *state = retained.clone();
+            store
+                .save(&retained)
+                .context("persist WireGuard-family runtime left after rollback")?;
+            Err(failure).context(
+                "network action rolled back; staged runtime cleanup requires retry",
+            )
+        }
         Ok(()) => Err(failure).context("network action failed; rollback completed"),
         Err(rollback_error) => {
             if let Some(connection) = recovery {

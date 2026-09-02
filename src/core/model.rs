@@ -84,6 +84,8 @@ pub struct Connection {
     pub profile_id: String,
     #[serde(default, skip_serializing_if = "is_false")]
     pub recovery_required: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disconnecting: bool,
     pub pid: Option<u32>,
     #[serde(default)]
     pub process_start_ticks: Option<u64>,
@@ -94,8 +96,12 @@ pub struct Connection {
     pub interface_owner: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub quick_root_owned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xray_route: Option<XrayRouteIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub xray_owned_routes: Vec<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

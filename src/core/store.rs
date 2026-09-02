@@ -128,7 +128,8 @@ impl Store {
         let temporary = path.with_extension("json.new");
         let data = serde_json::to_vec_pretty(state)?;
         write_private(&temporary, &data)?;
-        fs::rename(&temporary, &path).with_context(|| format!("replace {}", path.display()))
+        fs::rename(&temporary, &path).with_context(|| format!("replace {}", path.display()))?;
+        sync_parent_directory(&path)
     }
 
     pub fn import_profile(
@@ -1109,12 +1110,27 @@ pub(crate) fn write_private(path: &Path, data: &[u8]) -> Result<()> {
             .with_context(|| format!("write {}", path.display()))?;
         file.write_all(data)?;
         file.sync_all()?;
-        fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))
+        fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))?;
+        sync_parent_directory(path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .context("durable file path has no parent directory")?;
+        fs::File::open(parent)
+            .with_context(|| format!("open {} for durable metadata sync", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("sync {} metadata", parent.display()))?;
+    }
+    Ok(())
 }
 
 fn reject_executable_directives(text: &str, protocol: &Protocol) -> Result<()> {

@@ -22,13 +22,16 @@ mod tests {
         let connection = Connection {
             profile_id: "p".into(),
             recovery_required: false,
+            disconnecting: false,
             pid: None,
             process_start_ticks: None,
             interface: Some("test".into()),
             interface_index: None,
             interface_owner: None,
             runtime_directory: None,
+            quick_root_owned: false,
             xray_route: None,
+            xray_owned_routes: Vec::new(),
         };
         let disconnect = disconnect_plan(&profile(Protocol::WireGuard), &connection).unwrap();
         let ((_, disconnect_args), (_, disconnect_rollback)) = disconnect.commands();
@@ -113,13 +116,16 @@ mod tests {
         let connection = Connection {
             profile_id: "profile-a".into(),
             recovery_required: true,
+            disconnecting: false,
             pid: None,
             process_start_ticks: None,
             interface: Some("amnxray0".into()),
             interface_index: None,
             interface_owner: None,
             runtime_directory: Some("/run/amn/example".into()),
+            quick_root_owned: false,
             xray_route: None,
+            xray_owned_routes: Vec::new(),
         };
         assert!(is_runtime_only_xray_recovery(&connection));
 
@@ -246,6 +252,16 @@ mod tests {
             "unreachable default proto 66 metric 42760 pref medium"
         )
         .unwrap());
+        assert!(xray_route_line_matches(
+            &arguments,
+            "unreachable default dev lo proto 66 metric 42760 pref medium"
+        )
+        .unwrap());
+        assert!(xray_route_line_matches(
+            &arguments,
+            "7 default dev lo proto 66 metric 42760 pref medium"
+        )
+        .unwrap());
         assert!(!xray_route_line_matches(
             &arguments,
             "unreachable ::/0 proto 66 metric 999 pref medium"
@@ -361,6 +377,7 @@ mod tests {
             &prepared,
             u32::MAX,
             "amnxray0",
+            Vec::new(),
         );
         let connection = retained.connection.unwrap();
 
@@ -383,13 +400,16 @@ mod tests {
         let connection = Connection {
             profile_id: "p".into(),
             recovery_required: false,
+            disconnecting: false,
             pid: Some(pid),
             process_start_ticks: Some(ticks),
             interface: None,
             interface_index: None,
             interface_owner: None,
             runtime_directory: None,
+            quick_root_owned: false,
             xray_route: None,
+            xray_owned_routes: Vec::new(),
         };
         assert_eq!(verify_connection_process(&connection).unwrap(), pid);
         let mut mismatch = connection;
@@ -410,6 +430,39 @@ mod tests {
     }
 
     #[test]
+    fn quick_disconnect_refuses_unowned_staged_cleanup() {
+        let runtime = std::env::temp_dir().join(format!(
+            "amn-quick-cleanup-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        fs::create_dir(&runtime).unwrap();
+        fs::write(runtime.join("amncleanup.conf"), b"private").unwrap();
+        let mut prepared = PreparedPlan {
+            program: "/tools/wg-quick".into(),
+            rollback_program: "/tools/wg-quick".into(),
+            args: Vec::new(),
+            rollback_args: Vec::new(),
+            path: "/usr/bin:/bin".into(),
+            interface_probe: "/tools/wg".into(),
+            ip: "/usr/bin/ip".into(),
+            interface: "amncleanup".into(),
+            interface_existed: true,
+            expected_peer_keys: vec!["peer".into()],
+            runtime_directory: Some(runtime.clone()),
+            quick_base_created: false,
+            uses_default_route: false,
+            backend_environment: None,
+            force_userspace_backend: false,
+        };
+
+        verify_quick_disconnected(&prepared).unwrap();
+        assert!(prepared.cleanup_runtime().is_err());
+        assert!(runtime.exists());
+        fs::remove_dir_all(runtime).unwrap();
+    }
+
+    #[test]
     fn root_network_command_uses_validated_dependency_environment() {
         let prepared = PreparedPlan {
             program: "/tools/wg-quick".into(),
@@ -424,6 +477,7 @@ mod tests {
             expected_peer_keys: vec!["peer".into()],
             runtime_directory: None,
             quick_base_created: false,
+            uses_default_route: false,
             backend_environment: Some((
                 "WG_QUICK_USERSPACE_IMPLEMENTATION".into(),
                 "/tools/wireguard-go".into(),
@@ -479,6 +533,54 @@ mod tests {
         assert!(failure.contains("\\u{1b}"));
         assert!(failure.contains("PrivateKey=[REDACTED]"));
         assert!(!failure.contains("secret"));
+    }
+
+    #[test]
+    fn disconnect_journal_retains_exact_xray_route_ownership() {
+        let route = vec![
+            "route".into(),
+            "delete".into(),
+            "0.0.0.0/1".into(),
+            "dev".into(),
+            "amnxray0".into(),
+            "proto".into(),
+            "66".into(),
+            "metric".into(),
+            "5".into(),
+        ];
+        let state = State {
+            connection: Some(Connection {
+                profile_id: "p".into(),
+                recovery_required: false,
+                disconnecting: false,
+                pid: Some(42),
+                process_start_ticks: Some(7),
+                interface: Some("amnxray0".into()),
+                interface_index: Some(11),
+                interface_owner: Some("owner".into()),
+                runtime_directory: None,
+                quick_root_owned: false,
+                xray_route: Some(XrayRouteIdentity {
+                    endpoint: "192.0.2.1".into(),
+                    gateway: "192.0.2.254".into(),
+                    uplink: "eth0".into(),
+                }),
+                xray_owned_routes: vec![route.clone()],
+            }),
+            ..State::default()
+        };
+
+        let pending = pending_disconnect_state(&state).unwrap();
+        let connection = pending.connection.as_ref().unwrap();
+        assert!(connection.disconnecting);
+        assert_eq!(connection.pid, Some(42));
+        assert_eq!(connection.interface_index, Some(11));
+        assert_eq!(connection.xray_owned_routes, vec![route]);
+        validate_xray_owned_routes(connection).unwrap();
+
+        let mut foreign = connection.clone();
+        foreign.xray_owned_routes[0][4] = "foreign0".into();
+        assert!(validate_xray_owned_routes(&foreign).is_err());
     }
 
     #[test]

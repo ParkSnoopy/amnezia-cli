@@ -32,6 +32,16 @@ impl<'a> Connections<'a> {
             transaction::refresh_connection(self.store, &mut snapshot)?;
             return Ok(connection_status(&snapshot));
         }
+        if self
+            .state
+            .connection
+            .as_ref()
+            .is_some_and(|connection| connection.disconnecting)
+        {
+            transaction::disconnect(self.store, self.state, false)
+                .context("resume interrupted disconnect")?;
+            return Ok(connection_status(self.state));
+        }
         let before = self.state.connection.clone();
         if let Err(error) = transaction::refresh_connection(self.store, self.state) {
             let stale_xray = self
@@ -130,12 +140,15 @@ fn connection_changed(
         (Some(before), Some(after)) => {
             before.profile_id != after.profile_id
                 || before.recovery_required != after.recovery_required
+                || before.disconnecting != after.disconnecting
                 || before.pid != after.pid
                 || before.process_start_ticks != after.process_start_ticks
                 || before.interface != after.interface
                 || before.interface_index != after.interface_index
                 || before.interface_owner != after.interface_owner
                 || before.runtime_directory != after.runtime_directory
+                || before.quick_root_owned != after.quick_root_owned
+                || before.xray_owned_routes != after.xray_owned_routes
                 || before.xray_route.as_ref().map(|route| (&route.endpoint, &route.gateway, &route.uplink))
                     != after.xray_route.as_ref().map(|route| (&route.endpoint, &route.gateway, &route.uplink))
         }
