@@ -32,6 +32,24 @@ amn disconnect
 
 Profile commands use the number shown by `amn profile list`. Numbering starts at `1`.
 
+Generate command completion for Bash or Zsh:
+
+```text
+mkdir -p ~/.local/share/bash-completion/completions
+amn completion bash > ~/.local/share/bash-completion/completions/amn
+
+mkdir -p ~/.zfunc
+amn completion zsh > ~/.zfunc/_amn
+```
+
+Bash loads the file after the shell restarts when `bash-completion` is enabled. Add the following to `~/.zshrc` before restarting Zsh:
+
+```text
+fpath=(~/.zfunc $fpath)
+autoload -Uz compinit
+compinit
+```
+
 Use `--dry-run` to preview a connection and its rollback without changing the network:
 
 ```text
@@ -63,7 +81,7 @@ Use `↑` and `↓` to select connection, profile, settings, split-tunnel, backu
 - `r`: reload saved state
 - `q` or `Esc`: quit
 
-The TUI exposes the same operations as the command-line interface. Structured results are shown as indented entries instead of raw JSON.
+The TUI exposes the same VPN-management operations as the command-line interface. Structured results are shown as indented entries instead of raw JSON.
 
 ## Routing
 

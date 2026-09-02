@@ -1,10 +1,12 @@
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::{Shell, generate};
 
 use crate::core::{
     Command,
+    CompletionShell,
     State,
     Store,
 };
@@ -29,6 +31,17 @@ pub struct Cli {
     pub dry_run: bool,
     #[command(subcommand)]
     pub command: Option<Command>,
+}
+
+pub fn completion(shell: CompletionShell) -> String {
+    let mut command = Cli::command();
+    let mut output = Vec::new();
+    let shell = match shell {
+        CompletionShell::Bash => Shell::Bash,
+        CompletionShell::Zsh => Shell::Zsh,
+    };
+    generate(shell, &mut command, "amn", &mut output);
+    String::from_utf8(output).expect("shell completion output is UTF-8")
 }
 
 pub fn run(store: &Store, state: &mut State, command: Command, dry_run: bool) -> Result<()> {

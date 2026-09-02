@@ -4,7 +4,7 @@
 
 - `amn`: the single Rust frontend binary. Without `--tui` it runs the AmneziaVPN CLI; with `--tui` it runs the AmneziaVPN TUI.
 - `AmneziaVPN CLI`: the default command-oriented interface exposed by `amn`.
-- `AmneziaVPN TUI`: the interactive terminal interface launched only with `amn --tui`; it must expose the same feature operations as the CLI without requiring the user to leave the TUI.
+- `AmneziaVPN TUI`: the interactive terminal interface launched only with `amn --tui`; it must expose the same VPN-management operations as the CLI without requiring the user to leave the TUI. Interface-only helpers such as shell-completion generation remain CLI-only.
 - `core`: shared application logic under `src/core`; CLI and TUI are thin interfaces over the same commands and state transitions.
 - `build script`: Cargo `build.rs`, never a shell script.
 - `bundle`: the release `amn` executable together with required helper and data artifacts in the portable `target/bundle` tree.

@@ -11,10 +11,18 @@ use clap::{
 };
 use strum::EnumIter;
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CompletionShell {
+    Bash,
+    Zsh,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Install amn and its bundled programs under /usr/local (requires root)
     Install,
+    /// Generate a shell completion script
+    Completion { shell: CompletionShell },
     Status,
     Connect {
         profile: Option<usize>,
@@ -277,6 +285,7 @@ mod tests {
     fn tui_actions_cover_every_cli_leaf_command() {
         let mut commands = BTreeSet::new();
         collect_leaf_commands(&ActionParser::command(), "", &mut commands);
+        assert!(commands.remove("completion"));
         let actions = FeatureAction::iter()
             .map(|action| action.info().command.to_owned())
             .collect::<BTreeSet<_>>();

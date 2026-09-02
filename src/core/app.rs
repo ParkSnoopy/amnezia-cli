@@ -56,6 +56,7 @@ pub fn execute(
     let mut output = String::new();
     match command {
         Command::Install => writeln!(output, "{}", install::install()?)?,
+        Command::Completion { shell } => output.push_str(&crate::cli::completion(shell)),
         Command::Status => {
             let recovery_error = Connections::new(store, state).status(!dry_run).err();
             print_status(state, &mut output)?;

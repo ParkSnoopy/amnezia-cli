@@ -32,6 +32,13 @@ fn run() -> Result<()> {
         println!("{}", amn::core::install::install()?);
         return Ok(());
     }
+    if let Some(Command::Completion { shell }) = arguments.command.as_ref() {
+        if arguments.dry_run {
+            bail!("--dry-run is not supported for completion generation");
+        }
+        print!("{}", amn::cli::completion(*shell));
+        return Ok(());
+    }
     let store = if arguments.dry_run {
         Store::discover_read_only(arguments.data_dir)?
     } else {

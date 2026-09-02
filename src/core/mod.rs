@@ -17,6 +17,7 @@ pub use command::{
     ActionInfo,
     BackupCommand,
     Command,
+    CompletionShell,
     FeatureAction,
     LogsCommand,
     ProfileCommand,
