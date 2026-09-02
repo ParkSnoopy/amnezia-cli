@@ -1,50 +1,25 @@
 # Context
 
-## Vocabulary
+## Product boundary
 
-- `amn`: the single Rust frontend binary. Without `--tui` it runs the AmneziaVPN CLI; with `--tui` it runs the AmneziaVPN TUI.
-- `AmneziaVPN CLI`: the default command-oriented interface exposed by `amn`.
-- `AmneziaVPN TUI`: the interactive terminal interface launched only with `amn --tui`; it must expose the same VPN-management operations as the CLI without requiring the user to leave the TUI. Interface-only helpers such as shell-completion generation remain CLI-only.
-- `core`: shared application logic under `src/core`; CLI and TUI are thin interfaces over the same commands and state transitions.
-- `build script`: Cargo `build.rs`, never a shell script.
-- `bundle`: the release `amn` executable together with required helper and data artifacts in the portable `target/bundle` tree.
-- `profile`: an imported VPN configuration stored under the managed profile directory. Runtime network commands use a freshly validated owner-only copy, not the mutable imported pathname.
-- `preview`: the TUI form of CLI dry-run behavior; it displays both the planned network action and its rollback without mutating an interface.
-- `network mutation`: any command that can create, remove, or alter a real network interface, route, DNS state, or firewall state.
-- `connection transaction`: the coherent lifecycle joining dependency preflight, network mutations, readiness, ownership, durable connection state, rollback, and recovery for one selected profile.
-- `connections interface`: the shared caller surface exposing status, preview, connect, disconnect, and reconnect; status reconciliation keeps recovery internal rather than exposing transaction mechanics to CLI or TUI callers.
-- `rollback`: the opposite action attached to every supported network mutation plan. AmneziaWG/WireGuard use interface ownership evidence; XRay persists only route reverse actions actually created by the current transaction and reverses those exact routes, addresses, links, DNS state, and worker processes; OpenVPN owns an isolated process group and private runtime material.
-- `disconnect journal`: the durable connection ownership record remains present with a disconnect-in-progress marker until teardown and all postconditions complete. A restart resumes that teardown; it never loads a false disconnected state while an owned interface, route, DNS transaction, process group, firewall rule, or private runtime path may remain.
-- `Amnezia bundle`: a `vpn://` connection key or JSON full-access bundle. Import selects the preferred supported container and stores only its normalized native protocol profile; it is not retained as a fake protocol.
-- `ownership`: exact equality between the selected profile's peer public-key set and the live interface peer set; interface-name existence alone is not ownership. XRay revalidates every required route before persisting the connection and verifies owned interfaces, routes, and runtime files are absent before reporting disconnection. A compatible pre-existing bypass route remains externally owned: XRay may rely on it, never records a reverse action for it, and never removes it during disconnect or recovery; an exact application-owned stale route is reclaimed only when its persisted reverse action proves transaction ownership. Route identity accepts the kernel's numeric rendering of unreachable routes while still requiring the configured destination, protocol, and metric.
-- `dependency preflight`: resolution and validation of all command-line tools, conditional DNS/firewall helpers, privilege requirements, and kernel or userspace backend requirements before a network mutation begins. AmneziaWG 2 fields select the bundled source-matched userspace backend because the presence of an installed `amneziawg` module does not prove support for that configuration generation.
-- `static runtime`: the `x86_64-unknown-linux-musl` `amn` executable, DNS helper, native netlink ownership helper, WireGuard and AmneziaWG control tools, and native Go XRay runner are static Linux executables; remaining bundled upstream helpers retain their audited linkage requirements.
+`amn` is a Linux-only, CLI-only Go application. It supports exactly XRay, WireGuard, and AmneziaWG. It accepts native XRay JSON and native WireGuard-family INI configuration; it never requires an application-specific profile format.
 
-## Project Concepts
+## Network model
 
-- Direct connections: OpenVPN, WireGuard, AmneziaWG, and general XRay.
-- OpenVPN owns a fixed `amnovpn0` interface and an isolated process group; accepted profiles are self-contained and non-interactive.
-- `XRay`: the Linux-relevant XRay formats, protocols, transports, and security combinations supported by the configured upstream Amnezia client branch; support is not limited to VLESS Reality or the `raw` transport. Imported inbounds, bypass outbounds, and routing rules are not trusted: normalization retains one supported proxy outbound, installs the loopback inbound owned by the Linux runner, and forces that inbound through the retained outbound. Rejecting malformed links and unknown transport or security values that upstream may pass through is an intentional Linux safety deviation.
-- Bundled artifacts: source-built `wg`, `wg-quick`, `wireguard-go`, `awg`, `awg-quick`, `openvpn`, `tun2socks`, `amneziawg-go`, `amnezia-xray-runner`, `amn-dns`, and `amn-link`, plus validated `geoip.dat` and `geosite.dat` data. WireGuard-family userspace ownership changes are applied only to private build copies from parent-repository patch inputs; bundled source submodules remain immutable and reproducible from their pinned gitlinks. The WireGuard-family control tools are linked statically so an older installed glibc cannot prevent configuration or rollback. The XRay runner is built directly as a static Go executable from the audited upstream XRay source graph; it does not cross a C archive boundary or depend on the build host's glibc.
-- DNS lifecycle: XRay, WireGuard, and AmneziaWG use the bundled `amn-dns` helper. It records the exact resolver target, mode, previous contents, and applied contents under protected runtime state, atomically applies DNS, restores only when ownership still matches, and retains recovery state instead of overwriting an external resolver change. WireGuard-family runtime profiles resolve GUI-exported `$PRIMARY_DNS` and `$SECONDARY_DNS` values from their server record during import; existing profiles with unresolved placeholders use the configured DNS servers in the protected runtime copy, without rewriting the stored import.
-- Process lifecycle: exited zombie processes do not count as live process-group ownership. XRay startup rollback escalates from graceful termination to an exact owned process-group force-stop, and a later connect reconciles retained stale XRay state before starting another profile.
-- Bundle cache: Cargo `build.rs` reuses the complete locally built helper bundle only when both its source inputs and every cached artifact still match their recorded content fingerprints; changed, missing, or partial bundles are rebuilt from source.
-- Installation: `amn install` requires root, reads only the complete bundle relative to the running executable, and installs the command under `/usr/local/bin` with its programs under `/usr/local/libexec/amn`.
-- Interface: the TUI uses a dark canvas, light text, hairline cards, restrained blue focus, grouped human-readable actions, and responsive wide and narrow layouts. Actions that need values use typed popups or selectable lists rather than command-text entry; structured output is rendered as hierarchical entries.
-- CLI errors: an invalid command prints both the parser error and the complete command help.
-- Build inputs: branch-tracked GitHub source submodules under `thirdparty/`, upstream Conan recipes under `thirdparty/amnezia-client/recipes`, and an already configured Amnezia Conan remote; executable packages are rebuilt from source rather than deployed from remote binaries.
-- Build tools: Rust with the musl target, Go, Conan 2, a C compiler, musl tools, Linux UAPI headers, CMake, Ninja, and Make.
-- Runtime trust boundary: real interface changes require root, trusted root-owned executables, a controlled dependency `PATH`, and a root-owned mode-0700 runtime directory.
+Every protocol ultimately exposes `amn0`. The supervisor first creates an owner-derived, unpredictable TUN name and keeps its file descriptor. XRay requires the supplied descriptor's live name to match its configuration, so its verified staging interface is renamed to `amn0` before XRay starts; WireGuard-family interfaces are renamed after UAPI configuration. Each source-built backend receives the exact open descriptor. The descriptor and kernel index are the ownership identity, and teardown closes the owned descriptor rather than deleting a mutable name. Traffic selection is always the mathematical complement of user exclusions. There is no kill switch, firewall mutation, policy-routing table, transparent-proxy flag, or local proxy exposed to the user.
 
-## Invariants
+XRay uses its native TUN inbound over the supervisor-created descriptor; the supervisor applies its gateway addresses and ordinary main-table routes because XRay deliberately leaves externally supplied interfaces unconfigured. WireGuard and AmneziaWG use source-built userspace backends, their native UAPI sockets, interface addresses, and the same route mechanism. Peer endpoints and the current SSH client are excluded to prevent routing loops and administration loss.
 
-- Keep one frontend binary and shared logic in `src/core`; preserve `src/cli`, `src/tui`, and `src/main.rs`.
-- Keep protocol-specific parsing and validation in one file per protocol; keep shared encoding, routing, lifecycle, persistence, and rollback behavior generic rather than duplicating it between protocols.
-- Prefer enums, traits, and iterator-driven behavior over hardcoded parallel arrays and indexing.
-- Keep profile IDs internal; CLI and TUI profile selection and presentation use the current displayed order starting at 1.
-- Fail fast when required build tools, recipes, Conan configuration, artifacts, runtime dependencies, or backends are missing.
-- Reject executable profile hooks and mutable `SaveConfig` behavior before privileged execution.
-- Persist private state, profiles, backups, logs, and staged configurations with owner-only permissions where supported.
-- Treat backup restore as an interoperable partial update: accept upstream AmneziaVPN settings keys without an `amn` envelope, replace each supplied overall setting (including the complete server/profile list), and preserve only omitted settings.
-- Never import a profile as connectable unless its protocol-specific configuration validates; never report an incomplete connection as connected or protected.
-- Keep README.md end-user focused. Maintain project vocabulary in `CONTEXT.md` and release criteria in `RELEASE_GATE.md`; do not add `CHANGELOG.md`.
+## Lifecycle
+
+The public command launches an internal supervisor. Before the first network mutation, the supervisor writes a private durable recovery journal containing only ownership and process/interface intent—never configuration or secrets. The supervisor owns the backend process and gives it a parent-death signal. It creates the interface and reports readiness. After displaying the prompt, the public command arms one authoritative ten-second supervisor deadline and waits for an explicit newline confirmation. Until confirmation, no durable active connection exists. Timeout, caller death, signal, setup error, or failed confirmation reports rollback only after routes, the backend, and the owned interface are verified absent; otherwise the recovery journal and runtime evidence remain.
+
+Confirmation is handled by the supervisor, which atomically persists exact process and interface identity before acknowledging success. Disconnect verifies the supervisor identity and sends a private control request. Foreign processes or a replaced `amn0` are never signalled or deleted.
+
+## Source trust
+
+Release runtime programs are built from the pinned `thirdparty/xray-core`, `thirdparty/wireguard-go`, and `thirdparty/amneziawg-go` source trees. No downloaded executable is accepted. Adding or replacing a source submodule requires explicit user approval.
+
+## Private data
+
+`/run/amn` and `/var/lib/amn` are root-only. Native configuration is copied only into private runtime storage while a connection is active or recovery is still required. Logs and state must never include private keys, tokens, endpoints, or complete configuration content.
