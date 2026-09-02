@@ -78,6 +78,19 @@ PersistentKeepalive = 22-30
 	}
 }
 
+func TestWireGuardRejectsIPv6InterfaceAddress(t *testing.T) {
+	config := WireGuard{}
+	if err := config.apply("interface", "address", "fd00::1/64", "wireguard"); err == nil {
+		t.Fatal("expected IPv6 interface address rejection")
+	}
+}
+
+func TestResolveEndpointRejectsIPv6(t *testing.T) {
+	if _, _, err := ResolveEndpoint("[::1]:51820"); err == nil {
+		t.Fatal("expected IPv6 endpoint rejection")
+	}
+}
+
 func writeConfig(t *testing.T, content string) string {
 	t.Helper()
 	file, err := os.CreateTemp(t.TempDir(), "config-*.conf")

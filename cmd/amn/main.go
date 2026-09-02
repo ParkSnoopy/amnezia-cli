@@ -54,7 +54,7 @@ func run(arguments []string) error {
 	case "routes":
 		return showRoutes(arguments[1:])
 	case "version", "--version", "-version":
-		fmt.Printf("amn %s\n", version)
+		fmt.Printf("AmneziaVPN CLI %s\n", version)
 		return nil
 	case "__supervise":
 		if len(arguments) != 2 {
@@ -544,10 +544,10 @@ func currentSSHClient() (netip.Prefix, bool) {
 		return netip.Prefix{}, false
 	}
 	address, err := netip.ParseAddr(fields[0])
-	if err != nil {
+	if err != nil || !address.Is4() {
 		return netip.Prefix{}, false
 	}
-	return netip.PrefixFrom(address, address.BitLen()), true
+	return netip.PrefixFrom(address, 32), true
 }
 
 func randomOwner() (string, error) {
@@ -566,7 +566,7 @@ func requireRoot() error {
 }
 
 func printUsage() {
-	fmt.Println(`amn - Linux VPN client
+	fmt.Println(`AmneziaVPN CLI
 
 Usage:
   amn connect --protocol PROTOCOL --config FILE [--exclude CIDR ...]

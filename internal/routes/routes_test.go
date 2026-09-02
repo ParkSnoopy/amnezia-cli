@@ -7,7 +7,7 @@ import (
 )
 
 func TestComplementDocumentedIPv4Example(t *testing.T) {
-	excluded := []netip.Prefix{netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("::/0")}
+	excluded := []netip.Prefix{netip.MustParsePrefix("192.168.0.0/16")}
 	got, err := Complement(excluded)
 	if err != nil {
 		t.Fatal(err)
@@ -27,12 +27,21 @@ func TestComplementDocumentedIPv4Example(t *testing.T) {
 	}
 }
 
+func TestComplementFullIPv4Exclusion(t *testing.T) {
+	got, err := Complement([]netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty complement, got %v", got)
+	}
+}
+
 func TestComplementHandlesOverlapAndDuplicates(t *testing.T) {
 	excluded := []netip.Prefix{
 		netip.MustParsePrefix("10.0.0.0/8"),
 		netip.MustParsePrefix("10.0.0.0/9"),
 		netip.MustParsePrefix("10.0.0.0/8"),
-		netip.MustParsePrefix("::/0"),
 	}
 	got, err := Complement(excluded)
 	if err != nil {
@@ -48,5 +57,11 @@ func TestComplementHandlesOverlapAndDuplicates(t *testing.T) {
 func TestParseRejectsHostBits(t *testing.T) {
 	if _, err := Parse([]string{"192.168.1.1/24"}); err == nil {
 		t.Fatal("expected host-bit error")
+	}
+}
+
+func TestParseRejectsIPv6(t *testing.T) {
+	if _, err := Parse([]string{"2001:db8::/32"}); err == nil {
+		t.Fatal("expected IPv6 rejection")
 	}
 }

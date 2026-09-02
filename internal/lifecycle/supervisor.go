@@ -104,17 +104,6 @@ func (s *supervisor) start() error {
 		}
 		config.Peer.Endpoint = resolvedEndpoint
 		prefixes = append(prefixes, endpoint)
-		hasIPv4, hasIPv6 := false, false
-		for _, address := range config.Addresses {
-			hasIPv4 = hasIPv4 || address.Addr().Is4()
-			hasIPv6 = hasIPv6 || address.Addr().Is6()
-		}
-		if !hasIPv4 {
-			prefixes = append(prefixes, netip.MustParsePrefix("0.0.0.0/0"))
-		}
-		if !hasIPv6 {
-			prefixes = append(prefixes, netip.MustParsePrefix("::/0"))
-		}
 		allowed, err = routes.Complement(prefixes)
 		if err != nil {
 			return err
@@ -197,7 +186,6 @@ func (s *supervisor) startXRay(allowed []netip.Prefix) error {
 	}
 	return configureTun("amn0", 1500, []netip.Prefix{
 		netip.MustParsePrefix("10.255.255.1/30"),
-		netip.MustParsePrefix("fd00:616d:6e::1/126"),
 	}, allowed)
 }
 
@@ -245,9 +233,6 @@ func configureTun(name string, mtu int, addresses, allowed []netip.Prefix) error
 	}
 	for _, prefix := range allowed {
 		args := []string{"route", "add", prefix.String(), "dev", name}
-		if prefix.Addr().Is6() {
-			args = append([]string{"-6"}, args...)
-		}
 		if err := runIP(ip, args...); err != nil {
 			return err
 		}
@@ -464,9 +449,6 @@ func (s *supervisor) cleanup() {
 					for i := len(s.state.Routes) - 1; i >= 0; i-- {
 						prefix := netip.MustParsePrefix(s.state.Routes[i])
 						args := []string{"route", "del", prefix.String(), "dev", "amn0"}
-						if prefix.Addr().Is6() {
-							args = append([]string{"-6"}, args...)
-						}
 						_ = runIP(ip, args...)
 					}
 				}

@@ -90,6 +90,9 @@ func (c *WireGuard) apply(section, key, value, protocol string) error {
 				if err != nil {
 					return fmt.Errorf("invalid Address: %w", err)
 				}
+				if !prefix.Addr().Is4() {
+					return fmt.Errorf("IPv6 Interface Address is not supported")
+				}
 				c.Addresses = append(c.Addresses, prefix)
 			}
 		case "listenport":
@@ -222,6 +225,9 @@ func ResolveEndpoint(value string) (string, netip.Prefix, error) {
 	address, err := netip.ParseAddr(host)
 	if err != nil {
 		return "", netip.Prefix{}, err
+	}
+	if !address.Is4() {
+		return "", netip.Prefix{}, fmt.Errorf("IPv6 peer Endpoint is not supported")
 	}
 	return resolved, netip.PrefixFrom(address, address.BitLen()), nil
 }

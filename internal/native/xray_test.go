@@ -32,6 +32,11 @@ func TestPrepareXRayPreservesOutboundsAndReplacesManagedTun(t *testing.T) {
 	if len(inbounds) != 2 || inbounds[0].(map[string]any)["protocol"] != "tun" {
 		t.Fatalf("unexpected inbounds: %#v", inbounds)
 	}
+	settings := inbounds[0].(map[string]any)["settings"].(map[string]any)
+	gateways := settings["gateway"].([]any)
+	if len(gateways) != 1 || gateways[0] != "10.255.255.1/30" {
+		t.Fatalf("unexpected IPv4-only gateways: %#v", gateways)
+	}
 	if len(config["outbounds"].([]any)) != 1 {
 		t.Fatal("outbounds changed")
 	}

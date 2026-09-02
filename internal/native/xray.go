@@ -42,7 +42,7 @@ func PrepareXRay(source, destination, tunName string, allowed []netip.Prefix) er
 		"settings": map[string]any{
 			"name":                   tunName,
 			"mtu":                    1500,
-			"gateway":                []string{"10.255.255.1/30", "fd00:616d:6e::1/126"},
+			"gateway":                []string{"10.255.255.1/30"},
 			"autoSystemRoutingTable": routeValues,
 			"autoOutboundsInterface": "auto",
 		},

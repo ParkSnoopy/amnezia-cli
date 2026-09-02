@@ -2,11 +2,11 @@
 
 ## Product boundary
 
-`amn` is a Linux-only, CLI-only Go application. It supports exactly XRay, WireGuard, and AmneziaWG. It accepts native XRay JSON and native WireGuard-family INI configuration; it never requires an application-specific profile format.
+AmneziaVPN CLI is a Linux-only, CLI-only Go application whose executable is named `amn`. It supports exactly XRay, WireGuard, and AmneziaWG. It accepts native XRay JSON and native WireGuard-family INI configuration; it never requires an application-specific profile format.
 
 ## Network model
 
-Every protocol ultimately exposes `amn0`. The supervisor first creates an owner-derived, unpredictable TUN name and keeps its file descriptor. XRay requires the supplied descriptor's live name to match its configuration, so its verified staging interface is renamed to `amn0` before XRay starts; WireGuard-family interfaces are renamed after UAPI configuration. Each source-built backend receives the exact open descriptor. The descriptor and kernel index are the ownership identity, and teardown closes the owned descriptor rather than deleting a mutable name. Traffic selection is always the mathematical complement of user exclusions. There is no kill switch, firewall mutation, policy-routing table, transparent-proxy flag, or local proxy exposed to the user.
+Every protocol ultimately exposes `amn0`. The supervisor first creates an owner-derived, unpredictable TUN name and keeps its file descriptor. XRay requires the supplied descriptor's live name to match its configuration, so its verified staging interface is renamed to `amn0` before XRay starts; WireGuard-family interfaces are renamed after UAPI configuration. Each source-built backend receives the exact open descriptor. The descriptor and kernel index are the ownership identity, and teardown closes the owned descriptor rather than deleting a mutable name. IPv4 traffic selection is always the mathematical complement of IPv4 user exclusions. IPv6 addresses, endpoints, exclusions, gateways, and managed routes are unsupported. There is no kill switch, firewall mutation, policy-routing table, transparent-proxy flag, or local proxy exposed to the user.
 
 XRay uses its native TUN inbound over the supervisor-created descriptor; the supervisor applies its gateway addresses and ordinary main-table routes because XRay deliberately leaves externally supplied interfaces unconfigured. WireGuard and AmneziaWG use source-built userspace backends, their native UAPI sockets, interface addresses, and the same route mechanism. Peer endpoints and the current SSH client are excluded to prevent routing loops and administration loss.
 
@@ -19,6 +19,8 @@ Confirmation is handled by the supervisor, which atomically persists exact proce
 ## Source trust
 
 Release runtime programs are built from the pinned `thirdparty/xray-core`, `thirdparty/wireguard-go`, and `thirdparty/amneziawg-go` source trees. No downloaded executable is accepted. Adding or replacing a source submodule requires explicit user approval.
+
+The project build is generated with CMake and executed with Ninja. Makefiles are not part of the build contract.
 
 ## Private data
 

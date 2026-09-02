@@ -1,8 +1,8 @@
-# amn
+# AmneziaVPN CLI
 
-`amn` is a Linux command-line VPN client for XRay, WireGuard, and AmneziaWG.
+AmneziaVPN CLI is a Linux command-line VPN client. Its executable is named `amn`, and it supports XRay, WireGuard, and AmneziaWG.
 
-It accepts each protocol's native configuration file, creates a TUN interface, and routes traffic automatically. There is no proxy flag and no kill switch. Connections route all IPv4 and IPv6 traffic except the CIDR ranges supplied with `--exclude`.
+It accepts each protocol's native configuration file, creates a TUN interface, and routes traffic automatically. There is no proxy flag and no kill switch. Connections route all IPv4 traffic except the IPv4 CIDR ranges supplied with `--exclude`. IPv6 is not supported or routed through the VPN.
 
 ## Connect
 
@@ -27,6 +27,6 @@ amn routes --exclude 192.168.0.0/16
 amn version
 ```
 
-`routes` prints the exact CIDR complement used for route-all-except behavior.
+`routes` prints the exact IPv4 CIDR complement used for route-all-except behavior. IPv6 CIDRs are rejected.
 
 Only one connection is active at a time. Runtime files and connection state are private to root.
