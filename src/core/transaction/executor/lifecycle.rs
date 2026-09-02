@@ -424,6 +424,7 @@ pub fn connect(
         &state.settings,
         false,
         None,
+        QuickOwnership::default(),
     )?;
     if preflight.interface_existed {
         bail!(
@@ -431,9 +432,15 @@ pub fn connect(
             preflight.interface
         );
     }
+    if stale_quick_policy_artifacts_exist(&preflight)? {
+        bail!(
+            "refusing to connect because stale WireGuard-family firewall or policy state already exists"
+        );
+    }
     drop(preflight);
     let planned_runtime = Path::new("/etc/wireguard")
         .join(uuid::Uuid::new_v4().simple().to_string());
+    let planned_interface_owner = uuid::Uuid::new_v4().to_string();
     let mut staging = state.clone();
     staging.connection = Some(Connection {
         profile_id: profile.id.clone(),
@@ -443,7 +450,7 @@ pub fn connect(
         process_start_ticks: None,
         interface: plan.interface.clone(),
         interface_index: None,
-        interface_owner: None,
+        interface_owner: Some(planned_interface_owner.clone()),
         runtime_directory: Some(planned_runtime.to_string_lossy().into_owned()),
         quick_root_owned: false,
         xray_route: None,
@@ -460,6 +467,10 @@ pub fn connect(
         &state.settings,
         true,
         Some(&planned_runtime),
+        QuickOwnership {
+            owner: Some(&planned_interface_owner),
+            interface_index: None,
+        },
     )?;
     if prepared.interface_existed {
         prepared.cleanup_runtime().context(
@@ -475,7 +486,7 @@ pub fn connect(
             prepared.interface
         );
     }
-    let mut command = network_command(&prepared.program, &prepared.args, &prepared);
+    let mut command = network_command(&prepared.program, &prepared.args, &prepared, None);
     command.stdin(Stdio::null());
     let mut log = if state.settings.logging {
         let log_path = store
@@ -522,40 +533,28 @@ pub fn connect(
         Ok(index) => index,
         Err(error) => return fail_with_rollback(store, state, &profile.id, &plan, &prepared, error),
     };
-    let interface_owner = uuid::Uuid::new_v4().to_string();
-    let ownership = Command::new(&prepared.ip)
-        .args([
-            "link",
-            "set",
-            "dev",
-            &prepared.interface,
-            "alias",
-            &interface_owner,
-        ])
-        .env("PATH", &prepared.path)
-        .status();
-    match ownership {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            return fail_with_rollback(
-                store,
-                state,
-                &profile.id,
-                &plan,
-                &prepared,
-                anyhow!("mark WireGuard-family interface ownership exited with {status}"),
-            );
-        }
-        Err(error) => {
-            return fail_with_rollback(
-                store,
-                state,
-                &profile.id,
-                &plan,
-                &prepared,
-                error.into(),
-            );
-        }
+    let interface_owner = prepared
+        .interface_owner
+        .clone()
+        .context("WireGuard-family interface has no planned ownership token")?;
+    let identity = Connection {
+        profile_id: profile.id.clone(),
+        recovery_required: true,
+        disconnecting: false,
+        pid: None,
+        process_start_ticks: None,
+        interface: plan.interface.clone(),
+        interface_index: Some(interface_index),
+        interface_owner: Some(interface_owner.clone()),
+        runtime_directory: None,
+        quick_root_owned: false,
+        xray_route: None,
+        xray_owned_routes: Vec::new(),
+    };
+    if let Err(error) = verify_openvpn_interface_identity(&prepared.interface, &identity)
+        .context("verify freshly created WireGuard-family interface ownership")
+    {
+        return fail_with_rollback(store, state, &profile.id, &plan, &prepared, error);
     }
     if let Err(error) = prepared.cleanup_runtime() {
         let (runtime_directory, quick_root_owned) = prepared.retained_runtime();
@@ -690,6 +689,11 @@ pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<Str
     if dry_run {
         return Ok(plan.display());
     }
+    reconcile_precommitted_quick_identity(store, state, &profile)?;
+    let connection = state
+        .connection
+        .clone()
+        .context("WireGuard-family recovery ownership record is missing")?;
     if connection.runtime_directory.is_some() || connection.quick_root_owned {
         let pending = pending_disconnect_state(state)?;
         store
@@ -732,6 +736,10 @@ pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<Str
         &state.settings,
         true,
         Some(&planned_runtime),
+        QuickOwnership {
+            owner: connection.interface_owner.as_deref(),
+            interface_index: connection.interface_index,
+        },
     )?;
     if !prepared.interface_existed {
         let disconnected = disconnected_state(state);
@@ -788,7 +796,7 @@ pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<Str
         .context("persist pending WireGuard-family disconnect")?;
     verify_openvpn_interface_identity(&prepared.interface, &connection)
         .context("WireGuard-family interface ownership changed before disconnect")?;
-    let operation = network_command(&prepared.program, &prepared.args, &prepared)
+    let operation = network_command(&prepared.program, &prepared.args, &prepared, None)
         .output()
         .with_context(|| format!("run {}", plan.program()))
         .and_then(|output| {
@@ -853,6 +861,29 @@ pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<Str
         }
         return Err(error).context("WireGuard-family disconnect failed; connection restored");
     }
+    if let Err(error) = (|| -> Result<()> {
+        if stale_quick_policy_artifacts_exist(&prepared)? {
+            bail!("WireGuard-family firewall or policy state remained after disconnect");
+        }
+        Ok(())
+    })() {
+        let (runtime_directory, quick_root_owned) = prepared.retained_runtime();
+        if let Some(connection) = state.connection.as_mut() {
+            connection.disconnecting = true;
+            connection.recovery_required = true;
+            connection.runtime_directory =
+                runtime_directory.map(|path| path.to_string_lossy().into_owned());
+            connection.quick_root_owned = quick_root_owned;
+        }
+        return match store.save(state) {
+            Ok(()) => Err(error).context(
+                "WireGuard-family network teardown completed; firewall verification requires retry",
+            ),
+            Err(persist_error) => Err(error).context(format!(
+                "WireGuard-family network teardown completed, but firewall verification and recovery persistence failed; recovery remains in memory: {persist_error:#}"
+            )),
+        };
+    }
     if let Err(error) = prepared.cleanup_runtime() {
         let (runtime_directory, quick_root_owned) = prepared.retained_runtime();
         if let Some(connection) = state.connection.as_mut() {
@@ -878,6 +909,107 @@ pub fn disconnect(store: &Store, state: &mut State, dry_run: bool) -> Result<Str
     Ok("disconnected".into())
 }
 
+fn reconcile_precommitted_quick_identity(
+    store: &Store,
+    state: &mut State,
+    profile: &Profile,
+) -> Result<()> {
+    let connection = state
+        .connection
+        .clone()
+        .context("WireGuard-family recovery ownership record is missing")?;
+    if !connection.recovery_required || connection.interface_owner.is_none() {
+        return Ok(());
+    }
+    let final_interface = connection
+        .interface
+        .as_deref()
+        .context("WireGuard-family recovery interface is missing")?;
+    let owner = connection
+        .interface_owner
+        .as_deref()
+        .context("WireGuard-family recovery ownership alias is missing")?;
+    let spec = quick_spec(&profile.protocol)?;
+    let probe = resolve_network_program(spec.probe_program)?;
+    let path =
+        std::env::join_paths(network_program_directories()).context("construct dependency PATH")?;
+    let staging_interface = quick_staging_interface_name(owner)?;
+    let (interface, using_staging) = if interface_exists(&probe, &staging_interface, &path)? {
+        (staging_interface.as_str(), true)
+    } else if interface_exists(&probe, final_interface, &path)? {
+        (final_interface, false)
+    } else {
+        return Ok(());
+    };
+    let index = interface_index(interface)?;
+    let mut candidate = connection.clone();
+    candidate.interface_index = Some(index);
+    if let Err(error) = verify_openvpn_interface_identity(interface, &candidate) {
+        if !using_staging {
+            return Err(error).context("refusing to adopt a pre-committed owner for a changed interface");
+        }
+        let link_helper = resolve_network_program("amn-link")?;
+        let status = Command::new(&link_helper)
+            .args(["recover", interface, owner])
+            .env("PATH", &path)
+            .status()
+            .context("recover atomic Quick staging-interface ownership")?;
+        if !status.success() {
+            return Err(error).context(
+                "refusing to recover a staging interface without its exact precommitted identity",
+            );
+        }
+        verify_openvpn_interface_identity(interface, &candidate)
+            .context("verify recovered Quick staging-interface ownership")?;
+    }
+
+    let mut pending = state.clone();
+    let saved = pending
+        .connection
+        .as_mut()
+        .context("WireGuard-family recovery ownership record is missing")?;
+    saved.interface_index = Some(index);
+    saved.disconnecting = true;
+    store
+        .save(&pending)
+        .context("persist adopted WireGuard-family interface identity before recovery mutation")?;
+    *state = pending;
+
+    let configuration = store.validated_profile_text(profile)?;
+    let expected_peers = configuration_values(&configuration, "PublicKey");
+    let actual_peers = interface_peer_keys(&probe, interface, &path)?;
+    if !expected_peers.is_empty()
+        && peer_sets_match(&expected_peers, actual_peers.iter().map(String::as_str))
+    {
+        return Ok(());
+    }
+    if !actual_peers.is_empty() {
+        bail!(
+            "refusing to remove a pre-committed WireGuard-family interface with a nonempty unexpected peer set"
+        );
+    }
+
+    let identity = state
+        .connection
+        .as_ref()
+        .context("WireGuard-family recovery ownership record is missing")?;
+    verify_openvpn_interface_identity(interface, identity)
+        .context("WireGuard-family pre-configuration interface ownership changed")?;
+    let link_helper = resolve_network_program("amn-link")?;
+    let status = Command::new(&link_helper)
+        .args(["delete-index", &index.to_string(), owner])
+        .env("PATH", &path)
+        .status()
+        .context("remove owned pre-configuration WireGuard-family interface")?;
+    if !status.success() {
+        bail!("remove owned pre-configuration WireGuard-family interface exited with {status}");
+    }
+    if interface_exists(&probe, interface, &path)? {
+        bail!("owned pre-configuration WireGuard-family interface remained after removal");
+    }
+    Ok(())
+}
+
 fn disconnect_plan(profile: &Profile, connection: &Connection) -> Result<CommandPlan> {
     Ok(CommandPlan {
         mutation: ReversibleMutation::quick(
@@ -893,34 +1025,19 @@ fn restore_quick_interface_identity(
     prepared: &PreparedPlan,
     state: &mut State,
 ) -> Result<()> {
-    let owner = state
-        .connection
-        .as_ref()
-        .and_then(|connection| connection.interface_owner.as_deref())
-        .context("WireGuard-family connection has no ownership alias")?
-        .to_owned();
-    let status = Command::new(&prepared.ip)
-        .args([
-            "link",
-            "set",
-            "dev",
-            &prepared.interface,
-            "alias",
-            &owner,
-        ])
-        .env("PATH", &prepared.path)
-        .status()
-        .context("restore WireGuard-family interface ownership alias")?;
-    if !status.success() {
-        bail!("restore WireGuard-family interface ownership alias exited with {status}");
-    }
     let index = interface_index(&prepared.interface)?;
+    let mut candidate = state
+        .connection
+        .clone()
+        .context("WireGuard-family connection ownership record is missing")?;
+    candidate.interface_index = Some(index);
+    verify_openvpn_interface_identity(&prepared.interface, &candidate)
+        .context("verify restored WireGuard-family interface ownership")?;
     let connection = state
         .connection
         .as_mut()
         .context("WireGuard-family connection ownership record is missing")?;
     connection.interface_index = Some(index);
-    connection.interface_owner = Some(owner);
     Ok(())
 }
 
@@ -1173,6 +1290,7 @@ fn is_bundled_network_program(program: &str) -> bool {
             | "tun2socks"
             | "amnezia-xray-runner"
             | "amn-dns"
+            | "amn-link"
     )
 }
 

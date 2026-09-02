@@ -123,6 +123,7 @@ const BUNDLE_ARTIFACTS: &[&str] = &[
     "amneziawg-go",
     "amnezia-xray-runner",
     "amn-dns",
+    "amn-link",
     "geoip.dat",
     "geosite.dat",
 ];
@@ -131,6 +132,8 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/core/amnezia_xray_runner.go");
     println!("cargo:rerun-if-changed=src/core/amn_dns.rs");
+    println!("cargo:rerun-if-changed=src/core/amn_link.c");
+    println!("cargo:rerun-if-changed=patches/amneziawg-go-owner.patch");
     println!("cargo:rerun-if-changed=thirdparty/amnezia-client/recipes");
     println!("cargo:rerun-if-changed=thirdparty/wireguard-tools/src");
     println!("cargo:rerun-if-changed=thirdparty/amneziawg-tools/src");
@@ -178,9 +181,15 @@ fn main() {
     {
         panic!("required Conan remote is missing or has the wrong URL: {expected_remote}");
     }
-    export_recipes(&conan, &recipes);
+    let out_directory = PathBuf::from(required_env("OUT_DIR"));
+    export_recipes(
+        &conan,
+        &recipes,
+        &out_directory.join("recipe-exports"),
+        &manifest.join("patches/amneziawg-go-owner.patch"),
+    );
 
-    let conan_output = PathBuf::from(required_env("OUT_DIR")).join("conan");
+    let conan_output = out_directory.join("conan");
     let deploy = conan_output.join("deploy");
     if conan_output.exists() {
         fs::remove_dir_all(&conan_output).unwrap_or_else(|error| {
@@ -243,6 +252,12 @@ fn main() {
         &manifest.join("src/core/amn_dns.rs"),
         &bundle.join("amn-dns"),
     );
+    build_static_c_helper(
+        &musl_compiler,
+        &readelf,
+        &manifest.join("src/core/amn_link.c"),
+        &bundle.join("amn-link"),
+    );
 
     for artifact_kind in
         std::iter::successors(Some(RecipeArtifact::OpenVpn), |artifact| artifact.next())
@@ -261,8 +276,13 @@ fn main() {
             make_executable(&destination);
         }
     }
+    let quick_build_tools = QuickBuildTools {
+        musl_compiler: &musl_compiler,
+        readelf: &readelf,
+        make: &make,
+    };
     build_quick_tools(
-        &make,
+        &quick_build_tools,
         &manifest.join("thirdparty/wireguard-tools/src"),
         &conan_output.join("wireguard-tools"),
         &bundle,
@@ -270,7 +290,7 @@ fn main() {
         "wg-quick",
     );
     build_quick_tools(
-        &make,
+        &quick_build_tools,
         &manifest.join("thirdparty/amneziawg-tools/src"),
         &conan_output.join("amneziawg-tools"),
         &bundle,
@@ -374,6 +394,40 @@ fn build_static_rust_helper(
     );
 }
 
+fn build_static_c_helper(
+    musl_compiler: &Path,
+    readelf: &Path,
+    source: &Path,
+    output: &Path,
+) {
+    require_file(source);
+    run_os(
+        musl_compiler,
+        &[
+            "-std=c11".into(),
+            "-Wall".into(),
+            "-Wextra".into(),
+            "-Werror".into(),
+            "-O2".into(),
+            "-static".into(),
+            "-idirafter".into(),
+            "/usr/include".into(),
+            "-idirafter".into(),
+            "/usr/include/x86_64-linux-gnu".into(),
+            source.as_os_str().to_owned(),
+            "-o".into(),
+            output.as_os_str().to_owned(),
+        ],
+        output.parent().unwrap_or_else(|| Path::new(".")),
+    );
+    validate_artifact(output, true);
+    validate_static_elf(
+        readelf,
+        output,
+        output.parent().unwrap_or_else(|| Path::new(".")),
+    );
+}
+
 fn validate_static_elf(readelf: &Path, executable: &Path, directory: &Path) {
     let program_headers = run_capture_os(
         readelf,
@@ -402,8 +456,53 @@ fn validate_static_elf(readelf: &Path, executable: &Path, directory: &Path) {
     }
 }
 
+fn replace_build_source(path: &Path, old: &str, new: &str) {
+    let source = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("read build source {}: {error}", path.display()));
+    if source.matches(old).count() != 1 {
+        panic!("build source integration point changed: {}", path.display());
+    }
+    fs::write(path, source.replace(old, new))
+        .unwrap_or_else(|error| panic!("write build source {}: {error}", path.display()));
+}
+
+fn patch_wireguard_go_ownership(main: &Path) {
+    replace_build_source(main, "\t\"os\"\n\t\"os/signal\"", "\t\"os\"\n\t\"os/exec\"\n\t\"os/signal\"");
+    replace_build_source(
+        main,
+        "func printUsage() {",
+        concat!(
+            "func claimInterfaceOwnership(interfaceName string) error {\n",
+            "\towner := os.Getenv(\"AMN_QUICK_OWNER\")\n",
+            "\thelper := os.Getenv(\"AMN_LINK_HELPER\")\n",
+            "\tif owner == \"\" && helper == \"\" {\n",
+            "\t\treturn nil\n",
+            "\t}\n",
+            "\tif owner == \"\" || helper == \"\" {\n",
+            "\t\treturn fmt.Errorf(\"interface ownership environment is incomplete\")\n",
+            "\t}\n",
+            "\treturn exec.Command(helper, \"claim\", interfaceName, owner).Run()\n",
+            "}\n\n",
+            "func printUsage() {",
+        ),
+    );
+    replace_build_source(
+        main,
+        "\t// open UAPI file",
+        concat!(
+            "\tif err = claimInterfaceOwnership(interfaceName); err != nil {\n",
+            "\t\t_ = tdev.Close()\n",
+            "\t\tlogger.Errorf(\"Failed to establish TUN interface ownership: %v\", err)\n",
+            "\t\tos.Exit(ExitSetupFailed)\n",
+            "\t}\n\n",
+            "\t// open UAPI file",
+        ),
+    );
+}
+
 fn build_wireguard_go(go: &Path, source: &Path, build: &Path, bundle: &Path) {
     copy_directory(source, build);
+    patch_wireguard_go_ownership(&build.join("main.go"));
     let output = build.join("wireguard-go");
     let status = Command::new(go)
         .args(["build", "-trimpath", "-buildvcs=false", "-o"])
@@ -427,8 +526,14 @@ fn build_wireguard_go(go: &Path, source: &Path, build: &Path, bundle: &Path) {
     make_executable(&destination);
 }
 
+struct QuickBuildTools<'a> {
+    musl_compiler: &'a Path,
+    readelf: &'a Path,
+    make: &'a Path,
+}
+
 fn build_quick_tools(
-    make: &Path,
+    tools: &QuickBuildTools<'_>,
     source: &Path,
     build: &Path,
     bundle: &Path,
@@ -437,8 +542,11 @@ fn build_quick_tools(
 ) {
     copy_directory(source, build);
     run_os(
-        make,
+        tools.make,
         &[
+            format!("CC={}", tools.musl_compiler.display()).into(),
+            "CPPFLAGS=-idirafter /usr/include -idirafter /usr/include/x86_64-linux-gnu".into(),
+            "LDFLAGS=-static".into(),
             "WITH_BASHCOMPLETION=no".into(),
             "WITH_SYSTEMDUNITS=no".into(),
             "WITH_WGQUICK=yes".into(),
@@ -448,6 +556,7 @@ fn build_quick_tools(
     );
     let executable = build.join("wg");
     validate_artifact(&executable, true);
+    validate_static_elf(tools.readelf, &executable, build);
     let destination = bundle.join(program);
     fs::copy(&executable, &destination).unwrap_or_else(|error| {
         panic!(
@@ -468,6 +577,38 @@ fn build_quick_tools(
 fn stage_quick_dns_helper(source: &Path, destination: &Path, allow_forced_userspace: bool) {
     const INSERTION: &str = "# ~~ function override insertion point ~~";
     const ADD_IF_START: &str = "add_if() {\n\tlocal ret\n";
+    const WG_NATIVE_CREATE: &str = "cmd ip link add dev \"$INTERFACE\" type wireguard";
+    const AWG_NATIVE_CREATE: &str = "cmd ip link add \"$INTERFACE\" type amneziawg";
+    const OWNED_LINK_DELETE: &str = r#"if [[ -n ${AMN_QUICK_CREATED_IFINDEX:-} ]]; then
+		cmd amn_quick_link delete-index "$AMN_QUICK_CREATED_IFINDEX" "$AMN_QUICK_OWNER"
+	else
+		cmd amn_quick_link delete-name "$INTERFACE" "$AMN_QUICK_OWNER"
+	fi"#;
+    const CONFIGURE_INTERFACE: &str = "	trap 'del_if; exit' INT TERM EXIT\n	add_if\n	execute_hooks \"${PRE_UP[@]}\"\n	set_config\n";
+    const DOWN_START: &str = "cmd_down() {\n";
+    const OWNED_DOWN_START: &str = r#"cmd_down() {
+	[[ -n ${AMN_QUICK_OWNER:-} ]] || die "interface ownership token is not configured"
+	[[ -n ${AMN_QUICK_CREATED_IFINDEX:-} ]] || die "persisted interface index is not configured"
+	amn_quick_created_interface_matches || die "interface ownership changed before disconnect"
+"#;
+    const CONFIGURE_OWNED_INTERFACE: &str = r#"	[[ -n ${AMN_QUICK_OWNER:-} ]] || die "interface ownership token is not configured"
+	AMN_QUICK_FINAL_INTERFACE=$INTERFACE
+	AMN_QUICK_OWNER_HEX=${AMN_QUICK_OWNER//-/}
+	[[ $AMN_QUICK_OWNER_HEX =~ ^[0-9a-fA-F]{32}$ ]] || die "interface ownership token is invalid"
+	AMN_QUICK_STAGING_INTERFACE="amt${AMN_QUICK_OWNER_HEX:0:12}"
+	INTERFACE=$AMN_QUICK_STAGING_INTERFACE
+	add_if
+	AMN_QUICK_CREATED_IFINDEX=$(amn_quick_interface_index) || die "created interface identity could not be read"
+	trap 'amn_quick_delete_created_interface; exit' INT TERM EXIT
+	amn_quick_created_interface_matches || die "created interface ownership was not established"
+	cmd amn_quick_link rename "$AMN_QUICK_CREATED_IFINDEX" "$AMN_QUICK_OWNER" "$AMN_QUICK_FINAL_INTERFACE"
+	INTERFACE=$AMN_QUICK_FINAL_INTERFACE
+	amn_quick_created_interface_matches || die "created interface identity changed while finalizing its name"
+	execute_hooks "${PRE_UP[@]}"
+	amn_quick_created_interface_matches || die "created interface identity changed before configuration"
+	set_config
+	amn_quick_created_interface_matches || die "created interface identity changed while configuration was applied"
+"#;
     const FORCED_ADD_IF_START: &str = r#"add_if() {
 	local ret
 	if [[ ${AMN_QUICK_FORCE_USERSPACE:-0} == 1 ]]; then
@@ -476,7 +617,36 @@ fn stage_quick_dns_helper(source: &Path, destination: &Path, allow_forced_usersp
 		return
 	fi
 "#;
-    const OVERRIDES: &str = r#"set_dns() {
+    const OVERRIDES: &str = r#"AMN_QUICK_CREATED_IFINDEX=${AMN_QUICK_EXPECTED_IFINDEX:-}
+
+amn_quick_interface_index() {
+    local current_index
+    [[ -r /sys/class/net/$INTERFACE/ifindex ]] || return 1
+    read -r current_index < "/sys/class/net/$INTERFACE/ifindex" || return 1
+    [[ $current_index =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$current_index"
+}
+
+amn_quick_link() {
+    [[ -x ${AMN_LINK_HELPER:-} ]] || die "native interface ownership helper is unavailable"
+    "$AMN_LINK_HELPER" "$@"
+}
+
+amn_quick_created_interface_matches() {
+    amn_quick_link verify-name "$AMN_QUICK_CREATED_IFINDEX" "$AMN_QUICK_OWNER" "$INTERFACE"
+}
+
+amn_quick_delete_created_interface() {
+    trap - INT TERM EXIT
+    if amn_quick_created_interface_matches; then
+        del_if
+    else
+        echo "[!] Refusing to delete an interface whose identity changed" >&2
+        return 1
+    fi
+}
+
+set_dns() {
     [[ ${#DNS[@]} -gt 0 || ${#DNS_SEARCH[@]} -gt 0 ]] || return 0
     cmd amn-dns set "$INTERFACE" "${DNS[@]}" --search "${DNS_SEARCH[@]}"
     HAVE_SET_DNS=1
@@ -489,14 +659,33 @@ unset_dns() {
 "#;
     let script = fs::read_to_string(source)
         .unwrap_or_else(|error| panic!("read quick tool {}: {error}", source.display()));
+    let native_create = if allow_forced_userspace {
+        AWG_NATIVE_CREATE
+    } else {
+        WG_NATIVE_CREATE
+    };
     if script.matches(INSERTION).count() != 1
         || (allow_forced_userspace && script.matches(ADD_IF_START).count() != 1)
+        || script.matches(CONFIGURE_INTERFACE).count() != 1
+        || script.matches(DOWN_START).count() != 1
+        || script.matches(native_create).count() != 1
+        || script.matches("cmd ip link delete dev \"$INTERFACE\"").count() != 1
         || script.matches("unset_dns || true").count() != 1
     {
         panic!("quick tool DNS integration point changed: {}", source.display());
     }
     let mut script = script
         .replace(INSERTION, OVERRIDES)
+        .replace(CONFIGURE_INTERFACE, CONFIGURE_OWNED_INTERFACE)
+        .replace(DOWN_START, OWNED_DOWN_START)
+        .replace(
+            native_create,
+            &format!(
+                "cmd amn_quick_link create {} \"$INTERFACE\" \"$AMN_QUICK_OWNER\"",
+                if allow_forced_userspace { "amneziawg" } else { "wireguard" }
+            ),
+        )
+        .replace("cmd ip link delete dev \"$INTERFACE\"", OWNED_LINK_DELETE)
         .replace("unset_dns || true", "unset_dns");
     if allow_forced_userspace {
         script = script.replace(ADD_IF_START, FORCED_ADD_IF_START);
@@ -565,11 +754,49 @@ fn copy_symlink(source: &Path, _destination: &Path) {
     panic!("symbolic build input is unsupported: {}", source.display());
 }
 
-fn export_recipes(conan: &Path, recipes: &Path) {
+fn stage_amneziawg_recipe(recipe: &Path, owner_patch: &Path) {
+    require_file(owner_patch);
+    let patches = recipe.join("patches");
+    fs::create_dir_all(&patches)
+        .unwrap_or_else(|error| panic!("create recipe patch directory {}: {error}", patches.display()));
+    fs::copy(owner_patch, patches.join("amn-owner.patch")).unwrap_or_else(|error| {
+        panic!("copy AmneziaWG ownership patch {}: {error}", owner_patch.display())
+    });
+    let conanfile = recipe.join("conanfile.py");
+    replace_build_source(
+        &conanfile,
+        "from conan.tools.files import get, chdir",
+        "from conan.tools.files import get, chdir, patch",
+    );
+    replace_build_source(
+        &conanfile,
+        "    package_type = \"application\"",
+        "    package_type = \"application\"\n    exports_sources = \"patches/*\"",
+    );
+    replace_build_source(
+        &conanfile,
+        "            sha256=\"a95853baa25d438a3e92ea5207bd315e3a45143b5209488ebf7f0b44e2e2bcc3\", strip_root=True\n        )",
+        "            sha256=\"a95853baa25d438a3e92ea5207bd315e3a45143b5209488ebf7f0b44e2e2bcc3\", strip_root=True\n        )\n        patch(self, patch_file=os.path.join(self.export_sources_folder, \"patches\", \"amn-owner.patch\"))",
+    );
+}
+
+fn export_recipes(conan: &Path, recipes: &Path, staged_recipes: &Path, owner_patch: &Path) {
+    if staged_recipes.exists() {
+        fs::remove_dir_all(staged_recipes).unwrap_or_else(|error| {
+            panic!("remove stale recipe staging {}: {error}", staged_recipes.display())
+        });
+    }
+    fs::create_dir_all(staged_recipes).unwrap_or_else(|error| {
+        panic!("create recipe staging {}: {error}", staged_recipes.display())
+    });
     for recipe_kind in
         std::iter::successors(Some(RecipeInput::OpenVpn), |recipe| recipe.next())
     {
-        let recipe = recipes.join(recipe_kind.directory());
+        let recipe = staged_recipes.join(recipe_kind.directory());
+        copy_directory(&recipes.join(recipe_kind.directory()), &recipe);
+        if matches!(recipe_kind, RecipeInput::AmneziaWg) {
+            stage_amneziawg_recipe(&recipe, owner_patch);
+        }
         if matches!(recipe_kind, RecipeInput::Go) {
             run_os(
                 conan,
@@ -579,7 +806,7 @@ fn export_recipes(conan: &Path, recipes: &Path) {
                     "--version".into(),
                     "1.26.0".into(),
                 ],
-                recipes,
+                staged_recipes,
             );
             run_os(
                 conan,
@@ -589,13 +816,13 @@ fn export_recipes(conan: &Path, recipes: &Path) {
                     "--version".into(),
                     "1.23.12".into(),
                 ],
-                recipes,
+                staged_recipes,
             );
         } else {
             run_os(
                 conan,
                 &["export".into(), recipe.as_os_str().to_owned()],
-                recipes,
+                staged_recipes,
             );
         }
     }
@@ -710,6 +937,8 @@ fn source_fingerprint(manifest: &Path) -> u64 {
         "build.rs",
         "src/core/amnezia_xray_runner.go",
         "src/core/amn_dns.rs",
+        "src/core/amn_link.c",
+        "patches/amneziawg-go-owner.patch",
         "thirdparty/amnezia-client/recipes",
         "thirdparty/wireguard-tools/src",
         "thirdparty/amneziawg-tools/src",

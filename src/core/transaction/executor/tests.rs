@@ -418,15 +418,74 @@ mod tests {
     }
 
     #[test]
-    fn quick_interface_identity_does_not_depend_on_imported_filename() {
+    fn quick_interface_uses_the_simple_managed_name() {
         let mut imported = profile(Protocol::AmneziaWg);
         imported.id = "12345678-1234-1234-1234-123456789abc".into();
         imported.source = "/vpn/a GUI profile name that cannot be an interface.conf".into();
 
         let plan = quick_connection_plan(&imported).unwrap();
 
-        assert_eq!(plan.interface.as_deref(), Some("amn12345678123"));
-        assert!(plan.interface.as_ref().unwrap().len() <= 15);
+        assert_eq!(plan.interface.as_deref(), Some("amn0"));
+        assert_eq!(
+            quick_staging_interface_name("12345678-1234-1234-1234-123456789abc")
+                .unwrap(),
+            "amt123456781234"
+        );
+        assert!(quick_staging_interface_name("planned-owner").is_err());
+    }
+
+    #[test]
+    fn empty_uninitialized_iptables_state_does_not_strand_stale_cleanup() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        };
+        let markers = ["awg-quick(8) rule for amn0".to_owned()];
+
+        let nft_covered = IptablesInspectionCoverage {
+            legacy_tables_present: false,
+            nft_ruleset_inspected: true,
+        };
+        assert!(
+            !iptables_artifacts_exist("iptables-save", &output, nft_covered, &markers).unwrap()
+        );
+
+        let uncovered = IptablesInspectionCoverage {
+            legacy_tables_present: false,
+            nft_ruleset_inspected: false,
+        };
+        assert!(iptables_artifacts_exist("iptables-save", &output, uncovered, &markers).is_err());
+
+        let legacy_tables = IptablesInspectionCoverage {
+            legacy_tables_present: true,
+            ..nft_covered
+        };
+        assert!(
+            iptables_artifacts_exist("iptables-save", &output, legacy_tables, &markers).is_err()
+        );
+
+        let diagnostic_failure = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: b"permission denied".to_vec(),
+        };
+        assert!(
+            iptables_artifacts_exist("iptables-save", &diagnostic_failure, nft_covered, &markers)
+                .is_err()
+        );
+
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: b"-A PREROUTING -m comment --comment \"awg-quick(8) rule for amn0\""
+                .to_vec(),
+            stderr: Vec::new(),
+        };
+        assert!(
+            iptables_artifacts_exist("iptables-save", &output, uncovered, &markers).unwrap()
+        );
     }
 
     #[test]
@@ -446,6 +505,7 @@ mod tests {
             path: "/usr/bin:/bin".into(),
             interface_probe: "/tools/wg".into(),
             ip: "/usr/bin/ip".into(),
+            link_helper: "/bundle/amn-link".into(),
             interface: "amncleanup".into(),
             interface_existed: true,
             expected_peer_keys: vec!["peer".into()],
@@ -454,6 +514,8 @@ mod tests {
             uses_default_route: false,
             backend_environment: None,
             force_userspace_backend: false,
+            interface_owner: None,
+            expected_interface_index: None,
         };
 
         verify_quick_disconnected(&prepared).unwrap();
@@ -472,6 +534,7 @@ mod tests {
             path: "/bundle:/usr/bin".into(),
             interface_probe: "/tools/wg".into(),
             ip: "/tools/ip".into(),
+            link_helper: "/bundle/amn-link".into(),
             interface: "amn0".into(),
             interface_existed: false,
             expected_peer_keys: vec!["peer".into()],
@@ -483,11 +546,14 @@ mod tests {
                 "/tools/wireguard-go".into(),
             )),
             force_userspace_backend: true,
+            interface_owner: Some("planned-owner".into()),
+            expected_interface_index: Some(42),
         };
         let command = network_command(
             &prepared.program,
             &["up".into(), "/vpn/amn0.conf".into()],
             &prepared,
+            None,
         );
         let arguments = command
             .get_args()
@@ -517,6 +583,24 @@ mod tests {
                 .get("AMN_QUICK_FORCE_USERSPACE")
                 .and_then(Option::as_deref),
             Some("1")
+        );
+        assert_eq!(
+            environment
+                .get("AMN_LINK_HELPER")
+                .and_then(Option::as_deref),
+            Some("/bundle/amn-link")
+        );
+        assert_eq!(
+            environment
+                .get("AMN_QUICK_EXPECTED_IFINDEX")
+                .and_then(Option::as_deref),
+            Some("42")
+        );
+        assert_eq!(
+            environment
+                .get("AMN_QUICK_OWNER")
+                .and_then(Option::as_deref),
+            Some("planned-owner")
         );
         assert_eq!(arguments.first().map(String::as_str), Some("up"));
         assert_eq!(arguments.last().map(String::as_str), Some("/vpn/amn0.conf"));
@@ -595,6 +679,7 @@ mod tests {
         assert!(is_bundled_network_program("wireguard-go"));
         assert!(is_bundled_network_program("amnezia-xray-runner"));
         assert!(is_bundled_network_program("amn-dns"));
+        assert!(is_bundled_network_program("amn-link"));
         assert!(!is_bundled_network_program("resolvectl"));
         assert!(!is_bundled_network_program("resolvconf"));
         assert!(!is_bundled_network_program("ip"));

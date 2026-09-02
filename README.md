@@ -10,7 +10,7 @@ Install `amn` and its bundled programs under `/usr/local`:
 sudo ./amn install
 ```
 
-This installs the command at `/usr/local/bin/amn` and its bundled programs at `/usr/local/libexec/amn`. Run `install` from the portable bundle so `amn` can find the bundled programs beside the running binary.
+This installs the command at `/usr/local/bin/amn` and its bundled programs at `/usr/local/libexec/amn`. Run `install` from the portable bundle so `amn` can find the bundled programs beside the running binary. Default-route AmneziaWG and WireGuard profiles also require the system `nft` command so cleanup can inspect the complete firewall ruleset safely.
 
 Open the interactive dashboard:
 

@@ -74,7 +74,7 @@ fn quote_argument(value: &str) -> String {
 
 fn quick_connection_plan(profile: &Profile) -> Result<CommandPlan> {
     let source = profile.source.clone();
-    let interface = quick_interface_name(profile)?;
+    let interface = quick_interface_name();
     let plan = match profile.protocol {
         Protocol::WireGuard | Protocol::AmneziaWg => {
             CommandPlan {
@@ -92,17 +92,16 @@ fn quick_connection_plan(profile: &Profile) -> Result<CommandPlan> {
     Ok(plan)
 }
 
-fn quick_interface_name(profile: &Profile) -> Result<String> {
-    let suffix = profile
-        .id
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .take(11)
-        .collect::<String>();
-    if suffix.is_empty() {
-        bail!("VPN profile has no usable interface identity");
+fn quick_interface_name() -> String {
+    "amn0".to_owned()
+}
+
+fn quick_staging_interface_name(owner: &str) -> Result<String> {
+    let owner_hex = owner.replace('-', "");
+    if owner_hex.len() != 32 || !owner_hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("WireGuard-family ownership token cannot identify a staging interface");
     }
-    Ok(format!("amn{suffix}"))
+    Ok(format!("amt{}", &owner_hex[..12]))
 }
 
 struct PreparedPlan {
@@ -113,6 +112,7 @@ struct PreparedPlan {
     path: std::ffi::OsString,
     interface_probe: PathBuf,
     ip: PathBuf,
+    link_helper: PathBuf,
     interface: String,
     interface_existed: bool,
     expected_peer_keys: Vec<String>,
@@ -121,6 +121,14 @@ struct PreparedPlan {
     uses_default_route: bool,
     backend_environment: Option<(String, PathBuf)>,
     force_userspace_backend: bool,
+    interface_owner: Option<String>,
+    expected_interface_index: Option<u32>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct QuickOwnership<'a> {
+    owner: Option<&'a str>,
+    interface_index: Option<u32>,
 }
 
 const QUICK_CHILD_OWNER_FILE: &str = ".amn-owner";
@@ -154,6 +162,7 @@ fn prepare_network_plan(
     settings: &Settings,
     stage_profile: bool,
     staged_runtime_directory: Option<&Path>,
+    ownership: QuickOwnership<'_>,
 ) -> Result<PreparedPlan> {
     let configuration = effective_quick_configuration(
         &store.validated_profile_text(profile)?,
@@ -186,6 +195,7 @@ fn prepare_network_plan(
     let spec = quick_spec(&profile.protocol)?;
     let interface_probe = resolve_network_program(spec.probe_program)?;
     let ip = resolve_network_program("ip")?;
+    let link_helper = resolve_network_program("amn-link")?;
     let kernel_backend = Some((
         spec.kernel_module,
         spec.backend_variable,
@@ -198,7 +208,8 @@ fn prepare_network_plan(
     let uses_default_route = configuration_has_default_route(&configuration);
     if uses_default_route {
         resolve_network_program("sysctl")?;
-        let nft_available = resolve_network_program("nft").is_ok();
+        resolve_network_program("nft")
+            .context("default-route profile requires nft for complete firewall ownership inspection")?;
         let iptables_available = resolve_network_program("iptables").is_ok();
         if iptables_available {
             for dependency in [
@@ -210,9 +221,6 @@ fn prepare_network_plan(
             ] {
                 resolve_network_program(dependency)?;
             }
-        }
-        if !nft_available && !iptables_available {
-            bail!("default-route profile requires nft or iptables firewall tools");
         }
     }
     let path =
@@ -284,6 +292,7 @@ fn prepare_network_plan(
         path,
         interface_probe,
         ip,
+        link_helper,
         interface,
         interface_existed,
         expected_peer_keys: peer_keys,
@@ -292,6 +301,8 @@ fn prepare_network_plan(
         uses_default_route,
         backend_environment,
         force_userspace_backend,
+        interface_owner: ownership.owner.map(str::to_owned),
+        expected_interface_index: ownership.interface_index,
     })
 }
 
@@ -342,7 +353,15 @@ pub fn check_profile_dependencies(
         return Ok(());
     }
     let plan = quick_connection_plan(profile)?;
-    prepare_network_plan(store, profile, &plan, settings, false, None)?;
+    prepare_network_plan(
+        store,
+        profile,
+        &plan,
+        settings,
+        false,
+        None,
+        QuickOwnership::default(),
+    )?;
     Ok(())
 }
 
@@ -603,6 +622,7 @@ fn rollback(
         &prepared.rollback_program,
         &prepared.rollback_args,
         prepared,
+        identity.and_then(|identity| identity.interface_index),
     )
     .output()
     .with_context(|| format!("run rollback {}", plan.rollback_program()))?;
@@ -624,7 +644,12 @@ fn rollback_strategy(
     }
 }
 
-fn network_command(program: &Path, arguments: &[String], prepared: &PreparedPlan) -> Command {
+fn network_command(
+    program: &Path,
+    arguments: &[String],
+    prepared: &PreparedPlan,
+    interface_index: Option<u32>,
+) -> Command {
     const BACKEND_VARIABLES: [&str; 2] = [
         "WG_QUICK_USERSPACE_IMPLEMENTATION",
         "AWG_QUICK_USERSPACE_IMPLEMENTATION",
@@ -635,11 +660,21 @@ fn network_command(program: &Path, arguments: &[String], prepared: &PreparedPlan
         command.env_remove(variable);
     }
     command.env_remove("AMN_QUICK_FORCE_USERSPACE");
+    command.env_remove("AMN_QUICK_OWNER");
+    command.env_remove("AMN_LINK_HELPER");
+    command.env_remove("AMN_QUICK_EXPECTED_IFINDEX");
+    command.env("AMN_LINK_HELPER", &prepared.link_helper);
     if let Some((variable, executable)) = &prepared.backend_environment {
         command.env(variable, executable);
     }
     if prepared.force_userspace_backend {
         command.env("AMN_QUICK_FORCE_USERSPACE", "1");
+    }
+    if let Some(owner) = &prepared.interface_owner {
+        command.env("AMN_QUICK_OWNER", owner);
+    }
+    if let Some(index) = interface_index.or(prepared.expected_interface_index) {
+        command.env("AMN_QUICK_EXPECTED_IFINDEX", index.to_string());
     }
     command.args(arguments);
     command
@@ -717,6 +752,12 @@ fn verify_quick_disconnected(prepared: &PreparedPlan) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct IptablesInspectionCoverage {
+    legacy_tables_present: bool,
+    nft_ruleset_inspected: bool,
+}
+
 fn stale_quick_policy_artifacts_exist(prepared: &PreparedPlan) -> Result<bool> {
     if !prepared.uses_default_route {
         return Ok(false);
@@ -738,42 +779,100 @@ fn stale_quick_policy_artifacts_exist(prepared: &PreparedPlan) -> Result<bool> {
             return Ok(true);
         }
     }
-    if let Ok(nft) = resolve_network_program("nft") {
-        let output = Command::new(nft)
-            .args(["list", "tables"])
-            .env("PATH", &prepared.path)
-            .output()
-            .context("inspect stale WireGuard-family nftables state")?;
-        if !output.status.success() {
-            bail!("inspect stale WireGuard-family nftables state exited with {}", output.status);
-        }
-        let output = String::from_utf8(output.stdout)
-            .context("WireGuard-family nftables output is not UTF-8")?;
-        if output.contains(&format!("wg-quick-{}", prepared.interface)) {
-            return Ok(true);
-        }
-    }
     let markers = [
+        format!("wg-quick-{}", prepared.interface),
         format!("wg-quick(8) rule for {}", prepared.interface),
         format!("awg-quick(8) rule for {}", prepared.interface),
     ];
-    for program in ["iptables-save", "ip6tables-save"] {
-        if let Ok(program) = resolve_network_program(program) {
-            let output = Command::new(program)
-                .env("PATH", &prepared.path)
-                .output()
-                .context("inspect stale WireGuard-family iptables state")?;
-            if !output.status.success() {
-                bail!("inspect stale WireGuard-family iptables state exited with {}", output.status);
+    let nft = resolve_network_program("nft")
+        .context("resolve nft for complete stale WireGuard-family firewall inspection")?;
+    let output = Command::new(nft)
+        .args(["list", "ruleset"])
+        .env("PATH", &prepared.path)
+        .output()
+        .context("inspect stale WireGuard-family nftables state")?;
+    if !output.status.success() {
+        return Err(network_command_failure("nft", &output))
+            .context("inspect stale WireGuard-family nftables state");
+    }
+    let output = String::from_utf8(output.stdout)
+        .context("WireGuard-family nftables output is not UTF-8")?;
+    if markers.iter().any(|marker| output.contains(marker)) {
+        return Ok(true);
+    }
+    for program_name in ["iptables-save", "ip6tables-save"] {
+        let legacy_tables_present = kernel_iptables_tables_present(program_name)?;
+        let program = match resolve_network_program(program_name) {
+            Ok(program) => program,
+            Err(error) => {
+                if legacy_tables_present {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "resolve {program_name} for complete stale WireGuard-family firewall inspection"
+                        )
+                    });
+                }
+                continue;
             }
-            let output = String::from_utf8(output.stdout)
-                .context("WireGuard-family iptables output is not UTF-8")?;
-            if markers.iter().any(|marker| output.contains(marker)) {
-                return Ok(true);
-            }
+        };
+        let output = Command::new(&program)
+            .env("PATH", &prepared.path)
+            .output()
+            .context("inspect stale WireGuard-family iptables state")?;
+        let silent_failure = !output.status.success()
+            && output.stdout.is_empty()
+            && output.stderr.is_empty();
+        if iptables_artifacts_exist(
+            program_name,
+            &output,
+            IptablesInspectionCoverage {
+                legacy_tables_present: silent_failure && legacy_tables_present,
+                nft_ruleset_inspected: true,
+            },
+            &markers,
+        )? {
+            return Ok(true);
         }
     }
     Ok(false)
+}
+
+fn kernel_iptables_tables_present(program: &str) -> Result<bool> {
+    let path = if program == "ip6tables-save" {
+        Path::new("/proc/net/ip6_tables_names")
+    } else {
+        Path::new("/proc/net/ip_tables_names")
+    };
+    match fs::read_to_string(path) {
+        Ok(tables) => Ok(tables.lines().any(|table| !table.trim().is_empty())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
+fn iptables_artifacts_exist(
+    program: &str,
+    output: &std::process::Output,
+    coverage: IptablesInspectionCoverage,
+    markers: &[String],
+) -> Result<bool> {
+    let rules = std::str::from_utf8(&output.stdout)
+        .context("WireGuard-family iptables output is not UTF-8")?;
+    if markers.iter().any(|marker| rules.contains(marker)) {
+        return Ok(true);
+    }
+    if output.status.success() {
+        return Ok(false);
+    }
+    let silently_uninitialized = output.stdout.is_empty()
+        && output.stderr.is_empty()
+        && !coverage.legacy_tables_present
+        && coverage.nft_ruleset_inspected;
+    if silently_uninitialized {
+        return Ok(false);
+    }
+    Err(network_command_failure(program, output))
+        .context("inspect stale WireGuard-family iptables state")
 }
 
 fn revert_quick_dns(prepared: &PreparedPlan) -> Result<()> {
@@ -789,22 +888,42 @@ fn revert_quick_dns(prepared: &PreparedPlan) -> Result<()> {
     Ok(())
 }
 
-fn interface_matches_profile(
+fn interface_peer_keys(
     probe: &Path,
     interface: &str,
-    expected_peers: &[String],
     path: &std::ffi::OsStr,
-) -> Result<bool> {
+) -> Result<Vec<String>> {
     let output = Command::new(probe)
         .args(["show", interface, "peers"])
         .env("PATH", path)
         .output()
         .with_context(|| format!("inspect peers for network interface {interface}"))?;
     if !output.status.success() {
-        return Ok(false);
+        bail!(
+            "inspect peers for network interface {interface} exited with {}",
+            output.status
+        );
     }
     let actual = String::from_utf8(output.stdout).context("interface peer list is not UTF-8")?;
-    Ok(peer_sets_match(expected_peers, actual.lines()))
+    Ok(actual
+        .lines()
+        .map(str::trim)
+        .filter(|peer| !peer.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+fn interface_matches_profile(
+    probe: &Path,
+    interface: &str,
+    expected_peers: &[String],
+    path: &std::ffi::OsStr,
+) -> Result<bool> {
+    let actual = interface_peer_keys(probe, interface, path)?;
+    Ok(peer_sets_match(
+        expected_peers,
+        actual.iter().map(String::as_str),
+    ))
 }
 
 fn peer_sets_match<'a>(expected: &[String], actual: impl Iterator<Item = &'a str>) -> bool {
@@ -1051,73 +1170,94 @@ fn fail_with_rollback<T>(
         process_start_ticks: None,
         interface: Some(prepared.interface.clone()),
         interface_index: None,
-        interface_owner: None,
+        interface_owner: prepared.interface_owner.clone(),
         runtime_directory: retained_runtime.clone(),
         quick_root_owned,
         xray_route: None,
         xray_owned_routes: Vec::new(),
     };
-    let exists = Command::new(&prepared.ip)
-        .args(["link", "show", "dev", &prepared.interface])
+    let interface_exists_by_name = |interface: &str| Command::new(&prepared.ip)
+        .args(["link", "show", "dev", interface])
         .env("PATH", &prepared.path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .is_ok_and(|status| status.success());
+    let exists = interface_exists_by_name(&prepared.interface);
+    let staging_interface = prepared
+        .interface_owner
+        .as_deref()
+        .map(quick_staging_interface_name)
+        .transpose()?;
+    let staging_interface = staging_interface
+        .filter(|interface| interface_exists_by_name(interface));
+    if let Some(interface) = staging_interface {
+        let owner = prepared
+            .interface_owner
+            .clone()
+            .context("pre-committed staging interface has no ownership token")?;
+        let index = interface_index(&interface)?;
+        let candidate = Connection {
+            profile_id: profile_id.to_owned(),
+            recovery_required: true,
+            disconnecting: false,
+            pid: None,
+            process_start_ticks: None,
+            interface: Some(interface.clone()),
+            interface_index: Some(index),
+            interface_owner: Some(owner),
+            runtime_directory: retained_runtime.clone(),
+            quick_root_owned,
+            xray_route: None,
+            xray_owned_routes: Vec::new(),
+        };
+        verify_openvpn_interface_identity(&interface, &candidate)
+            .context("refusing to retain a changed Quick staging interface")?;
+        let mut retained = state.clone();
+        retained.connection = Some(candidate);
+        *state = retained.clone();
+        store
+            .save(&retained)
+            .context("persist exact Quick staging-interface recovery ownership")?;
+        return Err(failure).context(
+            "network action failed; exact staging-interface recovery ownership was retained",
+        );
+    }
     let mut recovery = None;
     if exists {
-        let owner = uuid::Uuid::new_v4().to_string();
-        let marked = Command::new(&prepared.ip)
-            .args([
-                "link",
-                "set",
-                "dev",
-                &prepared.interface,
-                "alias",
-                &owner,
-            ])
-            .env("PATH", &prepared.path)
-            .status()
-            .is_ok_and(|status| status.success());
-        if marked
-            && let Ok(index) = interface_index(&prepared.interface)
-        {
-            recovery = Some(Connection {
-                profile_id: profile_id.to_owned(),
-                recovery_required: true,
-                disconnecting: false,
-                pid: None,
-                process_start_ticks: None,
-                interface: Some(prepared.interface.clone()),
-                interface_index: Some(index),
-                interface_owner: Some(owner),
-                runtime_directory: retained_runtime.clone(),
-                quick_root_owned,
-                xray_route: None,
-                xray_owned_routes: Vec::new(),
-            });
-        } else {
-            let mut fallback = state.clone();
-            fallback.connection = Some(Connection {
-                profile_id: profile_id.to_owned(),
-                recovery_required: true,
-                disconnecting: false,
-                pid: None,
-                process_start_ticks: None,
-                interface: Some(prepared.interface.clone()),
-                interface_index: None,
-                interface_owner: None,
-                runtime_directory: retained_runtime.clone(),
-                quick_root_owned,
-                xray_route: None,
-                xray_owned_routes: Vec::new(),
-            });
-            *state = fallback.clone();
-            let _ = store.save(&fallback);
+        let Some(owner) = prepared.interface_owner.clone() else {
             return Err(failure).context(
-                "network action failed; rollback was refused because exact interface ownership could not be established",
+                "network action failed; rollback was refused because no pre-committed interface ownership token exists",
             );
+        };
+        let index = match interface_index(&prepared.interface) {
+            Ok(index) => index,
+            Err(error) => {
+                return Err(failure).context(format!(
+                    "network action failed; rollback was refused because interface identity could not be read: {error:#}"
+                ));
+            }
+        };
+        let candidate = Connection {
+            profile_id: profile_id.to_owned(),
+            recovery_required: true,
+            disconnecting: false,
+            pid: None,
+            process_start_ticks: None,
+            interface: Some(prepared.interface.clone()),
+            interface_index: Some(index),
+            interface_owner: Some(owner),
+            runtime_directory: retained_runtime.clone(),
+            quick_root_owned,
+            xray_route: None,
+            xray_owned_routes: Vec::new(),
+        };
+        if let Err(error) = verify_openvpn_interface_identity(&prepared.interface, &candidate) {
+            return Err(failure).context(format!(
+                "network action failed; rollback was refused because the live interface does not carry the pre-committed ownership identity: {error:#}"
+            ));
         }
+        recovery = Some(candidate);
     }
     if !exists {
         if retained_cleanup {

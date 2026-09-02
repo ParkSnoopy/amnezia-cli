@@ -16,7 +16,7 @@ A release is ready only when every applicable gate below passes against the curr
 ## Build prerequisites
 
 - Rust includes the `x86_64-unknown-linux-musl` target.
-- Go, Conan 2, a C compiler, `musl-gcc`, CMake, Ninja, and Make are available.
+- Go, Conan 2, a C compiler, `musl-gcc`, Linux UAPI headers, CMake, Ninja, and Make are available.
 - The Conan default profile exists.
 - The configured `amnezia` remote resolves to `https://artifactory.amnezia.org/artifactory/api/conan/client-prebuilts`.
 - Every required recipe and `conanfile.py` exists under `thirdparty/amnezia-client/recipes`.
@@ -37,11 +37,11 @@ git diff --check
 The release artifact must also satisfy:
 
 ```text
-file target/bundle/amn target/bundle/libexec/amn/amnezia-xray-runner target/bundle/libexec/amn/amn-dns
-ldd target/bundle/amn target/bundle/libexec/amn/amnezia-xray-runner target/bundle/libexec/amn/amn-dns
+file target/bundle/amn target/bundle/libexec/amn/{wg,awg,amnezia-xray-runner,amn-dns,amn-link}
+ldd target/bundle/amn target/bundle/libexec/amn/{wg,awg,amnezia-xray-runner,amn-dns,amn-link}
 ```
 
-Required result: `amn` and `amn-dns` are x86-64 static PIE executables, `amnezia-xray-runner` is a static x86-64 Linux executable, `ldd` reports all three as statically linked, and the XRay runner has no `GLIBC_*` version requirements.
+Required result: `amn`, `amn-dns`, and `amn-link` are x86-64 static executables; `wg`, `awg`, and `amnezia-xray-runner` are static x86-64 Linux executables; `ldd` reports all six as statically linked; and none has `GLIBC_*` version requirements.
 
 The release bundle must contain nonempty validated artifacts at:
 
@@ -57,6 +57,7 @@ target/bundle/libexec/amn/tun2socks
 target/bundle/libexec/amn/amneziawg-go
 target/bundle/libexec/amn/amnezia-xray-runner
 target/bundle/libexec/amn/amn-dns
+target/bundle/libexec/amn/amn-link
 target/bundle/libexec/amn/geoip.dat
 target/bundle/libexec/amn/geosite.dat
 ```
@@ -78,8 +79,8 @@ target/bundle/libexec/amn/geosite.dat
 - Backup restore accepts partial upstream AmneziaVPN settings objects, including a standalone `Servers/serversList`, without requiring an `amn` format marker; every supplied field replaces its corresponding overall setting, including complete replacement of the installed profile list, while omitted settings are preserved.
 - Profile lists, selectors, diagnostics, and action prompts expose readable 1-based profile numbers and names rather than internal IDs.
 - Every supported connect and disconnect plan has the opposite rollback action.
-- WireGuard-family connect marks and persists a random interface ownership alias and kernel interface index in addition to the exact peer set.
-- Connect rollback and disconnect remove a WireGuard-family interface only when its persisted index, ownership alias, and exact live peer set all match. State-file replacement syncs both file contents and parent-directory metadata before any journaled external mutation begins. Installation creates and validates the persistent root-owned `/etc/wireguard` staging root; connection transactions never create or claim that shared root. Connect and disconnect persist each exact planned child staging path before creating it, and every removable child carries a matching private ownership marker, so a planned-but-never-created path cannot authorize foreign-directory deletion. Staged runtime ownership remains durable whenever explicit removal needs retry. Disconnect verifies that the interface and staged copy are gone before success. If a stale interface has already vanished, DNS is reverted, but any detectable default-route firewall or policy state—including the exact bundled `wg-quick(8)` and `awg-quick(8)` iptables markers—blocks success and retains recovery state instead of blind deletion.
+- WireGuard-family connect uses the simple managed interface name `amn0`, durably persists a random ownership token before running the quick script, and creates kernel interfaces with an owner-derived name, kernel index, and group in one netlink operation before applying the full alias by index. Bundled userspace backends must claim the same alias while they still own the nonpersistent TUN descriptor and before reporting readiness. The static source-built `amn-link` helper verifies, renames, and deletes by kernel index plus alias rather than a mutable name; a pre-existing or raced-in `amn0` is refused rather than claimed. Recovery can reconstruct an interrupted pre-alias kernel creation only when its name, index, and group all match the persisted token, then adopts the full alias before any mutation. An owned interface with no configured peer is removed as an incomplete pre-configuration mutation; established and mismatched peer sets remain fail-closed.
+- Connect rollback and disconnect remove a WireGuard-family interface only when its persisted index, ownership alias, and exact live peer set all match. State-file replacement syncs both file contents and parent-directory metadata before any journaled external mutation begins. Installation creates and validates the persistent root-owned `/etc/wireguard` staging root; connection transactions never create or claim that shared root. Connect and disconnect persist each exact planned child staging path before creating it, and every removable child carries a matching private ownership marker, so a planned-but-never-created path cannot authorize foreign-directory deletion. Staged runtime ownership remains durable whenever explicit removal needs retry. Disconnect verifies that the interface and staged copy are gone before success. If a stale interface has already vanished, DNS is reverted, but any detectable default-route firewall or policy state—including the exact bundled `wg-quick(8)` and `awg-quick(8)` iptables markers—blocks success and retains recovery state instead of blind deletion. Complete nftables inspection is mandatory for every default-route WireGuard-family lifecycle, even when the active quick backend uses legacy iptables. An empty, diagnostic-free `iptables-save` failure is accepted only when the kernel reports no initialized legacy tables after that complete nftables inspection; a missing family inspector is accepted only when that family has no initialized legacy table. All other inspection failures retain recovery ownership and include bounded diagnostics.
 - Reconnect repeats the same owned disconnect/connect lifecycle; failed rollback records are marked as recovery-required rather than reported as healthy, and status reports Linux interface traffic counters when available.
 
 ## Runtime acceptance
