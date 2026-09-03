@@ -1,0 +1,10 @@
+[submodule "wireguard-go"]
+	path = thirdparty/wireguard-go
+	url = https://github.com/WireGuard/wireguard-go.git
+	branch = master
+[submodule "thirdparty/xray-core"]
+	path = thirdparty/xray-core
+	url = https://github.com/XTLS/Xray-core
+[submodule "thirdparty/amneziawg-go"]
+	path = thirdparty/amneziawg-go
+	url = https://github.com/amnezia-vpn/amneziawg-go
