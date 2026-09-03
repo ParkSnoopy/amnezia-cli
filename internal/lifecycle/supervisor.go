@@ -165,6 +165,7 @@ func (s *supervisor) startXRay(allowed []netip.Prefix) error {
 	if err != nil {
 		return err
 	}
+	defer xray.file.Close()
 	managed := filepath.Join(s.plan.RuntimeDir, "xray.json")
 	if err := s.createManagedTun(); err != nil {
 		return err
@@ -175,9 +176,11 @@ func (s *supervisor) startXRay(allowed []netip.Prefix) error {
 	if err := native.PrepareXRay(s.plan.ConfigPath, managed, "amn0", allowed); err != nil {
 		return err
 	}
-	check := exec.Command(xray, "run", "-test", "-config", managed)
+	check := exec.Command("/proc/self/fd/3", "run", "-test", "-config", managed)
+	check.Args[0] = xray.path
 	check.Stdout, check.Stderr = os.Stderr, os.Stderr
 	check.Env = runtimeEnvironment()
+	check.ExtraFiles = []*os.File{xray.file}
 	if err := check.Run(); err != nil {
 		return fmt.Errorf("validate XRay configuration: %w", err)
 	}
@@ -198,6 +201,7 @@ func (s *supervisor) startWireGuard(config native.WireGuard, allowed []netip.Pre
 	if err != nil {
 		return err
 	}
+	defer backend.file.Close()
 	if err := s.createManagedTun(); err != nil {
 		return err
 	}
@@ -294,19 +298,20 @@ func (s *supervisor) renameTun() error {
 	return nil
 }
 
-func (s *supervisor) startBackend(tunEnvironment, path string, arguments ...string) error {
-	logFile, err := os.OpenFile(filepath.Join(s.plan.RuntimeDir, "backend.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+func (s *supervisor) startBackend(tunEnvironment string, runtime runtimeExecutable, arguments ...string) error {
+	logFile, err := os.OpenFile(filepath.Join(s.plan.RuntimeDir, "backend.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
-	command := exec.Command(path, arguments...)
+	command := exec.Command("/proc/self/fd/3", arguments...)
+	command.Args[0] = runtime.path
 	command.Stdout, command.Stderr = logFile, logFile
 	command.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
-	command.ExtraFiles = []*os.File{s.tunFile}
-	command.Env = runtimeEnvironment(tunEnvironment + "=3")
+	command.ExtraFiles = []*os.File{runtime.file, s.tunFile}
+	command.Env = runtimeEnvironment(tunEnvironment + "=4")
 	if err := command.Start(); err != nil {
 		logFile.Close()
-		return fmt.Errorf("start %s: %w", filepath.Base(path), err)
+		return fmt.Errorf("start %s: %w", filepath.Base(runtime.path), err)
 	}
 	if err := s.tunFile.Close(); err != nil {
 		_ = command.Process.Kill()
@@ -494,18 +499,27 @@ func InterfaceIndexExists(index int) bool {
 	return false
 }
 
-func RuntimeExecutable(name string) (string, error) {
+type runtimeExecutable struct {
+	path string
+	file *os.File
+}
+
+func RuntimeExecutable(name string) (runtimeExecutable, error) {
 	executable, err := os.Executable()
 	if err != nil {
-		return "", err
+		return runtimeExecutable{}, err
+	}
+	owner, trusted := trustedExecutableOwner(executable)
+	if !trusted {
+		return runtimeExecutable{}, fmt.Errorf("amn executable path is untrusted: %s", executable)
 	}
 	candidates := runtimeCandidates(executable, name)
 	for _, candidate := range candidates {
-		if trustedExecutable(candidate) {
-			return candidate, nil
+		if file, ok := openTrustedExecutable(candidate, owner); ok {
+			return runtimeExecutable{path: candidate, file: file}, nil
 		}
 	}
-	return "", fmt.Errorf(
+	return runtimeExecutable{}, fmt.Errorf(
 		"trusted source-built %s is missing or untrusted relative to amn executable; checked %s",
 		name,
 		strings.Join(candidates, ", "),
@@ -573,30 +587,69 @@ func sendUAPI(path, request string) error {
 	return nil
 }
 
-func trustedExecutable(path string) bool {
+func trustedExecutableOwner(path string) (uint32, bool) {
+	canonical, stat, ok := trustedExecutableMetadata(path)
+	if !ok || !trustedExecutableAncestors(canonical, stat.Uid) {
+		return 0, false
+	}
+	return stat.Uid, true
+}
+
+func trustedExecutable(path string, owner uint32) bool {
+	canonical, stat, ok := trustedExecutableMetadata(path)
+	return ok && stat.Uid == owner && trustedExecutableAncestors(canonical, owner)
+}
+
+func openTrustedExecutable(path string, owner uint32) (*os.File, bool) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return nil, false
+	}
+	file := os.NewFile(uintptr(fd), path)
+	canonical, pathStat, ok := trustedExecutableMetadata(path)
+	if !ok || pathStat.Uid != owner || !trustedExecutableAncestors(canonical, owner) {
+		file.Close()
+		return nil, false
+	}
+	var descriptorStat syscall.Stat_t
+	if err := syscall.Fstat(fd, &descriptorStat); err != nil || descriptorStat.Dev != pathStat.Dev || descriptorStat.Ino != pathStat.Ino {
+		file.Close()
+		return nil, false
+	}
+	return file, true
+}
+
+func trustedExecutableMetadata(path string) (string, *syscall.Stat_t, bool) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
-		return false
+		return "", nil, false
 	}
 	canonical, err := filepath.EvalSymlinks(absolute)
 	if err != nil || canonical != absolute {
-		return false
+		return "", nil, false
 	}
 	info, err := os.Lstat(canonical)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 || info.Mode().Perm()&0o111 == 0 {
-		return false
+		return "", nil, false
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok || stat.Uid != 0 {
-		return false
+	if !ok {
+		return "", nil, false
 	}
-	for directory := filepath.Dir(canonical); ; directory = filepath.Dir(directory) {
+	return canonical, stat, true
+}
+
+func trustedExecutableAncestors(path string, owner uint32) bool {
+	for directory := filepath.Dir(path); ; directory = filepath.Dir(directory) {
 		info, err := os.Lstat(directory)
-		if err != nil || !info.IsDir() || info.Mode().Perm()&0o022 != 0 {
+		if err != nil || !info.IsDir() {
 			return false
 		}
 		stat, ok := info.Sys().(*syscall.Stat_t)
-		if !ok || stat.Uid != 0 {
+		if !ok || (stat.Uid != 0 && stat.Uid != owner) {
+			return false
+		}
+		if info.Mode().Perm()&0o022 != 0 && (stat.Uid != 0 || info.Mode()&os.ModeSticky == 0) {
 			return false
 		}
 		if directory == filepath.Dir(directory) {

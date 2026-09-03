@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"context"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -74,8 +75,8 @@ func TestRuntimeCandidatesAreExecutableRelative(t *testing.T) {
 }
 
 func TestRuntimeEnvironmentHasNoSearchPath(t *testing.T) {
-	got := runtimeEnvironment("XRAY_TUN_FD=3")
-	want := []string{"PATH=", "HOME=/root", "LANG=C", "XRAY_TUN_FD=3"}
+	got := runtimeEnvironment("XRAY_TUN_FD=4")
+	want := []string{"PATH=", "HOME=/root", "LANG=C", "XRAY_TUN_FD=4"}
 	if len(got) != len(want) {
 		t.Fatalf("got %d environment entries, want %d", len(got), len(want))
 	}
@@ -83,6 +84,153 @@ func TestRuntimeEnvironmentHasNoSearchPath(t *testing.T) {
 		if got[index] != want[index] {
 			t.Fatalf("environment %d is %q, want %q", index, got[index], want[index])
 		}
+	}
+}
+
+func TestTrustedExecutableAcceptsBundleOwner(t *testing.T) {
+	bundle := filepath.Join(t.TempDir(), "bundle")
+	helperDirectory := filepath.Join(bundle, "libexec", "amn")
+	if err := os.MkdirAll(helperDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	frontend := filepath.Join(bundle, "amn")
+	helper := filepath.Join(helperDirectory, "xray")
+	for _, path := range []string{frontend, helper} {
+		if err := os.WriteFile(path, []byte("executable"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	owner := os.Getuid()
+	if owner == 0 {
+		owner = 12345
+		for _, path := range []string{bundle, filepath.Join(bundle, "libexec"), helperDirectory, frontend, helper} {
+			if err := os.Chown(path, owner, owner); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	frontendOwner, ok := trustedExecutableOwner(frontend)
+	if !ok || int(frontendOwner) != owner {
+		t.Fatalf("frontend owner is %d trusted=%t, want %d", frontendOwner, ok, owner)
+	}
+	if !trustedExecutable(helper, frontendOwner) {
+		t.Fatalf("helper owned by bundle owner %d was rejected", owner)
+	}
+	if err := os.Chmod(helper, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	if trustedExecutable(helper, frontendOwner) {
+		t.Fatal("group-writable helper was trusted")
+	}
+	if err := os.Chmod(helper, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if trustedExecutable(helper, frontendOwner) {
+		t.Fatal("non-executable helper was trusted")
+	}
+	if err := os.Chmod(helper, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(helperDirectory, 0o775); err != nil {
+		t.Fatal(err)
+	}
+	if trustedExecutable(helper, frontendOwner) {
+		t.Fatal("helper below a group-writable directory was trusted")
+	}
+	if err := os.Chmod(helperDirectory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	realHelper := helper + ".real"
+	if err := os.Rename(helper, realHelper); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Base(realHelper), helper); err != nil {
+		t.Fatal(err)
+	}
+	if trustedExecutable(helper, frontendOwner) {
+		t.Fatal("symlinked helper was trusted")
+	}
+	if os.Getuid() == 0 {
+		if err := os.Remove(helper); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(realHelper, helper); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chown(helper, owner+1, owner+1); err != nil {
+			t.Fatal(err)
+		}
+		if trustedExecutable(helper, frontendOwner) {
+			t.Fatal("helper with a different owner was trusted")
+		}
+	}
+}
+
+func TestOpenedRuntimePinsValidatedExecutable(t *testing.T) {
+	if os.Getenv("AMN_PINNED_RUNTIME_HELPER") == "1" {
+		return
+	}
+	source, err := os.Open(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	runtimePath := filepath.Join(t.TempDir(), "runtime")
+	destination, err := os.OpenFile(runtimePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(destination, source); err != nil {
+		destination.Close()
+		t.Fatal(err)
+	}
+	if err := destination.Close(); err != nil {
+		t.Fatal(err)
+	}
+	owner, ok := trustedExecutableOwner(runtimePath)
+	if !ok {
+		t.Fatal("copied runtime was not trusted")
+	}
+	opened, ok := openTrustedExecutable(runtimePath, owner)
+	if !ok {
+		t.Fatal("trusted runtime was not opened")
+	}
+	defer opened.Close()
+	if err := os.Rename(runtimePath, runtimePath+".original"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(runtimePath, []byte("replacement"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command("/proc/self/fd/3", "-test.run=^TestOpenedRuntimePinsValidatedExecutable$")
+	command.Args[0] = runtimePath
+	command.ExtraFiles = []*os.File{opened}
+	command.Env = append(os.Environ(), "AMN_PINNED_RUNTIME_HELPER=1", "GORACE=atexit_sleep_ms=0")
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("execute pinned runtime: %v: %s", err, output)
+	}
+}
+
+func TestPinnedSourceBuiltXRayExecutes(t *testing.T) {
+	path := os.Getenv("AMN_TEST_XRAY")
+	if path == "" {
+		t.Skip("AMN_TEST_XRAY is not set")
+	}
+	owner, ok := trustedExecutableOwner(path)
+	if !ok {
+		t.Fatal("source-built XRay path was not trusted")
+	}
+	opened, ok := openTrustedExecutable(path, owner)
+	if !ok {
+		t.Fatal("source-built XRay was not opened")
+	}
+	defer opened.Close()
+	command := exec.Command("/proc/self/fd/3", "version")
+	command.Args[0] = path
+	command.ExtraFiles = []*os.File{opened}
+	command.Env = runtimeEnvironment()
+	if output, err := command.CombinedOutput(); err != nil || len(output) == 0 {
+		t.Fatalf("execute pinned source-built XRay: %v: %s", err, output)
 	}
 }
 

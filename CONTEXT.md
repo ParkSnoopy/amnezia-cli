@@ -20,7 +20,7 @@ Confirmation is handled by the supervisor, which atomically persists exact proce
 
 Release runtime programs are built from the pinned `thirdparty/xray-core`, `thirdparty/wireguard-go`, and `thirdparty/amneziawg-go` source trees. No downloaded executable is accepted. Adding or replacing a source submodule requires explicit user approval.
 
-Runtime engines are resolved only from `libexec/amn/` relative to the running `amn` executable, including the portable and installed `../libexec/amn/` layouts. Runtime validation and startup receive an empty `PATH`; a missing bundled engine never falls through to a system installation.
+Runtime engines are resolved only from `libexec/amn/` relative to the running `amn` executable, including the portable and installed `../libexec/amn/` layouts. Runtime validation and startup receive an empty `PATH`; a missing bundled engine never falls through to a system installation. A portable user-built bundle is accepted when `amn` and its engines share one owner, executable files are not group/world-writable, and the path is symlink-free through directories owned by that bundle owner or root. Installed root-owned bundles satisfy the same rule. Each validated engine inode remains pinned by an open descriptor and is executed through that descriptor, preventing a path replacement between validation and privileged startup.
 
 The project build is generated with CMake and executed with Ninja. Makefiles are not part of the build contract.
 

@@ -10,7 +10,8 @@ A release is ready only when every applicable check succeeds.
 - The bundle contains no downloaded or host-copied runtime executable.
 - Runtime engines resolve only from executable-relative `libexec/amn` layouts; validation and backend processes receive no system search path.
 - Submodule revisions and working trees are recorded and clean.
-- Privileged runtime files and every ancestor directory are root-owned and not group/world-writable; bundled runtime symlinks are rejected.
+- `amn` and each privileged runtime have the same owner and are not group/world-writable; symlinks are rejected, and ancestor directories are owned by root or the bundle owner without unsafe write access.
+- Runtime validation pins the accepted inode by descriptor, and validation/backend execution uses that descriptor rather than reopening a mutable path.
 
 ## Automated behavior
 

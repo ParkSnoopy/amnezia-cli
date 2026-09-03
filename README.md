@@ -4,7 +4,7 @@ AmneziaVPN CLI is a Linux command-line VPN client. Its executable is named `amn`
 
 It accepts each protocol's native configuration file, creates a TUN interface, and routes traffic automatically. There is no proxy flag and no kill switch. Connections route all IPv4 traffic except the IPv4 CIDR ranges supplied with `--exclude`. IPv6 is not supported or routed through the VPN.
 
-Keep the complete bundle together. `amn` loads its source-built protocol engines from `libexec/amn/` relative to its own executable; it never searches the system `PATH`. Copying only `amn` without the adjacent `libexec` tree produces a direct missing-runtime error.
+Keep the complete bundle together. `amn` loads its source-built protocol engines from `libexec/amn/` relative to its own executable; it never searches the system `PATH`. Portable bundles may remain owned by the user who built them, but `amn` and every protocol engine must have the same owner and must not be group- or world-writable. Copying only `amn` without the adjacent `libexec` tree produces a direct missing-runtime error.
 
 ## Connect
 
