@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -59,5 +60,73 @@ func TestPreparedXRayConfigurationIsAcceptedBySourceBuild(t *testing.T) {
 	command := exec.Command(binary, "run", "-test", "-config", destination)
 	if output, err := command.CombinedOutput(); err != nil {
 		t.Fatalf("source-built XRay rejected managed configuration: %v: %s", err, output)
+	}
+}
+
+func TestPrepareResolvedXRayPinsProxyEndpoint(t *testing.T) {
+	directory := t.TempDir()
+	source := filepath.Join(directory, "source.json")
+	destination := filepath.Join(directory, "managed.json")
+	config := `{
+  "outbounds": [
+    {"protocol":"vless","settings":{"vnext":[{"address":"198.51.100.17","port":443,"users":[{"id":"00000000-0000-0000-0000-000000000001","encryption":"none"}]}]}},
+    {"protocol":"freedom","settings":{}}
+  ]
+}`
+	if err := os.WriteFile(source, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	endpoints, err := PrepareResolvedXRay(source, destination, "amn0", []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(endpoints) != 1 || endpoints[0] != netip.MustParseAddr("198.51.100.17") {
+		t.Fatalf("unexpected pinned endpoints: %v", endpoints)
+	}
+	var managed map[string]any
+	content, err := os.ReadFile(destination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(content, &managed); err != nil {
+		t.Fatal(err)
+	}
+	outbound := managed["outbounds"].([]any)[0].(map[string]any)
+	vnext := outbound["settings"].(map[string]any)["vnext"].([]any)
+	if address := vnext[0].(map[string]any)["address"]; address != "198.51.100.17" {
+		t.Fatalf("managed endpoint is %v", address)
+	}
+	if binary := os.Getenv("AMN_TEST_XRAY"); binary != "" {
+		command := exec.Command(binary, "run", "-test", "-config", destination)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("source-built XRay rejected resolved managed configuration: %v: %s", err, output)
+		}
+	}
+}
+
+func TestPinnedXRayEndpointPreservesImplicitTLSServerName(t *testing.T) {
+	outbound := map[string]any{
+		"streamSettings": map[string]any{
+			"security":    "tls",
+			"tlsSettings": map[string]any{},
+		},
+	}
+	preserveXRayTLSServerName(outbound, "vpn.example.com")
+	stream := outbound["streamSettings"].(map[string]any)
+	tlsSettings := stream["tlsSettings"].(map[string]any)
+	if tlsSettings["serverName"] != "vpn.example.com" {
+		t.Fatalf("implicit TLS server name was not preserved: %#v", tlsSettings)
+	}
+}
+
+func TestPrepareResolvedXRayRejectsIPv6Endpoint(t *testing.T) {
+	directory := t.TempDir()
+	source := filepath.Join(directory, "source.json")
+	if err := os.WriteFile(source, []byte(`{"outbounds":[{"protocol":"vless","settings":{"address":"2001:db8::1","port":443}}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := PrepareResolvedXRay(source, filepath.Join(directory, "managed.json"), "amn0", []netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")})
+	if err == nil || !strings.Contains(err.Error(), "IPv6 is not supported") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

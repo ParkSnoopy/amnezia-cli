@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -87,11 +88,18 @@ func Supervise(planPath string) error {
 }
 
 func (s *supervisor) start() error {
-	prefixes, err := routes.Parse(s.plan.Exclusions)
+	exclusions, err := routes.Parse(s.plan.Exclusions)
 	if err != nil {
 		return err
 	}
-	var allowed []netip.Prefix
+	allowed, err := routes.Complement(exclusions)
+	if err != nil {
+		return err
+	}
+	bypass, err := bypassAddresses(s.plan.SafetyBypass)
+	if err != nil {
+		return err
+	}
 	if s.plan.Protocol == "wireguard" || s.plan.Protocol == "amneziawg" {
 		config, err := native.ReadWireGuard(s.plan.ConfigPath, s.plan.Protocol)
 		if err != nil {
@@ -102,26 +110,15 @@ func (s *supervisor) start() error {
 			return err
 		}
 		config.Peer.Endpoint = resolvedEndpoint
-		prefixes = append(prefixes, endpoint)
-		allowed, err = routes.Complement(prefixes)
-		if err != nil {
-			return err
-		}
-		if err := s.setPlannedRoutes(allowed); err != nil {
+		bypass = append(bypass, endpoint.Addr())
+		if err := s.setPlannedRoutes(allowed, bypass); err != nil {
 			return err
 		}
 		if err := s.startWireGuard(config, allowed); err != nil {
 			return err
 		}
 	} else if s.plan.Protocol == "xray" {
-		allowed, err = routes.Complement(prefixes)
-		if err != nil {
-			return err
-		}
-		if err := s.setPlannedRoutes(allowed); err != nil {
-			return err
-		}
-		if err := s.startXRay(allowed); err != nil {
+		if err := s.startXRay(allowed, bypass); err != nil {
 			return err
 		}
 	} else {
@@ -160,22 +157,28 @@ func (s *supervisor) start() error {
 	return WriteJSON(filepath.Join(s.plan.RuntimeDir, "ready.json"), s.state, 0o600)
 }
 
-func (s *supervisor) startXRay(allowed []netip.Prefix) error {
+func (s *supervisor) startXRay(allowed []netip.Prefix, bypass []netip.Addr) error {
 	xray, err := RuntimeExecutable("xray")
 	if err != nil {
 		return err
 	}
 	defer xray.file.Close()
 	managed := filepath.Join(s.plan.RuntimeDir, "xray.json")
+	endpoints, err := native.PrepareResolvedXRay(s.plan.ConfigPath, managed, "amn0", allowed)
+	if err != nil {
+		return err
+	}
+	bypass = append(bypass, endpoints...)
+	if err := s.setPlannedRoutes(allowed, bypass); err != nil {
+		return err
+	}
 	if err := s.createManagedTun(); err != nil {
 		return err
 	}
 	if err := s.renameTun(); err != nil {
 		return err
 	}
-	if err := native.PrepareXRay(s.plan.ConfigPath, managed, "amn0", allowed); err != nil {
-		return err
-	}
+
 	check := exec.Command("/proc/self/fd/3", "run", "-test", "-config", managed)
 	check.Args[0] = xray.path
 	check.Stdout, check.Stderr = os.Stderr, os.Stderr
@@ -187,7 +190,7 @@ func (s *supervisor) startXRay(allowed []netip.Prefix) error {
 	if err := s.startBackend("XRAY_TUN_FD", xray, "run", "-config", managed); err != nil {
 		return err
 	}
-	return configureTun(s.tunIndex, 1500, []netip.Prefix{
+	return s.configureTun(1500, []netip.Prefix{
 		netip.MustParsePrefix("10.255.255.1/30"),
 	}, allowed)
 }
@@ -219,32 +222,98 @@ func (s *supervisor) startWireGuard(config native.WireGuard, allowed []netip.Pre
 	if err := sendUAPI(uapiPath, request); err != nil {
 		return err
 	}
-	return configureTun(s.tunIndex, config.MTU, config.Addresses, allowed)
+	return s.configureTun(config.MTU, config.Addresses, allowed)
 }
 
-func configureTun(index, mtu int, addresses, allowed []netip.Prefix) error {
+func (s *supervisor) configureTun(mtu int, addresses, allowed []netip.Prefix) error {
 	for _, address := range addresses {
-		if err := netlinkAddAddress(index, address); err != nil {
+		if err := netlinkAddAddress(s.tunIndex, address); err != nil {
 			return err
 		}
 	}
-	if err := netlinkConfigure(index, mtu); err != nil {
+	if err := netlinkConfigure(s.tunIndex, mtu); err != nil {
 		return err
 	}
+	for index := range s.state.BypassRoutes {
+		route := s.state.BypassRoutes[index]
+		if err := netlinkAddBypassRoute(route); err != nil {
+			if errors.Is(err, syscall.EEXIST) {
+				s.state.BypassRoutes = s.state.BypassRoutes[:index]
+			} else {
+				s.state.BypassRoutes = s.state.BypassRoutes[:index+1]
+			}
+			if stateErr := WriteJSON(RecoveryPath, s.state, 0o600); stateErr != nil {
+				return fmt.Errorf("add original-path bypass for %s: %w; record failed route ownership: %v", route.Destination, err, stateErr)
+			}
+			return fmt.Errorf("add original-path bypass for %s: %w", route.Destination, err)
+		}
+		s.state.BypassRoutes[index].Applied = true
+		if err := WriteJSON(RecoveryPath, s.state, 0o600); err != nil {
+			return fmt.Errorf("record applied bypass route %s: %w", route.Destination, err)
+		}
+	}
 	for _, prefix := range allowed {
-		if err := netlinkAddRoute(index, prefix); err != nil {
+		if err := netlinkAddRoute(s.tunIndex, prefix); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (s *supervisor) setPlannedRoutes(allowed []netip.Prefix) error {
+func (s *supervisor) setPlannedRoutes(allowed []netip.Prefix, bypass []netip.Addr) error {
 	s.state.Routes = make([]string, len(allowed))
 	for i, prefix := range allowed {
 		s.state.Routes[i] = prefix.String()
 	}
+	if len(s.plan.Owner) < 8 {
+		return fmt.Errorf("invalid connection owner for bypass route identity")
+	}
+	priorityValue, err := strconv.ParseUint(s.plan.Owner[:8], 16, 32)
+	if err != nil {
+		return fmt.Errorf("invalid connection owner for bypass route identity")
+	}
+	priority := uint32(priorityValue)
+	if priority == 0 {
+		priority = 1
+	}
+	seen := map[netip.Addr]struct{}{}
+	for _, address := range bypass {
+		if !address.IsValid() || !address.Is4() {
+			return fmt.Errorf("bypass address %q is not IPv4", address)
+		}
+		if _, exists := seen[address]; exists {
+			continue
+		}
+		seen[address] = struct{}{}
+		route, err := netlinkLookupBypassRoute(address, priority)
+		if err != nil {
+			return err
+		}
+		exists, err := netlinkBypassRouteExists(route)
+		if err != nil {
+			return err
+		}
+		if exists {
+			return fmt.Errorf("managed bypass route %s already exists", route.Destination)
+		}
+		s.state.BypassRoutes = append(s.state.BypassRoutes, route)
+	}
 	return WriteJSON(RecoveryPath, s.state, 0o600)
+}
+
+func bypassAddresses(values []string) ([]netip.Addr, error) {
+	prefixes, err := routes.Parse(values)
+	if err != nil {
+		return nil, err
+	}
+	addresses := make([]netip.Addr, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		if prefix.Bits() != 32 {
+			return nil, fmt.Errorf("safety bypass %q is not an IPv4 host", prefix)
+		}
+		addresses = append(addresses, prefix.Addr())
+	}
+	return addresses, nil
 }
 
 func (s *supervisor) createManagedTun() error {
@@ -438,12 +507,15 @@ func (s *supervisor) cleanup() {
 	if s.listener != nil {
 		_ = s.listener.Close()
 	}
+	backendGone := true
 	if s.backend != nil && s.backend.Process != nil {
 		if s.state.InterfaceIndex != 0 && s.plan.Protocol != "xray" {
 			if iface, err := net.InterfaceByName("amn0"); err == nil && iface.Index == s.state.InterfaceIndex {
 				for i := len(s.state.Routes) - 1; i >= 0; i-- {
 					prefix := netip.MustParsePrefix(s.state.Routes[i])
-					_ = netlinkDeleteRoute(s.state.InterfaceIndex, prefix)
+					if err := netlinkDeleteRoute(s.state.InterfaceIndex, prefix); err != nil && !errors.Is(err, syscall.ESRCH) {
+						complete = false
+					}
 				}
 			}
 		}
@@ -463,7 +535,13 @@ func (s *supervisor) cleanup() {
 				}
 			}
 		}
-		if s.state.BackendStart != 0 && ProcessMatches(pid, s.state.BackendStart) {
+		backendGone = s.state.BackendStart == 0 || !ProcessMatches(pid, s.state.BackendStart)
+		if !backendGone {
+			complete = false
+		}
+	}
+	if backendGone {
+		if err := CleanupBypassRoutes(s.state); err != nil {
 			complete = false
 		}
 	}

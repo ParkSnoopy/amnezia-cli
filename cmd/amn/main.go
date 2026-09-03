@@ -22,7 +22,7 @@ import (
 	"github.com/amn-vpn/amn/internal/routes"
 )
 
-const version = "0.1.2"
+const version = "0.1.3"
 
 type stringList []string
 
@@ -92,8 +92,9 @@ func connect(arguments []string) error {
 	if err != nil {
 		return err
 	}
+	var safetyBypass []string
 	if sshPrefix, ok := currentSSHClient(); ok {
-		parsedExclusions = append(parsedExclusions, sshPrefix)
+		safetyBypass = append(safetyBypass, sshPrefix.String())
 	}
 	exclusions = exclusions[:0]
 	for _, prefix := range parsedExclusions {
@@ -144,7 +145,8 @@ func connect(arguments []string) error {
 	}
 	plan := lifecycle.Plan{
 		Owner: owner, Protocol: *protocol, ConfigPath: privateConfig, Exclusions: exclusions,
-		RuntimeDir: runtimeDir, CallerPID: os.Getpid(), CallerStart: callerStart,
+		SafetyBypass: safetyBypass,
+		RuntimeDir:   runtimeDir, CallerPID: os.Getpid(), CallerStart: callerStart,
 	}
 	planPath := filepath.Join(runtimeDir, "plan.json")
 	if err := lifecycle.WriteJSON(planPath, plan, 0o600); err != nil {
@@ -360,6 +362,9 @@ func disconnect(arguments []string) error {
 		if state.InterfaceIndex != 0 && lifecycle.InterfaceIndexExists(state.InterfaceIndex) {
 			return errors.New("connection supervisor is gone but the owned interface still exists; refusing unsafe cleanup")
 		}
+		if err := lifecycle.CleanupBypassRoutes(state); err != nil {
+			return fmt.Errorf("connection supervisor is gone but an owned bypass route remains: %w", err)
+		}
 		_ = lifecycle.RemoveState()
 		_ = os.RemoveAll(state.RuntimeDir)
 		fmt.Println("Removed stale connection state; no interface remained.")
@@ -409,6 +414,9 @@ func disconnectRecovery() error {
 	}
 	if recovery.InterfaceIndex != 0 && lifecycle.InterfaceIndexExists(recovery.InterfaceIndex) {
 		return errors.New("owned interface remains without its supervisor; recovery state was retained")
+	}
+	if err := lifecycle.CleanupBypassRoutes(recovery); err != nil {
+		return fmt.Errorf("owned bypass route cleanup failed; recovery state was retained: %w", err)
 	}
 	if err := lifecycle.RemoveRecovery(recovery.Owner); err != nil {
 		return err
@@ -543,6 +551,9 @@ func requireNoActiveConnection() error {
 		if recovery.InterfaceIndex != 0 && lifecycle.InterfaceIndexExists(recovery.InterfaceIndex) {
 			return fmt.Errorf("a %s interface remains from an interrupted connection", recovery.Protocol)
 		}
+		if err := lifecycle.CleanupBypassRoutes(recovery); err != nil {
+			return fmt.Errorf("a %s bypass route remains from an interrupted connection: %w", recovery.Protocol, err)
+		}
 		if err := lifecycle.RemoveRecovery(recovery.Owner); err != nil {
 			return err
 		}
@@ -566,6 +577,9 @@ func requireNoActiveConnection() error {
 	}
 	if state.InterfaceIndex != 0 && lifecycle.InterfaceIndexExists(state.InterfaceIndex) {
 		return errors.New("stale connection state retains its owned interface")
+	}
+	if err := lifecycle.CleanupBypassRoutes(state); err != nil {
+		return fmt.Errorf("stale connection state retains an owned bypass route: %w", err)
 	}
 	_ = lifecycle.RemoveState()
 	_ = os.RemoveAll(state.RuntimeDir)

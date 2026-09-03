@@ -21,27 +21,37 @@ const (
 )
 
 type Plan struct {
-	Owner       string   `json:"owner"`
-	Protocol    string   `json:"protocol"`
-	ConfigPath  string   `json:"config_path"`
-	Exclusions  []string `json:"exclusions"`
-	RuntimeDir  string   `json:"runtime_dir"`
-	CallerPID   int      `json:"caller_pid"`
-	CallerStart uint64   `json:"caller_start"`
+	Owner        string   `json:"owner"`
+	Protocol     string   `json:"protocol"`
+	ConfigPath   string   `json:"config_path"`
+	Exclusions   []string `json:"exclusions"`
+	SafetyBypass []string `json:"safety_bypass,omitempty"`
+	RuntimeDir   string   `json:"runtime_dir"`
+	CallerPID    int      `json:"caller_pid"`
+	CallerStart  uint64   `json:"caller_start"`
+}
+
+type BypassRoute struct {
+	Destination    string `json:"destination"`
+	Gateway        string `json:"gateway,omitempty"`
+	InterfaceIndex int    `json:"interface_index"`
+	Priority       uint32 `json:"priority"`
+	Applied        bool   `json:"applied"`
 }
 
 type State struct {
-	Owner           string   `json:"owner"`
-	Protocol        string   `json:"protocol"`
-	RuntimeDir      string   `json:"runtime_dir"`
-	ControlSocket   string   `json:"control_socket"`
-	SupervisorPID   int      `json:"supervisor_pid"`
-	SupervisorStart uint64   `json:"supervisor_start"`
-	BackendPID      int      `json:"backend_pid"`
-	BackendStart    uint64   `json:"backend_start"`
-	InterfaceIndex  int      `json:"interface_index"`
-	InterfaceName   string   `json:"interface_name"`
-	Routes          []string `json:"routes"`
+	Owner           string        `json:"owner"`
+	Protocol        string        `json:"protocol"`
+	RuntimeDir      string        `json:"runtime_dir"`
+	ControlSocket   string        `json:"control_socket"`
+	SupervisorPID   int           `json:"supervisor_pid"`
+	SupervisorStart uint64        `json:"supervisor_start"`
+	BackendPID      int           `json:"backend_pid"`
+	BackendStart    uint64        `json:"backend_start"`
+	InterfaceIndex  int           `json:"interface_index"`
+	InterfaceName   string        `json:"interface_name"`
+	Routes          []string      `json:"routes"`
+	BypassRoutes    []BypassRoute `json:"bypass_routes,omitempty"`
 }
 
 func EnsureDirectories() error {

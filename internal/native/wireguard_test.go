@@ -1,6 +1,7 @@
 package native
 
 import (
+	"net/netip"
 	"os"
 	"strings"
 	"testing"
@@ -75,6 +76,27 @@ PersistentKeepalive = 22-30
 	}
 	if !strings.Contains(request, "random_trailers=true") || !strings.Contains(request, "disable_cookies=false") {
 		t.Fatal("AmneziaWG native Boolean values were not normalized for UAPI")
+	}
+}
+
+func TestAmneziaWGWithoutExclusionsUsesSingleDefaultAllowedIP(t *testing.T) {
+	path := writeConfig(t, `[Interface]
+PrivateKey = `+testKey+`
+Address = 10.8.0.2/32
+[Peer]
+PublicKey = `+testKey+`
+Endpoint = 198.51.100.17:51820
+`)
+	config, err := ReadWireGuard(path, "amneziawg")
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := config.UAPI([]netip.Prefix{netip.MustParsePrefix("0.0.0.0/0")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(request, "allowed_ip=") != 1 || !strings.Contains(request, "allowed_ip=0.0.0.0/0\n") {
+		t.Fatalf("unexpected AllowedIPs:\n%s", request)
 	}
 }
 
