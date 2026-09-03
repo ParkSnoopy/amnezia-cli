@@ -1,0 +1,126 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja
+
+      - name: Check
+        run: cmake --build build --target check
+
+      - name: Set release tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(build/dist/amn version)"
+          version="${version##* }"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            printf 'Invalid application version: %s\n' "${version}" >&2
+            exit 1
+          fi
+          printf 'tag=v%s.%s\n' "${version}" "$(date -u +%Y%m%d)" >> "${GITHUB_OUTPUT}"
+
+  build:
+    name: Build Linux
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      GOOS: linux
+      GOARCH: amd64
+      CGO_ENABLED: "0"
+      TAG: ${{ needs.verify.outputs.tag }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Configure
+        run: cmake -S . -B build -G Ninja
+
+      - name: Build bundle
+        run: cmake --build build
+
+      - name: Package bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_root="amn-${TAG}"
+          archive="${package_root}.tar.gz"
+          mkdir -p "package/${package_root}" release
+          cp -a build/dist/. "package/${package_root}/"
+          tar -C package -czf "release/${archive}" "${package_root}"
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: amn-${{ needs.verify.outputs.tag }}
+          path: release/amn-${{ needs.verify.outputs.tag }}.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish release
+    if: github.event_name != 'pull_request'
+    needs:
+      - verify
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: amn-${{ needs.verify.outputs.tag }}
+          path: release
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.verify.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "${TAG}" "release/amn-${TAG}.tar.gz" \
+            --target "${GITHUB_SHA}" \
+            --title "AmneziaVPN CLI ${TAG}" \
+            --generate-notes
