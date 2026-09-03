@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -20,6 +21,68 @@ func TestProcessIdentityUsesStartTime(t *testing.T) {
 	}
 	if ProcessMatches(os.Getpid(), start+1) {
 		t.Fatal("changed process identity matched")
+	}
+}
+
+func TestProcessMatchesRejectsZombie(t *testing.T) {
+	if os.Getenv("AMN_ZOMBIE_HELPER") == "1" {
+		return
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestProcessMatchesRejectsZombie$")
+	command.Env = append(os.Environ(), "AMN_ZOMBIE_HELPER=1", "GORACE=atexit_sleep_ms=0")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer command.Wait()
+	start, err := ProcessStart(command.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		_, state, err := processStat(command.Process.Pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state == "Z" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("helper did not become a zombie")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if ProcessMatches(command.Process.Pid, start) {
+		t.Fatal("zombie process was treated as live identity")
+	}
+}
+
+func TestRuntimeCandidatesAreExecutableRelative(t *testing.T) {
+	got := runtimeCandidates("/opt/amnezia/amn", "xray")
+	want := []string{
+		"/opt/amnezia/libexec/amn/xray",
+		"/opt/libexec/amn/xray",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d candidates, want %d", len(got), len(want))
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("candidate %d is %q, want %q", index, got[index], want[index])
+		}
+	}
+}
+
+func TestRuntimeEnvironmentHasNoSearchPath(t *testing.T) {
+	got := runtimeEnvironment("XRAY_TUN_FD=3")
+	want := []string{"PATH=", "HOME=/root", "LANG=C", "XRAY_TUN_FD=3"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d environment entries, want %d", len(got), len(want))
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			t.Fatalf("environment %d is %q, want %q", index, got[index], want[index])
+		}
 	}
 }
 

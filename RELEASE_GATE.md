@@ -8,6 +8,7 @@ A release is ready only when every applicable check succeeds.
 - `xray`, `wireguard-go`, and `amneziawg-go` are built from the pinned source submodules.
 - CMake generates the build and Ninja executes it; no Makefile is used.
 - The bundle contains no downloaded or host-copied runtime executable.
+- Runtime engines resolve only from executable-relative `libexec/amn` layouts; validation and backend processes receive no system search path.
 - Submodule revisions and working trees are recorded and clean.
 - Privileged runtime files and every ancestor directory are root-owned and not group/world-writable; bundled runtime symlinks are rejected.
 
@@ -20,6 +21,8 @@ A release is ready only when every applicable check succeeds.
 - The ten-second confirmation deadline is armed only after the prompt is displayed; timeout and caller loss report success only after teardown postconditions hold.
 - A recovery journal exists before mutation; active connection state appears only after confirmation.
 - Failed cleanup retains recovery evidence until backend and interface absence are verified.
+- A reported startup failure is acknowledged and allowed to finish cleanup without caller signalling; an exited zombie is not treated as a live owned process.
+- Interface, address, rename, and route operations pass in an isolated user/network namespace through the in-process route-netlink implementation without a host `ip` dependency.
 - Disconnect checks stored PID start time and interface index before mutation.
 - `cmake -S . -B build -G Ninja`, `cmake --build build`, and `cmake --build build --target check` succeed.
 

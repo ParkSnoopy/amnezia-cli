@@ -11,7 +11,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -178,13 +177,14 @@ func (s *supervisor) startXRay(allowed []netip.Prefix) error {
 	}
 	check := exec.Command(xray, "run", "-test", "-config", managed)
 	check.Stdout, check.Stderr = os.Stderr, os.Stderr
+	check.Env = runtimeEnvironment()
 	if err := check.Run(); err != nil {
 		return fmt.Errorf("validate XRay configuration: %w", err)
 	}
 	if err := s.startBackend("XRAY_TUN_FD", xray, "run", "-config", managed); err != nil {
 		return err
 	}
-	return configureTun("amn0", 1500, []netip.Prefix{
+	return configureTun(s.tunIndex, 1500, []netip.Prefix{
 		netip.MustParsePrefix("10.255.255.1/30"),
 	}, allowed)
 }
@@ -215,25 +215,20 @@ func (s *supervisor) startWireGuard(config native.WireGuard, allowed []netip.Pre
 	if err := sendUAPI(uapiPath, request); err != nil {
 		return err
 	}
-	return configureTun(s.tunName, config.MTU, config.Addresses, allowed)
+	return configureTun(s.tunIndex, config.MTU, config.Addresses, allowed)
 }
 
-func configureTun(name string, mtu int, addresses, allowed []netip.Prefix) error {
-	ip, err := trustedIP()
-	if err != nil {
-		return err
-	}
+func configureTun(index, mtu int, addresses, allowed []netip.Prefix) error {
 	for _, address := range addresses {
-		if err := runIP(ip, "address", "add", address.String(), "dev", name); err != nil {
+		if err := netlinkAddAddress(index, address); err != nil {
 			return err
 		}
 	}
-	if err := runIP(ip, "link", "set", "dev", name, "mtu", strconv.Itoa(mtu), "up"); err != nil {
+	if err := netlinkConfigure(index, mtu); err != nil {
 		return err
 	}
 	for _, prefix := range allowed {
-		args := []string{"route", "add", prefix.String(), "dev", name}
-		if err := runIP(ip, args...); err != nil {
+		if err := netlinkAddRoute(index, prefix); err != nil {
 			return err
 		}
 	}
@@ -285,11 +280,7 @@ func (s *supervisor) renameTun() error {
 	if _, err := net.InterfaceByName("amn0"); err == nil {
 		return errors.New("foreign interface amn0 appeared during connection setup")
 	}
-	ip, err := trustedIP()
-	if err != nil {
-		return err
-	}
-	if err := runIP(ip, "link", "set", "dev", s.tunName, "name", "amn0"); err != nil {
+	if err := netlinkRename(s.tunIndex, "amn0"); err != nil {
 		return err
 	}
 	iface, err := net.InterfaceByName("amn0")
@@ -312,7 +303,7 @@ func (s *supervisor) startBackend(tunEnvironment, path string, arguments ...stri
 	command.Stdout, command.Stderr = logFile, logFile
 	command.SysProcAttr = &syscall.SysProcAttr{Pdeathsig: syscall.SIGTERM}
 	command.ExtraFiles = []*os.File{s.tunFile}
-	command.Env = append(os.Environ(), tunEnvironment+"=3")
+	command.Env = runtimeEnvironment(tunEnvironment + "=3")
 	if err := command.Start(); err != nil {
 		logFile.Close()
 		return fmt.Errorf("start %s: %w", filepath.Base(path), err)
@@ -445,12 +436,9 @@ func (s *supervisor) cleanup() {
 	if s.backend != nil && s.backend.Process != nil {
 		if s.state.InterfaceIndex != 0 && s.plan.Protocol != "xray" {
 			if iface, err := net.InterfaceByName("amn0"); err == nil && iface.Index == s.state.InterfaceIndex {
-				if ip, findErr := trustedIP(); findErr == nil {
-					for i := len(s.state.Routes) - 1; i >= 0; i-- {
-						prefix := netip.MustParsePrefix(s.state.Routes[i])
-						args := []string{"route", "del", prefix.String(), "dev", "amn0"}
-						_ = runIP(ip, args...)
-					}
+				for i := len(s.state.Routes) - 1; i >= 0; i-- {
+					prefix := netip.MustParsePrefix(s.state.Routes[i])
+					_ = netlinkDeleteRoute(s.state.InterfaceIndex, prefix)
 				}
 			}
 		}
@@ -511,17 +499,25 @@ func RuntimeExecutable(name string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	base := filepath.Dir(executable)
-	candidates := []string{
-		filepath.Join(base, "libexec", "amn", name),
-		filepath.Join(filepath.Dir(base), "libexec", "amn", name),
-	}
+	candidates := runtimeCandidates(executable, name)
 	for _, candidate := range candidates {
-		if trustedExecutable(candidate, false) {
+		if trustedExecutable(candidate) {
 			return candidate, nil
 		}
 	}
-	return "", fmt.Errorf("trusted source-built %s is not installed beside amn", name)
+	return "", fmt.Errorf(
+		"trusted source-built %s is missing or untrusted relative to amn executable; checked %s",
+		name,
+		strings.Join(candidates, ", "),
+	)
+}
+
+func runtimeCandidates(executable, name string) []string {
+	base := filepath.Dir(executable)
+	return []string{
+		filepath.Join(base, "libexec", "amn", name),
+		filepath.Join(filepath.Dir(base), "libexec", "amn", name),
+	}
 }
 
 func waitInterface(name string, timeout time.Duration) (*net.Interface, error) {
@@ -577,22 +573,13 @@ func sendUAPI(path, request string) error {
 	return nil
 }
 
-func trustedIP() (string, error) {
-	for _, path := range []string{"/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip", "/bin/ip"} {
-		if trustedExecutable(path, true) {
-			return path, nil
-		}
-	}
-	return "", errors.New("trusted system ip utility is unavailable")
-}
-
-func trustedExecutable(path string, allowSymlink bool) bool {
+func trustedExecutable(path string) bool {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return false
 	}
 	canonical, err := filepath.EvalSymlinks(absolute)
-	if err != nil || (!allowSymlink && canonical != absolute) {
+	if err != nil || canonical != absolute {
 		return false
 	}
 	info, err := os.Lstat(canonical)
@@ -618,13 +605,9 @@ func trustedExecutable(path string, allowSymlink bool) bool {
 	}
 }
 
-func runIP(path string, arguments ...string) error {
-	command := exec.Command(path, arguments...)
-	output, err := command.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("ip %s: %w: %s", strings.Join(arguments, " "), err, strings.TrimSpace(string(output)))
-	}
-	return nil
+func runtimeEnvironment(extra ...string) []string {
+	environment := []string{"PATH=", "HOME=/root", "LANG=C"}
+	return append(environment, extra...)
 }
 
 func SendControl(ctx context.Context, socket, command string) (string, error) {

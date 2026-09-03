@@ -179,26 +179,31 @@ func CopyPrivate(source, destination string) error {
 }
 
 func ProcessStart(pid int) (uint64, error) {
+	start, _, err := processStat(pid)
+	return start, err
+}
+
+func processStat(pid int) (uint64, string, error) {
 	content, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	closing := strings.LastIndexByte(string(content), ')')
 	if closing < 0 {
-		return 0, errors.New("malformed process stat")
+		return 0, "", errors.New("malformed process stat")
 	}
 	fields := strings.Fields(string(content[closing+1:]))
 	if len(fields) <= 19 {
-		return 0, errors.New("incomplete process stat")
+		return 0, "", errors.New("incomplete process stat")
 	}
 	start, err := strconv.ParseUint(fields[19], 10, 64)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	return start, nil
+	return start, fields[0], nil
 }
 
 func ProcessMatches(pid int, expected uint64) bool {
-	actual, err := ProcessStart(pid)
-	return err == nil && actual == expected
+	actual, state, err := processStat(pid)
+	return err == nil && state != "Z" && state != "X" && state != "x" && actual == expected
 }

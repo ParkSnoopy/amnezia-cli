@@ -22,7 +22,7 @@ import (
 	"github.com/amn-vpn/amn/internal/routes"
 )
 
-const version = "0.1.0"
+const version = "0.1.1"
 
 type stringList []string
 
@@ -161,7 +161,7 @@ func connect(arguments []string) error {
 	}
 	command := exec.Command(executable, "__supervise", planPath)
 	command.Stdout, command.Stderr = logFile, logFile
-	command.Env = []string{"PATH=/usr/sbin:/usr/bin:/sbin:/bin", "HOME=/root", "LANG=C"}
+	command.Env = []string{"PATH=", "HOME=/root", "LANG=C"}
 	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := command.Start(); err != nil {
 		logFile.Close()
@@ -179,7 +179,8 @@ func connect(arguments []string) error {
 
 	ready, err := waitReady(runtimeDir, 15*time.Second)
 	if err != nil {
-		if cleanupErr := abortStartup(owner, supervisorPID, supervisorStart); cleanupErr != nil {
+		var reported supervisorStartupError
+		if cleanupErr := abortStartup(owner, supervisorPID, supervisorStart, errors.As(err, &reported)); cleanupErr != nil {
 			return fmt.Errorf("%w; startup cleanup failed: %v", err, cleanupErr)
 		}
 		return err
@@ -249,23 +250,48 @@ func controlFailure(response string, err error) string {
 	return response
 }
 
-func abortStartup(owner string, supervisorPID int, supervisorStart uint64) error {
+func abortStartup(owner string, supervisorPID int, supervisorStart uint64, allowGracefulExit bool) error {
+	if allowGracefulExit {
+		deadline := time.Now().Add(8 * time.Second)
+		for time.Now().Before(deadline) {
+			complete, err := startupCleanupComplete(owner, supervisorPID, supervisorStart)
+			if err != nil {
+				return err
+			}
+			if complete {
+				return nil
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		return errors.New("startup supervisor cleanup did not complete; recovery evidence was retained")
+	}
 	if lifecycle.ProcessMatches(supervisorPID, supervisorStart) {
 		_ = syscall.Kill(supervisorPID, syscall.SIGTERM)
 	}
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
-		var recovery lifecycle.State
-		recoveryErr := lifecycle.ReadJSON(lifecycle.RecoveryPath, &recovery)
-		if !lifecycle.ProcessMatches(supervisorPID, supervisorStart) && os.IsNotExist(recoveryErr) {
-			return nil
+		complete, err := startupCleanupComplete(owner, supervisorPID, supervisorStart)
+		if err != nil {
+			return err
 		}
-		if recoveryErr == nil && recovery.Owner != owner {
-			return errors.New("startup recovery owner changed")
+		if complete {
+			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
 	return errors.New("startup supervisor cleanup did not complete; recovery evidence was retained")
+}
+
+func startupCleanupComplete(owner string, supervisorPID int, supervisorStart uint64) (bool, error) {
+	var recovery lifecycle.State
+	recoveryErr := lifecycle.ReadJSON(lifecycle.RecoveryPath, &recovery)
+	if recoveryErr == nil && recovery.Owner != owner {
+		return false, errors.New("startup recovery owner changed")
+	}
+	if recoveryErr != nil && !os.IsNotExist(recoveryErr) {
+		return false, recoveryErr
+	}
+	return !lifecycle.ProcessMatches(supervisorPID, supervisorStart) && os.IsNotExist(recoveryErr), nil
 }
 
 func rollbackConnection(state lifecycle.State) error {
@@ -466,6 +492,14 @@ func validateNativeConfig(protocol, path string, exclusions []netip.Prefix, runt
 	return err
 }
 
+type supervisorStartupError struct {
+	message string
+}
+
+func (err supervisorStartupError) Error() string {
+	return err.message
+}
+
 func waitReady(runtimeDir string, timeout time.Duration) (lifecycle.State, error) {
 	deadline := time.Now().Add(timeout)
 	readyPath := filepath.Join(runtimeDir, "ready.json")
@@ -477,7 +511,7 @@ func waitReady(runtimeDir string, timeout time.Duration) (lifecycle.State, error
 		}
 		if content, err := os.ReadFile(errorPath); err == nil {
 			_ = os.WriteFile(filepath.Join(runtimeDir, "error.ack"), nil, 0o600)
-			return lifecycle.State{}, errors.New(strings.TrimSpace(string(content)))
+			return lifecycle.State{}, supervisorStartupError{message: strings.TrimSpace(string(content))}
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
