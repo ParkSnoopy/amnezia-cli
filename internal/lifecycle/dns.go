@@ -10,7 +10,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/amn-vpn/amn/internal/native"
+	"github.com/ParkSnoopy/amnezia-cli/internal/native"
 )
 
 const resolverPath = "/etc/resolv.conf"

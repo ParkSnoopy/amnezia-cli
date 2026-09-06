@@ -16,8 +16,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/amn-vpn/amn/internal/native"
-	"github.com/amn-vpn/amn/internal/routes"
+	"github.com/ParkSnoopy/amnezia-cli/internal/native"
+	"github.com/ParkSnoopy/amnezia-cli/internal/routes"
 )
 
 type supervisor struct {

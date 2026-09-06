@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/amn-vpn/amn/internal/native"
+	"github.com/ParkSnoopy/amnezia-cli/internal/native"
 )
 
 func resolverFixture(t *testing.T) (string, *ResolverState) {

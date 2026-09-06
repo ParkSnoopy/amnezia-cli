@@ -17,9 +17,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/amn-vpn/amn/internal/lifecycle"
-	"github.com/amn-vpn/amn/internal/native"
-	"github.com/amn-vpn/amn/internal/routes"
+	"github.com/ParkSnoopy/amnezia-cli/internal/lifecycle"
+	"github.com/ParkSnoopy/amnezia-cli/internal/native"
+	"github.com/ParkSnoopy/amnezia-cli/internal/routes"
 )
 
 const version = "0.1.4"
