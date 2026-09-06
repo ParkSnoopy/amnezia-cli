@@ -40,18 +40,19 @@ type BypassRoute struct {
 }
 
 type State struct {
-	Owner           string        `json:"owner"`
-	Protocol        string        `json:"protocol"`
-	RuntimeDir      string        `json:"runtime_dir"`
-	ControlSocket   string        `json:"control_socket"`
-	SupervisorPID   int           `json:"supervisor_pid"`
-	SupervisorStart uint64        `json:"supervisor_start"`
-	BackendPID      int           `json:"backend_pid"`
-	BackendStart    uint64        `json:"backend_start"`
-	InterfaceIndex  int           `json:"interface_index"`
-	InterfaceName   string        `json:"interface_name"`
-	Routes          []string      `json:"routes"`
-	BypassRoutes    []BypassRoute `json:"bypass_routes,omitempty"`
+	DNS             *ResolverState `json:"dns,omitempty"`
+	Owner           string         `json:"owner"`
+	Protocol        string         `json:"protocol"`
+	RuntimeDir      string         `json:"runtime_dir"`
+	ControlSocket   string         `json:"control_socket"`
+	SupervisorPID   int            `json:"supervisor_pid"`
+	SupervisorStart uint64         `json:"supervisor_start"`
+	BackendPID      int            `json:"backend_pid"`
+	BackendStart    uint64         `json:"backend_start"`
+	InterfaceIndex  int            `json:"interface_index"`
+	InterfaceName   string         `json:"interface_name"`
+	Routes          []string       `json:"routes"`
+	BypassRoutes    []BypassRoute  `json:"bypass_routes,omitempty"`
 }
 
 func EnsureDirectories() error {

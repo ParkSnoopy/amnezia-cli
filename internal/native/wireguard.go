@@ -18,6 +18,7 @@ type WireGuard struct {
 	Addresses  []netip.Prefix
 	ListenPort uint16
 	MTU        int
+	DNS        DNS
 	Amnezia    map[string]string
 	Peer       Peer
 }
@@ -108,7 +109,11 @@ func (c *WireGuard) apply(section, key, value, protocol string) error {
 			}
 			c.MTU = mtu
 		case "dns":
-			// The existing system resolver remains in use and is routed through amn0.
+			for _, item := range strings.Split(value, ",") {
+				if err := c.DNS.add(strings.TrimSpace(item), true); err != nil {
+					return err
+				}
+			}
 		case "jc", "jmin", "jmax", "s1", "s2", "s3", "s4", "h1", "h2", "h3", "h4", "i1", "i2", "i3", "i4", "i5",
 			"headerprotectionkey", "contentpaddingaddition", "rekeyaftertime", "rekeytimeout", "rejectaftertime", "keepalivetimeout", "maxhandshakeattempts", "randomtrailers", "disablecookies":
 			if protocol != "amneziawg" {

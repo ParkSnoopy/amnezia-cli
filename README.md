@@ -34,3 +34,11 @@ amn version
 `routes` prints the exact IPv4 CIDR complement used for route-all-except behavior. IPv6 CIDRs are rejected.
 
 Only one connection is active at a time. Runtime files and connection state are private to root.
+
+## DNS
+
+`amn` temporarily owns whole-system DNS through the real target of `/etc/resolv.conf` (including a symlink target). WireGuard and AmneziaWG honor native `DNS` IPv4 servers and search domains. XRay uses global plain IPv4 port-53 entries from native `dns.servers`; its engine configuration is preserved. Domain-scoped, encrypted, local, and nonstandard-port XRay entries are not system resolver candidates. An explicit XRay DNS configuration without a usable candidate is rejected, rather than replaced with an invented public resolver. At most three servers and six search domains are supported; WireGuard search domains require a server. IPv6 and loopback DNS servers are unsupported. When native DNS is absent (including ordinary XRay exports), every protocol uses the same explicit Cloudflare public default: `1.1.1.1` and `1.0.0.1`. Native DNS takes precedence. This replaces unreachable pre-VPN/local resolver addresses without requiring manual configuration edits.
+
+DNS is applied after tunnel routes and before the confirmation prompt. Disconnect, timeout, setup failure, and interrupted-connection recovery restore the original resolver bytes and mode. Recovery refuses to overwrite externally changed contents, permissions, or a retargeted symlink; the private journal is retained and `amn disconnect` reports incomplete cleanup. Restore the original resolver configuration before retrying recovery if another service has taken over.
+
+This is not split DNS or integration with a concurrent resolver manager. The target must be a root-owned regular file, not group/world-writable, and support atomic replacement; bind-mounted or read-only resolver files fail safely (no in-place fallback). DNS follows ordinary routes, including exclusions; no DNS bypass is added. Successful setup proves resolver installation, not upstream DNS reachability or live VPN traffic.

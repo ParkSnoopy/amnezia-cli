@@ -105,6 +105,10 @@ func (s *supervisor) start() error {
 		if err != nil {
 			return err
 		}
+		s.state.DNS, err = prepareDNS(resolverPath, s.plan.Owner, config.DNS)
+		if err != nil {
+			return err
+		}
 		resolvedEndpoint, endpoint, err := native.ResolveEndpoint(config.Peer.Endpoint)
 		if err != nil {
 			return err
@@ -137,6 +141,9 @@ func (s *supervisor) start() error {
 	if iface.Index != s.tunIndex {
 		return errors.New("managed TUN identity changed during rename")
 	}
+	if err := applyDNS(s.state, func(state State) error { return WriteJSON(RecoveryPath, state, 0o600) }); err != nil {
+		return err
+	}
 	socketPath := filepath.Join(s.plan.RuntimeDir, "control.sock")
 	address := &net.UnixAddr{Name: socketPath, Net: "unix"}
 	listener, err := net.ListenUnix("unix", address)
@@ -158,6 +165,14 @@ func (s *supervisor) start() error {
 }
 
 func (s *supervisor) startXRay(allowed []netip.Prefix, bypass []netip.Addr) error {
+	dns, err := native.ReadXRayDNS(s.plan.ConfigPath)
+	if err != nil {
+		return err
+	}
+	s.state.DNS, err = prepareDNS(resolverPath, s.plan.Owner, dns)
+	if err != nil {
+		return err
+	}
 	xray, err := RuntimeExecutable("xray")
 	if err != nil {
 		return err
@@ -498,6 +513,10 @@ func (s *supervisor) serve() error {
 
 func (s *supervisor) cleanup() {
 	complete := true
+	if err := RestoreDNS(s.state); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		complete = false
+	}
 	if s.tunFile != nil {
 		if err := s.tunFile.Close(); err != nil {
 			complete = false
