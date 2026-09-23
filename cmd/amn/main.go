@@ -17,12 +17,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/amn-vpn/amn/internal/lifecycle"
-	"github.com/amn-vpn/amn/internal/native"
-	"github.com/amn-vpn/amn/internal/routes"
+	"github.com/ParkSnoopy/amnezia-cli/internal/lifecycle"
+	"github.com/ParkSnoopy/amnezia-cli/internal/native"
+	"github.com/ParkSnoopy/amnezia-cli/internal/routes"
 )
 
-const version = "0.1.3"
+const version = "0.1.4"
 
 type stringList []string
 
@@ -362,6 +362,9 @@ func disconnect(arguments []string) error {
 		if state.InterfaceIndex != 0 && lifecycle.InterfaceIndexExists(state.InterfaceIndex) {
 			return errors.New("connection supervisor is gone but the owned interface still exists; refusing unsafe cleanup")
 		}
+		if err := lifecycle.RestoreDNS(state); err != nil {
+			return err
+		}
 		if err := lifecycle.CleanupBypassRoutes(state); err != nil {
 			return fmt.Errorf("connection supervisor is gone but an owned bypass route remains: %w", err)
 		}
@@ -414,6 +417,9 @@ func disconnectRecovery() error {
 	}
 	if recovery.InterfaceIndex != 0 && lifecycle.InterfaceIndexExists(recovery.InterfaceIndex) {
 		return errors.New("owned interface remains without its supervisor; recovery state was retained")
+	}
+	if err := lifecycle.RestoreDNS(recovery); err != nil {
+		return err
 	}
 	if err := lifecycle.CleanupBypassRoutes(recovery); err != nil {
 		return fmt.Errorf("owned bypass route cleanup failed; recovery state was retained: %w", err)
@@ -551,6 +557,9 @@ func requireNoActiveConnection() error {
 		if recovery.InterfaceIndex != 0 && lifecycle.InterfaceIndexExists(recovery.InterfaceIndex) {
 			return fmt.Errorf("a %s interface remains from an interrupted connection", recovery.Protocol)
 		}
+		if err := lifecycle.RestoreDNS(recovery); err != nil {
+			return err
+		}
 		if err := lifecycle.CleanupBypassRoutes(recovery); err != nil {
 			return fmt.Errorf("a %s bypass route remains from an interrupted connection: %w", recovery.Protocol, err)
 		}
@@ -577,6 +586,9 @@ func requireNoActiveConnection() error {
 	}
 	if state.InterfaceIndex != 0 && lifecycle.InterfaceIndexExists(state.InterfaceIndex) {
 		return errors.New("stale connection state retains its owned interface")
+	}
+	if err := lifecycle.RestoreDNS(state); err != nil {
+		return err
 	}
 	if err := lifecycle.CleanupBypassRoutes(state); err != nil {
 		return fmt.Errorf("stale connection state retains an owned bypass route: %w", err)

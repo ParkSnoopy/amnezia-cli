@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/amn-vpn/amn/internal/lifecycle"
+	"github.com/ParkSnoopy/amnezia-cli/internal/lifecycle"
 )
 
 func TestReportedStartupFailureAllowsSupervisorCleanup(t *testing.T) {
